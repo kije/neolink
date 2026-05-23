@@ -122,6 +122,10 @@ pub(crate) struct OnvifStateInner {
     pub(crate) globals: RwLock<OnvifGlobalConfig>,
     /// The neolink RTSP port (so we can build `rtsp://...` URIs).
     pub(crate) rtsp_port: RwLock<u16>,
+    /// Cached non-loopback IPv4 used for `advertise_host = "auto"`. The
+    /// outbound interface effectively never changes during a process
+    /// lifetime, so we resolve once on first use.
+    cached_local_ip: RwLock<Option<IpAddr>>,
 }
 
 impl OnvifState {
@@ -132,6 +136,7 @@ impl OnvifState {
                 users: RwLock::new(HashMap::new()),
                 globals: RwLock::new(globals),
                 rtsp_port: RwLock::new(rtsp_port),
+                cached_local_ip: RwLock::new(None),
             }),
         }
     }
@@ -225,12 +230,23 @@ impl OnvifState {
         Ok(())
     }
 
+    async fn resolve_auto_host(&self) -> Result<IpAddr> {
+        if let Some(ip) = *self.inner.cached_local_ip.read().await {
+            return Ok(ip);
+        }
+        let ip = detect_local_ipv4()?;
+        *self.inner.cached_local_ip.write().await = Some(ip);
+        Ok(ip)
+    }
+
     /// Returns the `host:port` to embed in ONVIF URLs.
     pub(crate) async fn advertise_authority(&self) -> Result<String> {
-        let g = self.inner.globals.read().await;
-        let port = g.bind_port;
-        let host = match g.advertise_host.as_str() {
-            "auto" => detect_local_ipv4()?.to_string(),
+        let (port, advertise) = {
+            let g = self.inner.globals.read().await;
+            (g.bind_port, g.advertise_host.clone())
+        };
+        let host = match advertise.as_str() {
+            "auto" => self.resolve_auto_host().await?.to_string(),
             other if other.contains(':') => return Ok(other.to_string()),
             other => other.to_string(),
         };
@@ -239,9 +255,9 @@ impl OnvifState {
 
     /// Returns the `host` to embed in RTSP URLs (no port).
     pub(crate) async fn advertise_host(&self) -> Result<String> {
-        let g = self.inner.globals.read().await;
-        let host = match g.advertise_host.as_str() {
-            "auto" => detect_local_ipv4()?.to_string(),
+        let advertise = self.inner.globals.read().await.advertise_host.clone();
+        let host = match advertise.as_str() {
+            "auto" => self.resolve_auto_host().await?.to_string(),
             other if other.contains(':') => other.split(':').next().unwrap_or(other).to_string(),
             other => other.to_string(),
         };

@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 
 use anyhow::Result;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -22,6 +22,11 @@ use crate::onvif::state::OnvifState;
 /// even for SOAP faults. Surveillance VMS clients break otherwise.
 const SOAP_CONTENT_TYPE: &str = "application/soap+xml; charset=utf-8";
 
+/// Cap on incoming SOAP envelopes. Real ONVIF requests are <8 KiB; 64 KiB is
+/// generous, but bounded enough to prevent an attacker from holding a worker
+/// with a multi-MiB POST.
+const SOAP_BODY_LIMIT: usize = 64 * 1024;
+
 pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<()> {
     let (bind_addr, bind_port) = {
         let g = state.inner().globals.read().await;
@@ -32,6 +37,7 @@ pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<
         .route("/onvif/:camera/device_service", post(device_service_route))
         .route("/onvif/:camera/media_service", post(media_service_route))
         .route("/onvif/:camera/ptz_service", post(ptz_service_route))
+        .layer(DefaultBodyLimit::max(SOAP_BODY_LIMIT))
         .route("/onvif/:camera/snapshot/:stream", get(snapshot::handler))
         .route("/onvif/:camera", get(camera_index))
         .route("/", get(root_index))

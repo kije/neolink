@@ -6,6 +6,11 @@
 //! announcement and stable UUID. PTZ commands are translated to the Reolink
 //! BC protocol via the same `BcCamera` methods the CLI and MQTT surfaces use.
 //!
+//! This module is intentionally NOT gated on the `gstreamer` feature: ONVIF
+//! itself only hands out the existing RTSP URL (it doesn't stream media or
+//! transcode anything), so it builds and runs without GStreamer. The combined
+//! `mqtt-rtsp` launcher remains `gstreamer`-gated because RTSP is.
+//!
 //! See `sample_config.toml` for the user-facing configuration.
 
 use anyhow::Result;
