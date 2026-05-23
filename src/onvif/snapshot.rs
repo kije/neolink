@@ -12,6 +12,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use neolink_core::bc_protocol::BcCamera;
 
+use crate::onvif::soap::constant_time_eq;
 use crate::onvif::state::OnvifState;
 
 pub(crate) async fn handler(
@@ -78,7 +79,7 @@ async fn authenticated(state: &OnvifState, cam_name: &str, headers: &HeaderMap) 
     let Some(expected) = state.user_password(user).await else {
         return false;
     };
-    if expected != pass {
+    if !constant_time_eq(expected.as_bytes(), pass.as_bytes()) {
         return false;
     }
     if let Some(allow) = permitted {

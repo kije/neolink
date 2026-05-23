@@ -167,13 +167,11 @@ pub(crate) fn parse_envelope(xml: &str) -> Result<ParsedRequest<'_>> {
                     _ => {}
                 }
             }
-            Ok(Event::Empty(e)) => {
-                if in_body && body_child_start.is_none() {
-                    let name = local_name(e.name().into_inner());
-                    action = Some(name);
-                    let end = reader.buffer_position() as usize;
-                    body_span = Some((pos, end));
-                }
+            Ok(Event::Empty(e)) if in_body && body_child_start.is_none() => {
+                let name = local_name(e.name().into_inner());
+                action = Some(name);
+                let end = reader.buffer_position() as usize;
+                body_span = Some((pos, end));
             }
             _ => {}
         }
@@ -237,7 +235,7 @@ pub(crate) fn verify_token(token: &UsernameToken, users: &HashMap<String, String
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
