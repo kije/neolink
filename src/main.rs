@@ -43,6 +43,7 @@ mod config;
 #[cfg(feature = "gstreamer")]
 mod image;
 mod mqtt;
+mod onvif;
 mod pir;
 mod ptz;
 mod reboot;
@@ -132,7 +133,11 @@ async fn main() -> Result<()> {
             tokio::select! {
                 v = mqtt::main(opts, neo_reactor.clone()) => v,
                 v = rtsp::main(rtsp::Opt {}, neo_reactor.clone()) => v,
+                v = onvif::main(onvif::Opt {}, neo_reactor.clone()) => v,
             }?;
+        }
+        Some(Command::Onvif(opts)) => {
+            onvif::main(opts, neo_reactor.clone()).await?;
         }
         #[cfg(feature = "gstreamer")]
         Some(Command::Image(opts)) => {

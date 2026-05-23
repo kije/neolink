@@ -49,6 +49,79 @@ pub(crate) struct Config {
     #[validate(nested)]
     #[serde(default)]
     pub(crate) users: Vec<UserConfig>,
+
+    #[validate(nested)]
+    #[serde(default)]
+    pub(crate) onvif: OnvifGlobalConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
+pub(crate) struct OnvifGlobalConfig {
+    #[serde(default = "default_false")]
+    pub(crate) enabled: bool,
+
+    #[serde(rename = "bind", default = "default_onvif_bind_addr")]
+    pub(crate) bind_addr: String,
+
+    #[validate(range(min = 0, max = 65535, message = "Invalid port", code = "bind_port"))]
+    #[serde(default = "default_onvif_bind_port")]
+    pub(crate) bind_port: u16,
+
+    #[serde(default = "default_true")]
+    pub(crate) discovery: bool,
+
+    /// Hostname or `host:port` to advertise in ONVIF responses. Use `"auto"` to
+    /// pick the first non-loopback IPv4 address found on the machine.
+    #[serde(default = "default_advertise_host")]
+    pub(crate) advertise_host: String,
+}
+
+impl Default for OnvifGlobalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: default_onvif_bind_addr(),
+            bind_port: default_onvif_bind_port(),
+            discovery: true,
+            advertise_host: default_advertise_host(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
+pub(crate) struct OnvifCameraConfig {
+    #[serde(default = "default_true", alias = "enable")]
+    pub(crate) enabled: bool,
+
+    /// Fixed UUID for stable ONVIF device identity. `"auto"` derives a UUID
+    /// from the camera name via UUIDv5.
+    #[serde(default = "default_uuid")]
+    pub(crate) uuid: String,
+}
+
+impl Default for OnvifCameraConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            uuid: default_uuid(),
+        }
+    }
+}
+
+fn default_onvif_bind_addr() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_onvif_bind_port() -> u16 {
+    8000
+}
+
+fn default_advertise_host() -> String {
+    "auto".to_string()
+}
+
+fn default_uuid() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
@@ -218,6 +291,10 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_false", alias = "idle", alias = "idle_disc")]
     pub(crate) idle_disconnect: bool,
+
+    #[validate(nested)]
+    #[serde(default)]
+    pub(crate) onvif: OnvifCameraConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]

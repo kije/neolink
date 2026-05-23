@@ -35,6 +35,18 @@ bind = "0.0.0.0"
 # mqtt.port = 1883
 # mqtt.credentials = ["mqtt_user", "mqtt_password"]
 
+# Uncomment to enable the ONVIF bridge.
+# Each enabled camera becomes a virtual ONVIF Profile S device served at
+#     http://<host>:<bind_port>/onvif/<camera-name>/device_service
+# VMS clients (Home Assistant, Frigate, BlueIris, ...) can then discover the
+# camera over WS-Discovery, fetch the RTSP URL automatically, and control PTZ.
+# [onvif]
+# enabled = true
+# bind = "0.0.0.0"
+# bind_port = 8000
+# discovery = true              # answer UDP multicast WS-Discovery probes
+# advertise_host = "auto"       # "auto" picks the first non-loopback IPv4 NIC
+
 
 [[cameras]]
 name = "driveway"
@@ -83,6 +95,12 @@ address = "192.168.1.187:9000"
 # - Xml
 #
 # print_format = "None"
+
+# Per-camera ONVIF settings (only meaningful when the global [onvif] block is
+# enabled). Each camera can opt out by setting `enabled = false`.
+# [cameras.onvif]
+# enabled = true
+# uuid = "auto"   # or a fixed UUID for stable identity across restarts
 
 
 [[cameras]]
