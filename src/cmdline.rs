@@ -33,4 +33,5 @@ pub enum Command {
     Battery(super::battery::Opt),
     Services(super::services::Opt),
     Users(super::users::Opt),
+    Onvif(super::onvif::Opt),
 }
