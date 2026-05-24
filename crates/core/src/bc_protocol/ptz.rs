@@ -12,6 +12,14 @@ pub enum Direction {
     Left,
     /// To move the camera Right
     Right,
+    /// To move the camera Up and Left (diagonal)
+    LeftUp,
+    /// To move the camera Up and Right (diagonal)
+    RightUp,
+    /// To move the camera Down and Left (diagonal)
+    LeftDown,
+    /// To move the camera Down and Right (diagonal)
+    RightDown,
     /// To stop currently active PTZ command
     Stop,
 }
@@ -29,6 +37,10 @@ impl BcCamera {
             Direction::Down => "down",
             Direction::Left => "left",
             Direction::Right => "right",
+            Direction::LeftUp => "leftUp",
+            Direction::RightUp => "rightUp",
+            Direction::LeftDown => "leftDown",
+            Direction::RightDown => "rightDown",
             Direction::Stop => "stop",
         }
         .to_string();

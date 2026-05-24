@@ -34,27 +34,36 @@ fn onvif_to_reolink_speed(v: f32) -> f32 {
 
 /// Choose a Reolink direction string from a velocity vector. Returns None when
 /// both components are essentially zero.
+///
+/// When both axes carry meaningful velocity we emit the matching diagonal
+/// (`leftUp`/`rightUp`/`leftDown`/`rightDown`). Otherwise we emit a pure
+/// cardinal direction. Threshold of 0.05 avoids jitter triggering moves and
+/// also acts as the diagonal-vs-cardinal decision boundary: if the smaller
+/// axis is under threshold we treat it as zero.
 fn pick_direction(x: f32, y: f32) -> Option<Direction> {
-    // The current crates/core::Direction enum has no diagonals; pick the
-    // dominant axis. Threshold of 0.05 to avoid jitter triggering moves.
+    const THRESHOLD: f32 = 0.05;
     let ax = x.abs();
     let ay = y.abs();
-    if ax < 0.05 && ay < 0.05 {
+    if ax < THRESHOLD && ay < THRESHOLD {
         return None;
     }
-    if ax >= ay {
-        Some(if x > 0.0 {
-            Direction::Right
-        } else {
-            Direction::Left
-        })
-    } else {
-        Some(if y > 0.0 {
-            Direction::Up
-        } else {
-            Direction::Down
-        })
-    }
+    let has_x = ax >= THRESHOLD;
+    let has_y = ay >= THRESHOLD;
+    Some(match (has_x, has_y, x > 0.0, y > 0.0) {
+        // Diagonals
+        (true, true, true, true) => Direction::RightUp,
+        (true, true, true, false) => Direction::RightDown,
+        (true, true, false, true) => Direction::LeftUp,
+        (true, true, false, false) => Direction::LeftDown,
+        // Pure X
+        (true, false, true, _) => Direction::Right,
+        (true, false, false, _) => Direction::Left,
+        // Pure Y
+        (false, true, _, true) => Direction::Up,
+        (false, true, _, false) => Direction::Down,
+        // Unreachable — both flags can't be false here.
+        _ => return None,
+    })
 }
 
 #[derive(Default, Debug)]
@@ -634,12 +643,30 @@ mod tests {
     }
 
     #[test]
-    fn direction_picks_dominant_axis() {
+    fn direction_picks_cardinal_when_one_axis_dominates() {
         assert!(pick_direction(0.0, 0.0).is_none());
-        assert!(matches!(pick_direction(0.8, 0.1), Some(Direction::Right)));
-        assert!(matches!(pick_direction(-0.8, 0.1), Some(Direction::Left)));
-        assert!(matches!(pick_direction(0.1, 0.8), Some(Direction::Up)));
-        assert!(matches!(pick_direction(0.1, -0.8), Some(Direction::Down)));
+        // Tiny secondary axis falls under the diagonal threshold.
+        assert!(matches!(pick_direction(0.8, 0.01), Some(Direction::Right)));
+        assert!(matches!(pick_direction(-0.8, 0.01), Some(Direction::Left)));
+        assert!(matches!(pick_direction(0.01, 0.8), Some(Direction::Up)));
+        assert!(matches!(pick_direction(0.01, -0.8), Some(Direction::Down)));
+    }
+
+    #[test]
+    fn direction_picks_diagonal_when_both_axes_significant() {
+        assert!(matches!(pick_direction(0.8, 0.5), Some(Direction::RightUp)));
+        assert!(matches!(
+            pick_direction(-0.8, 0.5),
+            Some(Direction::LeftUp)
+        ));
+        assert!(matches!(
+            pick_direction(0.8, -0.5),
+            Some(Direction::RightDown)
+        ));
+        assert!(matches!(
+            pick_direction(-0.8, -0.5),
+            Some(Direction::LeftDown)
+        ));
     }
 
     #[test]
