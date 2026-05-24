@@ -11,10 +11,12 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::common::{NeoInstance, NeoReactor};
 use crate::config::{CameraConfig, Config, OnvifGlobalConfig, StreamConfig};
+use crate::onvif::events::EventsManager;
 use neolink_core::bc_protocol::BcCamera;
 
 /// Hard cap for a single SOAP-time camera read. The shared `NeoInstance`
@@ -105,6 +107,9 @@ pub(crate) struct CameraEntry {
     /// Tracks an in-flight continuous-PTZ background task so the next
     /// `Stop` / replacement can abort it cleanly.
     pub(crate) zoom_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Per-camera ONVIF events manager. Lazily starts a motion listener on
+    /// first subscription.
+    pub(crate) events: Arc<EventsManager>,
 }
 
 /// Shared state for every ONVIF handler (axum + WS-Discovery).
@@ -126,6 +131,9 @@ pub(crate) struct OnvifStateInner {
     /// outbound interface effectively never changes during a process
     /// lifetime, so we resolve once on first use.
     cached_local_ip: RwLock<Option<IpAddr>>,
+    /// Shared cancel token for background tasks (motion listeners, ...).
+    /// Set when the bridge starts so per-camera lazy tasks can hook into it.
+    pub(crate) cancel: RwLock<Option<CancellationToken>>,
 }
 
 impl OnvifState {
@@ -137,8 +145,25 @@ impl OnvifState {
                 globals: RwLock::new(globals),
                 rtsp_port: RwLock::new(rtsp_port),
                 cached_local_ip: RwLock::new(None),
+                cancel: RwLock::new(None),
             }),
         }
+    }
+
+    /// Stash the lifetime cancel token so per-camera event managers (which
+    /// can lazily spawn background tasks long after `sync_with_config`) can
+    /// hook into it.
+    pub(crate) async fn set_cancel(&self, cancel: CancellationToken) {
+        *self.inner.cancel.write().await = Some(cancel);
+    }
+
+    async fn cancel_token(&self) -> CancellationToken {
+        self.inner
+            .cancel
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(CancellationToken::new)
     }
 
     pub(crate) fn inner(&self) -> &OnvifStateInner {
@@ -195,8 +220,10 @@ impl OnvifState {
                 let uuid = build_camera_uuid(cam_cfg);
                 let permitted_users = cam_cfg.permitted_users.clone();
                 let entry = if let Some(prev) = existing.get(&cam_cfg.name) {
-                    // Reuse the existing NeoInstance + zoom task handle; just
-                    // refresh the descriptor fields that come from config.
+                    // Reuse the existing NeoInstance + zoom task handle + the
+                    // already-running events manager (so live subscriptions
+                    // survive a config reload). Just refresh the descriptor
+                    // fields that come from config.
                     Arc::new(CameraEntry {
                         name: cam_cfg.name.clone(),
                         channel_id: cam_cfg.channel_id,
@@ -205,6 +232,7 @@ impl OnvifState {
                         permitted_users,
                         instance: prev.instance.clone(),
                         zoom_task: prev.zoom_task.clone(),
+                        events: prev.events.clone(),
                     })
                 } else {
                     // A single misconfigured camera must not take down ONVIF
@@ -220,6 +248,12 @@ impl OnvifState {
                             continue;
                         }
                     };
+                    let cancel = self.cancel_token().await;
+                    let events = Arc::new(EventsManager::new(
+                        cam_cfg.name.clone(),
+                        instance.clone(),
+                        cancel,
+                    ));
                     Arc::new(CameraEntry {
                         name: cam_cfg.name.clone(),
                         channel_id: cam_cfg.channel_id,
@@ -228,6 +262,7 @@ impl OnvifState {
                         permitted_users,
                         instance,
                         zoom_task: Arc::new(Mutex::new(None)),
+                        events,
                     })
                 };
                 new_set.insert(cam_cfg.name.clone(), entry);

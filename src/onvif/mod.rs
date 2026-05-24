@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 mod cmdline;
 mod discovery;
+mod events;
 mod server;
 mod services;
 mod snapshot;
@@ -47,9 +48,9 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
     }
 
     let state = OnvifState::new(initial.onvif.clone(), initial.bind_port);
-    state.sync_with_config(&initial, &reactor).await?;
-
     let cancel = CancellationToken::new();
+    state.set_cancel(cancel.clone()).await;
+    state.sync_with_config(&initial, &reactor).await?;
     let mut set: JoinSet<AnyResult<()>> = JoinSet::new();
 
     let s_state = state.clone();
