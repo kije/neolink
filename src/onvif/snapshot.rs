@@ -5,6 +5,8 @@
 //! WS-UsernameToken doesn't apply to plain GET. This matches what other ONVIF
 //! bridges do.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -13,14 +15,21 @@ use base64::Engine;
 use neolink_core::bc_protocol::BcCamera;
 
 use crate::onvif::soap::constant_time_eq;
-use crate::onvif::state::OnvifState;
+use crate::onvif::state::{CameraEntry, OnvifState};
 
 pub(crate) async fn handler(
     State(state): State<OnvifState>,
     Path((cam_name, _stream)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !authenticated(&state, &cam_name, &headers).await {
+    // Fetch the camera entry once: a config-reload between the auth check and
+    // the fetch could otherwise validate against one entry and serve from a
+    // different one.
+    let Some(cam) = state.camera(&cam_name).await else {
+        return (StatusCode::NOT_FOUND, "Unknown camera").into_response();
+    };
+
+    if !authenticated(&state, &cam, &headers).await {
         let mut resp = (StatusCode::UNAUTHORIZED, "Authentication required").into_response();
         resp.headers_mut().insert(
             header::WWW_AUTHENTICATE,
@@ -28,10 +37,6 @@ pub(crate) async fn handler(
         );
         return resp;
     }
-
-    let Some(cam) = state.camera(&cam_name).await else {
-        return (StatusCode::NOT_FOUND, "Unknown camera").into_response();
-    };
 
     let jpeg = match cam
         .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_snapshot().await?) }))
@@ -47,14 +52,11 @@ pub(crate) async fn handler(
     ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response()
 }
 
-async fn authenticated(state: &OnvifState, cam_name: &str, headers: &HeaderMap) -> bool {
+async fn authenticated(state: &OnvifState, cam: &Arc<CameraEntry>, headers: &HeaderMap) -> bool {
     // No users configured at all → allow (matches RTSP's behaviour).
     let users_empty = state.inner().users.read().await.is_empty();
-    let permitted: Option<Vec<String>> = state
-        .camera(cam_name)
-        .await
-        .and_then(|c| c.permitted_users.clone());
-    let no_acl = permitted.as_ref().map(|v| v.is_empty()).unwrap_or(true);
+    let permitted = cam.permitted_users.as_ref();
+    let no_acl = permitted.map(|v| v.is_empty()).unwrap_or(true);
     if users_empty && no_acl {
         return true;
     }

@@ -2028,6 +2028,7 @@ dependencies = [
  "md5",
  "neolink_core",
  "once_cell",
+ "percent-encoding",
  "quick-xml",
  "regex",
  "rumqttc",

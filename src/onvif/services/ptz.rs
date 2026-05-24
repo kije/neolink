@@ -122,6 +122,38 @@ fn parse_velocity(xml: &str, wrapper: &str) -> Velocity {
     v
 }
 
+/// Is there a `<Zoom .../>` element nested inside the named wrapper element?
+/// Used to disambiguate "Zoom omitted" from "Zoom = 0.0" without false-matching
+/// on a sibling like `<Speed><Zoom .../></Speed>`.
+fn zoom_present_in(xml: &str, wrapper: &str) -> bool {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut in_wrap = false;
+    loop {
+        match reader.read_event() {
+            Err(_) | Ok(Event::Eof) => return false,
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = std::str::from_utf8(e.name().into_inner()).unwrap_or("");
+                let local = name.rsplit(':').next().unwrap_or(name);
+                if local == wrapper {
+                    in_wrap = true;
+                }
+                if in_wrap && local == "Zoom" {
+                    return true;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = std::str::from_utf8(e.name().into_inner()).unwrap_or("");
+                let local = name.rsplit(':').next().unwrap_or(name);
+                if local == wrapper {
+                    in_wrap = false;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Read boolean flags `<PanTilt>true</PanTilt>` / `<Zoom>true</Zoom>` from a
 /// `Stop` request body. Default — when neither tag is present — is to stop
 /// both axes.
@@ -162,13 +194,22 @@ async fn abort_zoom_task(cam: &CameraEntry) {
 
 /// Spawn a background task that approximates a continuous-zoom move. Reolink
 /// has no native "zoom velocity" so we simulate it by stepping `zoom_to`.
+///
+/// The mutex is held across abort+spawn+store so two concurrent
+/// `ContinuousMove` requests can't leak the previous task: without atomicity
+/// it's possible for both calls to abort the slot, both spawn a fresh task,
+/// then race to store — the loser's handle is dropped without being aborted
+/// and keeps stepping zoom in the background.
 async fn spawn_zoom_task(cam: &Arc<CameraEntry>, dir: f32) {
-    abort_zoom_task(cam).await;
+    let mut g = cam.zoom_task.lock().await;
+    if let Some(h) = g.take() {
+        h.abort();
+    }
     let cam2 = cam.clone();
     let h = tokio::spawn(async move {
         let _ = run_zoom_loop(cam2, dir).await;
     });
-    *cam.zoom_task.lock().await = Some(h);
+    *g = Some(h);
 }
 
 async fn run_zoom_loop(cam: Arc<CameraEntry>, dir: f32) -> Result<()> {
@@ -287,7 +328,11 @@ pub(crate) async fn dispatch(
                     reason: "Reolink cameras do not support absolute pan/tilt".to_string(),
                 });
             }
-            if position.zoom != 0.0 || body_xml.contains("Zoom") {
+            // We need to distinguish "client sent Zoom=0.0" (move to fully
+            // wide) from "client omitted Zoom entirely" (don't touch zoom).
+            // Scan only for a Zoom element nested in Position so a sibling
+            // <Speed><Zoom .../></Speed> doesn't trigger an unintended move.
+            if zoom_present_in(body_xml, "Position") {
                 absolute_zoom(cam, position.zoom).await.map_err(other_fault)?;
             }
             "<tptz:AbsoluteMoveResponse/>".to_string()

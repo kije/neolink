@@ -35,8 +35,15 @@ pub(crate) struct UsernameToken {
     pub(crate) username: String,
     /// Either the plain password (`PasswordText`) or the SHA1 digest.
     pub(crate) credential: Credential,
-    /// Optional `Created` timestamp; only meaningful when `digest`.
+    /// Optional parsed `Created` timestamp, used for the freshness/drift
+    /// check on digest tokens.
     pub(crate) created: Option<DateTime<Utc>>,
+    /// The verbatim text of `<wsu:Created>...</wsu:Created>`. We *must* feed
+    /// this into the SHA1, not a reformatted version, because the client's
+    /// digest used its own string. ISO8601 has many valid representations
+    /// (with/without fractional seconds, `Z` vs `+00:00`, ...) and clients
+    /// vary.
+    pub(crate) created_text: Option<String>,
     /// Optional `Nonce` (base64-encoded raw bytes).
     pub(crate) nonce: Option<Vec<u8>>,
 }
@@ -58,6 +65,7 @@ pub(crate) fn parse_envelope(xml: &str) -> Result<ParsedRequest<'_>> {
     let mut current_user: Option<String> = None;
     let mut current_pw: Option<Credential> = None;
     let mut current_created: Option<DateTime<Utc>> = None;
+    let mut current_created_text: Option<String> = None;
     let mut current_nonce: Option<Vec<u8>> = None;
     let mut current_field: Option<&'static str> = None;
 
@@ -144,6 +152,7 @@ pub(crate) fn parse_envelope(xml: &str) -> Result<ParsedRequest<'_>> {
                                 username: u,
                                 credential: c,
                                 created: current_created.take(),
+                                created_text: current_created_text.take(),
                                 nonce: current_nonce.take(),
                             });
                         }
@@ -160,9 +169,11 @@ pub(crate) fn parse_envelope(xml: &str) -> Result<ParsedRequest<'_>> {
                     Some("PasswordDigest") => current_pw = Some(Credential::Digest(text)),
                     Some("Nonce") => current_nonce = B64.decode(text.as_bytes()).ok(),
                     Some("Created") => {
-                        current_created = DateTime::parse_from_rfc3339(text.trim())
+                        let trimmed = text.trim().to_string();
+                        current_created = DateTime::parse_from_rfc3339(&trimmed)
                             .ok()
                             .map(|t| t.with_timezone(&Utc));
+                        current_created_text = Some(trimmed);
                     }
                     _ => {}
                 }
@@ -209,7 +220,9 @@ pub(crate) fn verify_token(token: &UsernameToken, users: &HashMap<String, String
     match &token.credential {
         Credential::Plain(p) => constant_time_eq(p.as_bytes(), stored.as_bytes()),
         Credential::Digest(d) => {
-            let (Some(nonce), Some(created)) = (&token.nonce, &token.created) else {
+            let (Some(nonce), Some(created), Some(created_text)) =
+                (&token.nonce, &token.created, &token.created_text)
+            else {
                 return false;
             };
             // ONVIF guidance: timestamp must be within a few minutes. We use 5.
@@ -217,17 +230,13 @@ pub(crate) fn verify_token(token: &UsernameToken, users: &HashMap<String, String
             if drift > 5 {
                 return false;
             }
-            // Base64(SHA1(nonce + created_string + password))
-            // The Created element is repeated verbatim from the request,
-            // which we converted to a DateTime. To match the digest the
-            // client computed we recompute from its ISO8601 representation.
-            // Easiest cross-implementation match: reparse the original text
-            // — but we kept the parsed value. Reformat using RFC3339 with
-            // 'Z' suffix, which python-onvif and gsoap both emit.
-            let created_str = created.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+            // Base64(SHA1(nonce + Created_text + password))
+            // We use the verbatim Created text the client sent because clients
+            // vary in formatting (with/without fractional seconds, `Z` vs
+            // `+00:00`, ...) and the SHA1 has to match byte-for-byte.
             let mut hasher = Sha1::new();
             hasher.update(nonce);
-            hasher.update(created_str.as_bytes());
+            hasher.update(created_text.as_bytes());
             hasher.update(stored.as_bytes());
             let computed = B64.encode(hasher.finalize());
             constant_time_eq(computed.as_bytes(), d.as_bytes())
@@ -429,5 +438,75 @@ mod tests {
 </env:Envelope>"#;
         let parsed = parse_envelope(xml).unwrap();
         assert_eq!(parsed.action, "GetProfiles");
+    }
+
+    /// Regression: the digest SHA1 must use the verbatim `Created` text the
+    /// client sent. Real clients (python-onvif, gsoap, ONVIF Device Manager,
+    /// Frigate) commonly omit fractional seconds — `2026-05-23T12:34:56Z` —
+    /// so any reformatting of the timestamp breaks digest verification.
+    #[test]
+    fn digest_uses_verbatim_created_text() {
+        use chrono::Utc;
+        let password = "mepass";
+        let nonce = b"some-random-nonce";
+        let created_text = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(); // NO fractional seconds — matches what real clients send
+        let nonce_b64 = B64.encode(nonce);
+
+        let mut hasher = Sha1::new();
+        hasher.update(nonce);
+        hasher.update(created_text.as_bytes());
+        hasher.update(password.as_bytes());
+        let digest = B64.encode(hasher.finalize());
+
+        let xml = format!(
+            r#"<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+      <wsse:UsernameToken>
+        <wsse:Username>me</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest}</wsse:Password>
+        <wsse:Nonce>{nonce_b64}</wsse:Nonce>
+        <wsu:Created xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">{created_text}</wsu:Created>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </env:Header>
+  <env:Body><tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/></env:Body>
+</env:Envelope>"#
+        );
+        let parsed = parse_envelope(&xml).unwrap();
+        let tok = parsed.auth.expect("token");
+        let mut users = HashMap::new();
+        users.insert("me".to_string(), password.to_string());
+        assert!(verify_token(&tok, &users), "digest should verify");
+    }
+
+    #[test]
+    fn digest_rejects_wrong_password() {
+        use chrono::Utc;
+        let nonce = b"some-random-nonce";
+        let created_text = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let nonce_b64 = B64.encode(nonce);
+        let mut hasher = Sha1::new();
+        hasher.update(nonce);
+        hasher.update(created_text.as_bytes());
+        hasher.update(b"wrongpass");
+        let digest = B64.encode(hasher.finalize());
+
+        let xml = format!(
+            r#"<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Header><wsse:Security xmlns:wsse="x"><wsse:UsernameToken>
+    <wsse:Username>me</wsse:Username>
+    <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest}</wsse:Password>
+    <wsse:Nonce>{nonce_b64}</wsse:Nonce>
+    <wsu:Created xmlns:wsu="y">{created_text}</wsu:Created>
+  </wsse:UsernameToken></wsse:Security></env:Header>
+  <env:Body><tds:Foo xmlns:tds="x"/></env:Body>
+</env:Envelope>"#
+        );
+        let parsed = parse_envelope(&xml).unwrap();
+        let tok = parsed.auth.expect("token");
+        let mut users = HashMap::new();
+        users.insert("me".to_string(), "mepass".to_string());
+        assert!(!verify_token(&tok, &users), "digest should reject bad pw");
     }
 }

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -207,10 +207,19 @@ impl OnvifState {
                         zoom_task: prev.zoom_task.clone(),
                     })
                 } else {
-                    let instance = reactor
-                        .get(&cam_cfg.name)
-                        .await
-                        .with_context(|| format!("ONVIF: attaching to camera {}", cam_cfg.name))?;
+                    // A single misconfigured camera must not take down ONVIF
+                    // for the rest. Log and skip; the user will see a clear
+                    // warning and the other cameras keep working.
+                    let instance = match reactor.get(&cam_cfg.name).await {
+                        Ok(i) => i,
+                        Err(e) => {
+                            log::warn!(
+                                "ONVIF: cannot attach to camera {}: {e:?}; skipping",
+                                cam_cfg.name
+                            );
+                            continue;
+                        }
+                    };
                     Arc::new(CameraEntry {
                         name: cam_cfg.name.clone(),
                         channel_id: cam_cfg.channel_id,
@@ -222,6 +231,27 @@ impl OnvifState {
                     })
                 };
                 new_set.insert(cam_cfg.name.clone(), entry);
+            }
+        }
+
+        // Loud warning for a config that would lock everyone out: per-camera
+        // permitted_users is set but the global [[users]] table is empty, so
+        // no authentication can ever succeed.
+        let users_empty = self.inner.users.read().await.is_empty();
+        if users_empty {
+            for entry in new_set.values() {
+                if entry
+                    .permitted_users
+                    .as_ref()
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+                {
+                    log::warn!(
+                        "ONVIF: camera {} has permitted_users set but no [[users]] are \
+                         configured globally — clients will be unable to authenticate.",
+                        entry.name
+                    );
+                }
             }
         }
 
@@ -305,4 +335,26 @@ pub(crate) fn detect_local_ipv4() -> Result<IpAddr> {
         .map_err(|e| anyhow!("Failed to detect local IPv4: {e}"))?;
     let addr = s.local_addr()?;
     Ok(addr.ip())
+}
+
+/// Percent-encode a camera name (or any user-supplied URL path segment) for
+/// safe inclusion in HTTP/RTSP URIs. Camera names like `"storage shed"`
+/// would otherwise produce malformed URIs that some VMS clients reject.
+pub(crate) fn url_path_segment(s: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+    // RFC 3986 'pchar' minus '%' for the leading byte we generate ourselves.
+    const SET: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}')
+        .add(b'/')
+        .add(b':')
+        .add(b'\\');
+    utf8_percent_encode(s, SET).to_string()
 }

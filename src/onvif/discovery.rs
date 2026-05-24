@@ -15,12 +15,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::onvif::soap::xml_escape;
-use crate::onvif::state::OnvifState;
+use crate::onvif::state::{url_path_segment, OnvifState};
 
 const WS_DISCOVERY_PORT: u16 = 3702;
 const WS_DISCOVERY_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
@@ -36,7 +35,6 @@ pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<
         }
     };
     let socket = Arc::new(socket);
-    let sent = Arc::new(Mutex::new(()));
 
     // Hello on startup for each camera.
     send_hello_for_all(&state, &socket).await;
@@ -70,7 +68,6 @@ pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<
 
     cancel.cancelled().await;
     inbound.abort();
-    drop(sent);
     send_bye_for_all(&state, &socket).await;
     Ok(())
 }
@@ -165,7 +162,10 @@ onvif://www.onvif.org/location/neolink"
 }
 
 fn xaddr(authority: &str, cam: &str) -> String {
-    let cam = xml_escape(cam);
+    // URL-encode the camera name so names with spaces / special chars produce
+    // a syntactically valid URI; then XML-escape what we drop into the
+    // SOAP envelope.
+    let cam = xml_escape(&url_path_segment(cam));
     format!("http://{authority}/onvif/{cam}/device_service")
 }
 

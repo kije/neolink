@@ -4,7 +4,7 @@ use anyhow::Result;
 use neolink_core::bc_protocol::BcCamera;
 
 use crate::onvif::soap::{wrap_envelope, xml_escape, FaultCode, NS_ALL};
-use crate::onvif::state::{CameraEntry, OnvifState};
+use crate::onvif::state::{url_path_segment, CameraEntry, OnvifState};
 
 pub(crate) struct DeviceInfo {
     pub(crate) manufacturer: String,
@@ -97,18 +97,10 @@ pub(crate) async fn dispatch(
                 code: FaultCode::Other,
                 reason: format!("Failed to determine advertise host: {e}"),
             })?;
-            let dev = format!(
-                "http://{authority}/onvif/{cam_name}/device_service",
-                cam_name = cam.name
-            );
-            let media = format!(
-                "http://{authority}/onvif/{cam_name}/media_service",
-                cam_name = cam.name
-            );
-            let ptz = format!(
-                "http://{authority}/onvif/{cam_name}/ptz_service",
-                cam_name = cam.name
-            );
+            let cam_seg = url_path_segment(&cam.name);
+            let dev = format!("http://{authority}/onvif/{cam_seg}/device_service");
+            let media = format!("http://{authority}/onvif/{cam_seg}/media_service");
+            let ptz = format!("http://{authority}/onvif/{cam_seg}/ptz_service");
             if action == "GetCapabilities" {
                 format!(
                     "<tds:GetCapabilitiesResponse><tds:Capabilities>\

@@ -9,7 +9,7 @@ use quick_xml::Reader;
 
 use crate::onvif::services::device::FaultBody;
 use crate::onvif::soap::{wrap_envelope, xml_escape, FaultCode, NS_ALL};
-use crate::onvif::state::{CameraEntry, OnvifState, OnvifStream};
+use crate::onvif::state::{url_path_segment, CameraEntry, OnvifState, OnvifStream};
 
 /// Per-stream descriptor used to build profile XML.
 struct StreamDesc {
@@ -233,7 +233,7 @@ pub(crate) async fn dispatch(
             let port = state.rtsp_port().await;
             let uri = format!(
                 "rtsp://{host}:{port}/{cam_name}/{path}",
-                cam_name = cam.name,
+                cam_name = url_path_segment(&cam.name),
                 path = stream.stream.as_rtsp_path(),
             );
             format!(
@@ -262,7 +262,7 @@ pub(crate) async fn dispatch(
             let authority = state.advertise_authority().await.map_err(other_fault)?;
             let uri = format!(
                 "http://{authority}/onvif/{cam}/snapshot/{path}",
-                cam = cam.name,
+                cam = url_path_segment(&cam.name),
                 path = stream.stream.as_rtsp_path(),
             );
             format!(
