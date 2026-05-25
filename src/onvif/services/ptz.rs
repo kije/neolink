@@ -132,12 +132,21 @@ fn zoom_present_in(xml: &str, wrapper: &str) -> bool {
     loop {
         match reader.read_event() {
             Err(_) | Ok(Event::Eof) => return false,
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+            Ok(Event::Start(e)) => {
                 let name = std::str::from_utf8(e.name().into_inner()).unwrap_or("");
                 let local = name.rsplit(':').next().unwrap_or(name);
                 if local == wrapper {
+                    // Enter the wrapper. We don't enter on Event::Empty for
+                    // the wrapper itself because a self-closing `<Position/>`
+                    // has no children — nothing inside to match.
                     in_wrap = true;
+                } else if in_wrap && local == "Zoom" {
+                    return true;
                 }
+            }
+            Ok(Event::Empty(e)) => {
+                let name = std::str::from_utf8(e.name().into_inner()).unwrap_or("");
+                let local = name.rsplit(':').next().unwrap_or(name);
                 if in_wrap && local == "Zoom" {
                     return true;
                 }
@@ -200,25 +209,36 @@ async fn abort_zoom_task(cam: &CameraEntry) {
 /// it's possible for both calls to abort the slot, both spawn a fresh task,
 /// then race to store — the loser's handle is dropped without being aborted
 /// and keeps stepping zoom in the background.
+///
+/// The spawned task holds a *Weak* reference to the CameraEntry, not Arc.
+/// Storing a JoinHandle for self on the entry would otherwise be a reference
+/// cycle (entry → JoinHandle for task → task closure → Arc<entry>) that
+/// keeps the entry alive forever after the bridge drops it from the map.
 async fn spawn_zoom_task(cam: &Arc<CameraEntry>, dir: f32) {
     let mut g = cam.zoom_task.lock().await;
     if let Some(h) = g.take() {
         h.abort();
     }
-    let cam2 = cam.clone();
+    let cam_weak = Arc::downgrade(cam);
     let h = tokio::spawn(async move {
-        let _ = run_zoom_loop(cam2, dir).await;
+        let _ = run_zoom_loop(cam_weak, dir).await;
     });
     *g = Some(h);
 }
 
-async fn run_zoom_loop(cam: Arc<CameraEntry>, dir: f32) -> Result<()> {
-    // Probe the current zoom range up-front.
+async fn run_zoom_loop(cam_weak: std::sync::Weak<CameraEntry>, dir: f32) -> Result<()> {
+    // The loop body upgrades the Weak to Arc only for the duration of a single
+    // step; if the entry has been dropped (config reload removed the camera,
+    // bridge shutdown, ...) we exit cleanly without holding it alive.
+    let Some(cam) = cam_weak.upgrade() else {
+        return Ok(());
+    };
     let zf = cam
         .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_zoom().await?) }))
         .await?;
     let min = zf.zoom.min_pos;
     let max = zf.zoom.max_pos;
+    drop(cam);
     if max <= min {
         return Ok(());
     }
@@ -234,6 +254,9 @@ async fn run_zoom_loop(cam: Arc<CameraEntry>, dir: f32) -> Result<()> {
             break;
         }
         let target = next;
+        let Some(cam) = cam_weak.upgrade() else {
+            return Ok(());
+        };
         cam.run(move |c: &BcCamera| {
             Box::pin(async move {
                 c.zoom_to(target).await?;
@@ -241,6 +264,7 @@ async fn run_zoom_loop(cam: Arc<CameraEntry>, dir: f32) -> Result<()> {
             })
         })
         .await?;
+        drop(cam);
         cur = next;
         // Roughly 4 steps/sec — fast enough for HA's typical 250-500ms
         // press-and-hold pulses, slow enough to not saturate the camera.
@@ -651,5 +675,34 @@ mod tests {
         assert_eq!(parse_preset_id("preset_7"), Some(7));
         assert_eq!(parse_preset_id("preset_xyz"), None);
         assert_eq!(parse_preset_id("xyz"), None);
+    }
+
+    /// Regression: `<Position/>` self-closing must not put `zoom_present_in`
+    /// in the "inside wrapper" state, otherwise a later `<Speed><Zoom/></Speed>`
+    /// would falsely match.
+    #[test]
+    fn zoom_present_self_closing_position_does_not_match_speed_zoom() {
+        let xml = r#"<tptz:AbsoluteMove xmlns:tptz="x" xmlns:tt="y">
+<tptz:ProfileToken>p</tptz:ProfileToken>
+<tptz:Position/>
+<tptz:Speed><tt:Zoom x="0.5"/></tptz:Speed>
+</tptz:AbsoluteMove>"#;
+        assert!(!zoom_present_in(xml, "Position"));
+    }
+
+    #[test]
+    fn zoom_present_inside_position_matches() {
+        let xml = r#"<tptz:AbsoluteMove xmlns:tptz="x" xmlns:tt="y">
+<tptz:Position><tt:Zoom x="0.5"/></tptz:Position>
+</tptz:AbsoluteMove>"#;
+        assert!(zoom_present_in(xml, "Position"));
+    }
+
+    #[test]
+    fn zoom_present_only_inside_wrapper() {
+        let xml = r#"<tptz:AbsoluteMove xmlns:tptz="x" xmlns:tt="y">
+<tptz:Speed><tt:Zoom x="0.5"/></tptz:Speed>
+</tptz:AbsoluteMove>"#;
+        assert!(!zoom_present_in(xml, "Position"));
     }
 }

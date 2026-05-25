@@ -694,8 +694,13 @@ pub struct Preset {
     /// The preset name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Command: Known values: `"toPos"` and `"setPos"`
-    pub command: String,
+    /// Command: Known values: `"toPos"` (move to preset) and `"setPos"` (save
+    /// current position as preset). Set on outgoing requests; the camera's
+    /// reply to `MSG_ID_GET_PTZ_PRESET` lists existing presets without this
+    /// field, so it must be optional on receive or the whole reply fails to
+    /// deserialize and the BC connection gets torn down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// A list of battery infos. This message is sent from the camera as

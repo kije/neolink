@@ -145,7 +145,16 @@ async fn dispatch_service(
 fn soap_ok(xml: String) -> Response {
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, SOAP_CONTENT_TYPE)],
+        [
+            (axum::http::header::CONTENT_TYPE, SOAP_CONTENT_TYPE),
+            // Force-close the TCP connection after each SOAP response. ONVIF
+            // SOAP traffic is stateless and very low-rate (clients poll on
+            // human timescales), so HTTP keep-alive buys nothing. Letting
+            // hyper keep idle connections open for the default 75s lets even
+            // a handful of polling VMS clients accumulate hundreds of idle
+            // FDs in the bridge until accept() starts failing with EMFILE.
+            (axum::http::header::CONNECTION, "close"),
+        ],
         xml,
     )
         .into_response()
@@ -155,7 +164,10 @@ fn soap_fault(code: FaultCode, reason: &str) -> Response {
     let xml = fault_envelope(code, reason, None);
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, SOAP_CONTENT_TYPE)],
+        [
+            (axum::http::header::CONTENT_TYPE, SOAP_CONTENT_TYPE),
+            (axum::http::header::CONNECTION, "close"),
+        ],
         xml,
     )
         .into_response()
