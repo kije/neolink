@@ -242,9 +242,11 @@ pub(super) async fn make_factory(
 
                         // Run blocking code on a seperate thread
                         // This is not an async thread
+                        let max_fps = config.max_fps;
                         std::thread::spawn(move || {
                             let mut aud_ts = 0u32;
                             let mut vid_ts = 0u32;
+                            let mut vid_frame_count = 0u32;
                             let mut pools = Default::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
@@ -256,6 +258,8 @@ pub(super) async fn make_factory(
                                     &aud_src,
                                     &mut vid_ts,
                                     &mut aud_ts,
+                                    &mut vid_frame_count,
+                                    max_fps,
                                     &stream_config,
                                 )?;
                             }
@@ -269,6 +273,8 @@ pub(super) async fn make_factory(
                                     &aud_src,
                                     &mut vid_ts,
                                     &mut aud_ts,
+                                    &mut vid_frame_count,
+                                    max_fps,
                                     &stream_config,
                                 );
                                 if let Err(r) = &r {
@@ -306,6 +312,8 @@ fn send_to_sources(
     aud_src: &Option<AppSrc>,
     vid_ts: &mut u32,
     aud_ts: &mut u32,
+    vid_frame_count: &mut u32,
+    max_fps: Option<u32>,
     stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     // Update TS
@@ -340,12 +348,26 @@ fn send_to_sources(
         }
         BcMedia::Iframe(BcMediaIframe { data, .. })
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
-            if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+            // Feature 2 & 4: FPS limiting — drop frames before they enter the GStreamer/RTSP
+            // pipeline. Timestamps always advance at the camera rate so the pipeline's
+            // internal clock stays correct; we just don't push every buffer.
+            let should_send = match max_fps {
+                Some(limit) if limit > 0 && stream_config.fps > limit => {
+                    // ceiling-integer frame_skip: e.g. 15fps camera / 5fps limit → skip=3
+                    let frame_skip = (stream_config.fps + limit - 1) / limit;
+                    *vid_frame_count % frame_skip == 0
+                }
+                _ => true,
+            };
+            if should_send {
+                if let Some(vid_src) = vid_src.as_ref() {
+                    log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
+                    send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                }
             }
             const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
+            *vid_ts = vid_ts.saturating_add(MICROSECONDS / stream_config.fps.max(1));
+            *vid_frame_count = vid_frame_count.wrapping_add(1);
         }
         _ => {}
     }
