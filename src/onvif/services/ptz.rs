@@ -655,10 +655,7 @@ mod tests {
     #[test]
     fn direction_picks_diagonal_when_both_axes_significant() {
         assert!(matches!(pick_direction(0.8, 0.5), Some(Direction::RightUp)));
-        assert!(matches!(
-            pick_direction(-0.8, 0.5),
-            Some(Direction::LeftUp)
-        ));
+        assert!(matches!(pick_direction(-0.8, 0.5), Some(Direction::LeftUp)));
         assert!(matches!(
             pick_direction(0.8, -0.5),
             Some(Direction::RightDown)
