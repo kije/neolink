@@ -39,7 +39,12 @@ bind = "0.0.0.0"
 # Each enabled camera becomes a virtual ONVIF Profile S device served at
 #     http://<host>:<bind_port>/onvif/<camera-name>/device_service
 # VMS clients (Home Assistant, Frigate, BlueIris, ...) can then discover the
-# camera over WS-Discovery, fetch the RTSP URL automatically, and control PTZ.
+# camera over WS-Discovery, fetch the RTSP URL automatically, control PTZ,
+# and subscribe to motion-detection events via the ONVIF Events service
+# (PullPoint subscriptions). The standard topic
+#     tns1:VideoSource/MotionAlarm
+# is published whenever the camera reports motion start/stop, so VMS clients
+# that record on motion (Frigate, BlueIris, ...) work out of the box.
 # [onvif]
 # enabled = true
 # bind = "0.0.0.0"

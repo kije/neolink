@@ -101,6 +101,7 @@ pub(crate) async fn dispatch(
             let dev = format!("http://{authority}/onvif/{cam_seg}/device_service");
             let media = format!("http://{authority}/onvif/{cam_seg}/media_service");
             let ptz = format!("http://{authority}/onvif/{cam_seg}/ptz_service");
+            let evt = format!("http://{authority}/onvif/{cam_seg}/events_service");
             if action == "GetCapabilities" {
                 format!(
                     "<tds:GetCapabilitiesResponse><tds:Capabilities>\
@@ -108,6 +109,7 @@ pub(crate) async fn dispatch(
 <tt:Network><tt:IPFilter>false</tt:IPFilter><tt:ZeroConfiguration>false</tt:ZeroConfiguration><tt:IPVersion6>false</tt:IPVersion6><tt:DynDNS>false</tt:DynDNS></tt:Network>\
 <tt:System><tt:DiscoveryResolve>false</tt:DiscoveryResolve><tt:DiscoveryBye>true</tt:DiscoveryBye><tt:RemoteDiscovery>false</tt:RemoteDiscovery><tt:SystemBackup>false</tt:SystemBackup><tt:SystemLogging>false</tt:SystemLogging><tt:FirmwareUpgrade>false</tt:FirmwareUpgrade></tt:System>\
 </tt:Device>\
+<tt:Events><tt:XAddr>{evt}</tt:XAddr><tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport><tt:WSPullPointSupport>true</tt:WSPullPointSupport><tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport></tt:Events>\
 <tt:Media><tt:XAddr>{media}</tt:XAddr><tt:StreamingCapabilities><tt:RTPMulticast>false</tt:RTPMulticast><tt:RTP_TCP>true</tt:RTP_TCP><tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP></tt:StreamingCapabilities></tt:Media>\
 <tt:PTZ><tt:XAddr>{ptz}</tt:XAddr></tt:PTZ>\
 </tds:Capabilities></tds:GetCapabilitiesResponse>"
@@ -117,6 +119,7 @@ pub(crate) async fn dispatch(
                     "<tds:GetServicesResponse>\
 <tds:Service><tds:Namespace>http://www.onvif.org/ver10/device/wsdl</tds:Namespace><tds:XAddr>{dev}</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version></tds:Service>\
 <tds:Service><tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace><tds:XAddr>{media}</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version></tds:Service>\
+<tds:Service><tds:Namespace>http://www.onvif.org/ver10/events/wsdl</tds:Namespace><tds:XAddr>{evt}</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version></tds:Service>\
 <tds:Service><tds:Namespace>http://www.onvif.org/ver20/ptz/wsdl</tds:Namespace><tds:XAddr>{ptz}</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version></tds:Service>\
 </tds:GetServicesResponse>"
                 )

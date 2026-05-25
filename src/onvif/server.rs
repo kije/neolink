@@ -11,7 +11,7 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use crate::onvif::services::{device, media, ptz};
+use crate::onvif::services::{device, events, media, ptz};
 use crate::onvif::snapshot;
 use crate::onvif::soap::{
     fault_envelope, is_unauth_allowed, parse_envelope, verify_token, FaultCode,
@@ -37,6 +37,11 @@ pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<
         .route("/onvif/:camera/device_service", post(device_service_route))
         .route("/onvif/:camera/media_service", post(media_service_route))
         .route("/onvif/:camera/ptz_service", post(ptz_service_route))
+        .route("/onvif/:camera/events_service", post(events_service_route))
+        .route(
+            "/onvif/:camera/subscription/:sub_id",
+            post(subscription_route),
+        )
         .layer(DefaultBodyLimit::max(SOAP_BODY_LIMIT))
         .route("/onvif/:camera/snapshot/:stream", get(snapshot::handler))
         .route("/onvif/:camera", get(camera_index))
@@ -85,10 +90,41 @@ async fn ptz_service_route(
     dispatch_service(state, cam, ServiceKind::Ptz, body).await
 }
 
+async fn events_service_route(
+    State(state): State<OnvifState>,
+    Path(cam): Path<String>,
+    body: String,
+) -> Response {
+    dispatch_service(state, cam, ServiceKind::Events, body).await
+}
+
+async fn subscription_route(
+    State(state): State<OnvifState>,
+    Path((cam_name, sub_id)): Path<(String, String)>,
+    body: String,
+) -> Response {
+    let Some(cam) = state.camera(&cam_name).await else {
+        return soap_fault(FaultCode::Other, &format!("Unknown camera '{cam_name}'"));
+    };
+    let parsed = match parse_envelope(&body) {
+        Ok(p) => p,
+        Err(e) => return soap_fault(FaultCode::InvalidArgs, &format!("Bad SOAP envelope: {e}")),
+    };
+    // Per-subscription endpoints require authentication too.
+    if let Err(e) = auth_check(&state, &cam, &parsed.auth, &parsed.action).await {
+        return soap_fault(FaultCode::NotAuthorized, e.reason());
+    }
+    match events::dispatch_subscription(&cam, &sub_id, &parsed.action, parsed.body_xml).await {
+        Ok(xml) => soap_ok(xml),
+        Err(fb) => soap_fault(fb.code, &fb.reason),
+    }
+}
+
 enum ServiceKind {
     Device,
     Media,
     Ptz,
+    Events,
 }
 
 async fn dispatch_service(
@@ -106,40 +142,75 @@ async fn dispatch_service(
         Err(e) => return soap_fault(FaultCode::InvalidArgs, &format!("Bad SOAP envelope: {e}")),
     };
 
-    // Auth check: skip for the small whitelist of operations that ONVIF
-    // explicitly permits anonymously.
-    if !is_unauth_allowed(&parsed.action) {
-        let users_empty = state.inner().users.read().await.is_empty();
-        let permitted = cam.permitted_users.clone();
-        let no_acl = permitted.as_ref().map(|v| v.is_empty()).unwrap_or(true);
-        // If neither global users nor camera ACL is configured we allow
-        // anonymous access (matches the existing RTSP behaviour).
-        if !(users_empty && no_acl) {
-            let Some(tok) = parsed.auth.as_ref() else {
-                return soap_fault(FaultCode::NotAuthorized, "WS-UsernameToken required");
-            };
-            let users = state.inner().users.read().await.clone();
-            if !verify_token(tok, &users) {
-                return soap_fault(FaultCode::NotAuthorized, "Bad credentials");
-            }
-            if let Some(allow) = permitted.as_ref() {
-                if !allow.is_empty() && !allow.iter().any(|u| u == &tok.username) {
-                    return soap_fault(FaultCode::NotAuthorized, "User not permitted");
-                }
-            }
-        }
+    if let Err(e) = auth_check(&state, &cam, &parsed.auth, &parsed.action).await {
+        return soap_fault(FaultCode::NotAuthorized, e.reason());
     }
 
     let result = match service {
         ServiceKind::Device => device::dispatch(&state, &cam, &parsed.action).await,
         ServiceKind::Media => media::dispatch(&state, &cam, &parsed.action, parsed.body_xml).await,
         ServiceKind::Ptz => ptz::dispatch(&state, &cam, &parsed.action, parsed.body_xml).await,
+        ServiceKind::Events => {
+            events::dispatch(&state, &cam, &parsed.action, parsed.body_xml).await
+        }
     };
 
     match result {
         Ok(xml) => soap_ok(xml),
         Err(fb) => soap_fault(fb.code, &fb.reason),
     }
+}
+
+/// Distinct auth-failure modes so the dispatcher can return the matching
+/// SOAP fault reason. All three map to `NotAuthorized`; the reason string is
+/// what differs and is what makes client troubleshooting tractable.
+enum AuthError {
+    MissingToken,
+    BadCredentials,
+    UserNotPermitted,
+}
+
+impl AuthError {
+    fn reason(&self) -> &'static str {
+        match self {
+            AuthError::MissingToken => "WS-UsernameToken required",
+            AuthError::BadCredentials => "Bad credentials",
+            AuthError::UserNotPermitted => "User not permitted",
+        }
+    }
+}
+
+/// Returns `Ok(())` if the request is allowed through. Anonymous access is
+/// allowed for the small ONVIF discovery whitelist, and for everything when
+/// no users / camera ACLs are configured (matching existing RTSP behaviour).
+async fn auth_check(
+    state: &OnvifState,
+    cam: &crate::onvif::state::CameraEntry,
+    auth: &Option<crate::onvif::soap::UsernameToken>,
+    action: &str,
+) -> Result<(), AuthError> {
+    if is_unauth_allowed(action) {
+        return Ok(());
+    }
+    let users_empty = state.inner().users.read().await.is_empty();
+    let permitted = cam.permitted_users.clone();
+    let no_acl = permitted.as_ref().map(|v| v.is_empty()).unwrap_or(true);
+    if users_empty && no_acl {
+        return Ok(());
+    }
+    let Some(tok) = auth.as_ref() else {
+        return Err(AuthError::MissingToken);
+    };
+    let users = state.inner().users.read().await.clone();
+    if !verify_token(tok, &users) {
+        return Err(AuthError::BadCredentials);
+    }
+    if let Some(allow) = permitted.as_ref() {
+        if !allow.is_empty() && !allow.iter().any(|u| u == &tok.username) {
+            return Err(AuthError::UserNotPermitted);
+        }
+    }
+    Ok(())
 }
 
 fn soap_ok(xml: String) -> Response {
