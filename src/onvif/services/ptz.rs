@@ -132,12 +132,21 @@ fn zoom_present_in(xml: &str, wrapper: &str) -> bool {
     loop {
         match reader.read_event() {
             Err(_) | Ok(Event::Eof) => return false,
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+            Ok(Event::Start(e)) => {
                 let name = std::str::from_utf8(e.name().into_inner()).unwrap_or("");
                 let local = name.rsplit(':').next().unwrap_or(name);
                 if local == wrapper {
+                    // Enter the wrapper. We don't enter on Event::Empty for
+                    // the wrapper itself because a self-closing `<Position/>`
+                    // has no children — nothing inside to match.
                     in_wrap = true;
+                } else if in_wrap && local == "Zoom" {
+                    return true;
                 }
+            }
+            Ok(Event::Empty(e)) => {
+                let name = std::str::from_utf8(e.name().into_inner()).unwrap_or("");
+                let local = name.rsplit(':').next().unwrap_or(name);
                 if in_wrap && local == "Zoom" {
                     return true;
                 }
@@ -651,5 +660,34 @@ mod tests {
         assert_eq!(parse_preset_id("preset_7"), Some(7));
         assert_eq!(parse_preset_id("preset_xyz"), None);
         assert_eq!(parse_preset_id("xyz"), None);
+    }
+
+    /// Regression: `<Position/>` self-closing must not put `zoom_present_in`
+    /// in the "inside wrapper" state, otherwise a later `<Speed><Zoom/></Speed>`
+    /// would falsely match.
+    #[test]
+    fn zoom_present_self_closing_position_does_not_match_speed_zoom() {
+        let xml = r#"<tptz:AbsoluteMove xmlns:tptz="x" xmlns:tt="y">
+<tptz:ProfileToken>p</tptz:ProfileToken>
+<tptz:Position/>
+<tptz:Speed><tt:Zoom x="0.5"/></tptz:Speed>
+</tptz:AbsoluteMove>"#;
+        assert!(!zoom_present_in(xml, "Position"));
+    }
+
+    #[test]
+    fn zoom_present_inside_position_matches() {
+        let xml = r#"<tptz:AbsoluteMove xmlns:tptz="x" xmlns:tt="y">
+<tptz:Position><tt:Zoom x="0.5"/></tptz:Position>
+</tptz:AbsoluteMove>"#;
+        assert!(zoom_present_in(xml, "Position"));
+    }
+
+    #[test]
+    fn zoom_present_only_inside_wrapper() {
+        let xml = r#"<tptz:AbsoluteMove xmlns:tptz="x" xmlns:tt="y">
+<tptz:Speed><tt:Zoom x="0.5"/></tptz:Speed>
+</tptz:AbsoluteMove>"#;
+        assert!(!zoom_present_in(xml, "Position"));
     }
 }

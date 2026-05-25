@@ -26,6 +26,7 @@ features not yet in upstream master.
 **Major Features**:
 
 - MQTT
+- ONVIF (Profile S — device discovery, RTSP/snapshot URI hand-off, PTZ)
 - Motion Detection
 - Paused Streams (when no rtsp client or no motion detected)
 - Save a still image to disk
@@ -189,6 +190,10 @@ Then to start the mqtt+rtsp connection run the following:
 ```bash
 ./neolink mqtt-rtsp --config=neolink.toml
 ```
+
+(If you also set `[onvif].enabled = true` in your config, `mqtt-rtsp` will
+spawn the ONVIF bridge alongside MQTT and RTSP automatically. See
+[ONVIF](#onvif) below.)
 
 OR for only mqtt
 
@@ -500,6 +505,95 @@ There are currently 2 environmental variables available as part of the container
 
 - `NEO_LINK_MODE`: defaults to `"rtsp"` if not set, other options are "mqtt" or "mqtt-rtsp".
 - `NEO_LINK_PORT`: defaults to `8554`, set this to your required port value.
+
+### ONVIF
+
+Neolink can expose each configured Reolink camera as a virtual ONVIF Profile S
+device. Standard VMS clients (Home Assistant, Frigate, BlueIris, Synology
+Surveillance Station, Agent DVR, ONVIF Device Manager, ...) can then:
+
+- discover the camera automatically over WS-Discovery (UDP multicast)
+- read its RTSP and JPEG-snapshot URLs without manual configuration
+- drive PTZ (continuous and relative pan/tilt, absolute & continuous zoom, presets)
+
+Each enabled camera becomes its own ONVIF device under
+`http://<host>:<onvif_port>/onvif/<camera-name>/...`. PTZ commands are
+translated to the same Reolink calls the CLI and MQTT surfaces already use,
+so no extra protocol code runs against the camera.
+
+To turn it on, add an `[onvif]` block to your config:
+
+```toml
+[onvif]
+enabled = true
+bind = "0.0.0.0"
+bind_port = 8000              # SOAP + snapshot HTTP server
+discovery = true              # answer multicast WS-Discovery probes
+advertise_host = "auto"       # "auto" picks the first non-loopback IPv4 NIC;
+                              # set to your LAN IP if auto-detection picks wrong
+```
+
+Then either run ONVIF on its own:
+
+```bash
+./neolink onvif --config=neolink.toml
+```
+
+…or, more commonly, alongside the other services with the combined launcher
+(which now spawns RTSP, MQTT, **and** ONVIF in one process):
+
+```bash
+./neolink mqtt-rtsp --config=neolink.toml
+```
+
+#### Per-camera ONVIF options
+
+Each camera can opt out, or pin a stable UUID:
+
+```toml
+[[cameras]]
+name = "driveway"
+# ... usual camera fields
+  [cameras.onvif]
+  enabled = true            # default true when the global [onvif] is enabled
+  uuid    = "auto"          # "auto" → UUIDv5 derived from name + UID
+                            # or supply a fixed UUID for explicit identity
+```
+
+#### What's exposed
+
+| ONVIF service | Operations |
+|---|---|
+| Device | `GetDeviceInformation`, `GetSystemDateAndTime`, `GetCapabilities`, `GetServices`, `GetServiceCapabilities`, `GetHostname`, `GetScopes` |
+| Media  | `GetProfiles`, `GetProfile`, `GetStreamUri`, `GetSnapshotUri`, `GetVideoSources`, `GetVideoEncoderConfigurations` |
+| PTZ    | `GetNodes`, `GetConfigurations`, `GetConfigurationOptions`, `ContinuousMove`, `RelativeMove`, `AbsoluteMove` (zoom only), `Stop`, `GetStatus`, `GetPresets`, `GotoPreset`, `SetPreset`, `GotoHomePosition` |
+
+`GetSnapshotUri` returns `http://<host>:<onvif_port>/onvif/<camera>/snapshot/<stream>`;
+that URL serves a JPEG produced by Reolink's `SNAP` command (HTTP Basic auth,
+using the same `[[users]]` table).
+
+`GetStreamUri` returns the existing neolink RTSP URL, so the ONVIF client
+ends up streaming through the regular RTSP server.
+
+#### Authentication
+
+ONVIF SOAP uses **WS-UsernameToken** (`PasswordText` or `PasswordDigest`); the
+snapshot HTTP endpoint uses **HTTP Basic**. Both consult the same global
+`[[users]]` table that RTSP uses, and honour each camera's `permitted_users`
+list. A handful of operations are reachable without auth as required by the
+ONVIF spec: `GetSystemDateAndTime`, `GetCapabilities`, `GetServices`,
+`GetServiceCapabilities`.
+
+#### Limitations
+
+- **No absolute pan/tilt**: the underlying Reolink protocol doesn't expose
+  absolute PT coordinates, so `AbsoluteMove` for pan/tilt returns the
+  standard `ter:NoAbsolutePTZSpace` fault. Profile S explicitly allows this
+  on continuous-only devices; `RelativeMove` and `ContinuousMove` work.
+- **No Profile T (Events)** yet. Motion / IO alarms aren't surfaced via
+  ONVIF — use the MQTT surface for those today.
+- **No HTTPS yet** on the ONVIF port. Run behind a TLS-terminating reverse
+  proxy if you need it.
 
 ### Image
 
