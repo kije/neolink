@@ -62,7 +62,13 @@ pub(crate) struct Notification {
 pub(crate) struct Subscription {
     pub(crate) id: String,
     pub(crate) created_at: DateTime<Utc>,
-    pub(crate) terminates_at: Mutex<DateTime<Utc>>,
+    /// Termination timestamp is a tiny `Copy` value updated by
+    /// `Subscription::renew` and read by `termination_time` /
+    /// `EventsManager::reap_expired`. A `std::sync::Mutex` is correct here:
+    /// the critical section is just a load/store with no `.await` points,
+    /// and using a sync mutex lets `reap_expired` iterate without holding
+    /// the global `subs` lock across `.await`.
+    terminates_at: std::sync::Mutex<DateTime<Utc>>,
     pending: Mutex<VecDeque<Notification>>,
     /// Pinged when a new notification is enqueued so a long-polling
     /// `PullMessages` can return early.
@@ -78,7 +84,7 @@ impl Subscription {
         Self {
             id,
             created_at: now,
-            terminates_at: Mutex::new(term),
+            terminates_at: std::sync::Mutex::new(term),
             pending: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
         }
@@ -120,16 +126,22 @@ impl Subscription {
         }
     }
 
-    pub(crate) async fn renew(&self, ttl: Duration) -> DateTime<Utc> {
+    pub(crate) fn renew(&self, ttl: Duration) -> DateTime<Utc> {
         let new_term = Utc::now()
             + chrono::Duration::from_std(ttl.min(MAX_SUBSCRIPTION_TTL))
                 .unwrap_or_else(|_| chrono::Duration::seconds(60));
-        *self.terminates_at.lock().await = new_term;
+        *self
+            .terminates_at
+            .lock()
+            .expect("terminates_at mutex poisoned") = new_term;
         new_term
     }
 
-    pub(crate) async fn termination_time(&self) -> DateTime<Utc> {
-        *self.terminates_at.lock().await
+    pub(crate) fn termination_time(&self) -> DateTime<Utc> {
+        *self
+            .terminates_at
+            .lock()
+            .expect("terminates_at mutex poisoned")
     }
 }
 
@@ -206,16 +218,14 @@ impl EventsManager {
 
     async fn reap_expired(&self) {
         let now = Utc::now();
-        let mut subs = self.subs.write().await;
-        let mut to_drop = Vec::new();
-        for (id, s) in subs.iter() {
-            if s.termination_time().await < now {
-                to_drop.push(id.clone());
-            }
-        }
-        for id in to_drop {
-            subs.remove(&id);
-        }
+        // `termination_time` is now sync, so we can do the whole sweep
+        // without releasing the write-lock — but more importantly, without
+        // awaiting while holding it. That keeps subscription operations
+        // unblocked even when many entries are present.
+        self.subs
+            .write()
+            .await
+            .retain(|_, s| s.termination_time() >= now);
     }
 
     async fn ensure_listener_running(self: &Arc<Self>) {
@@ -342,9 +352,9 @@ mod tests {
     #[tokio::test]
     async fn renew_extends_termination() {
         let sub = Subscription::new("x".into(), Duration::from_secs(1));
-        let first = sub.termination_time().await;
+        let first = sub.termination_time();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let second = sub.renew(Duration::from_secs(10)).await;
+        let second = sub.renew(Duration::from_secs(10));
         assert!(second > first);
     }
 

@@ -111,8 +111,8 @@ async fn subscription_route(
         Err(e) => return soap_fault(FaultCode::InvalidArgs, &format!("Bad SOAP envelope: {e}")),
     };
     // Per-subscription endpoints require authentication too.
-    if !auth_ok(&state, &cam, &parsed.auth, &parsed.action).await {
-        return soap_fault(FaultCode::NotAuthorized, "WS-UsernameToken required");
+    if let Err(e) = auth_check(&state, &cam, &parsed.auth, &parsed.action).await {
+        return soap_fault(FaultCode::NotAuthorized, e.reason());
     }
     match events::dispatch_subscription(&cam, &sub_id, &parsed.action, parsed.body_xml).await {
         Ok(xml) => soap_ok(xml),
@@ -142,8 +142,8 @@ async fn dispatch_service(
         Err(e) => return soap_fault(FaultCode::InvalidArgs, &format!("Bad SOAP envelope: {e}")),
     };
 
-    if !auth_ok(&state, &cam, &parsed.auth, &parsed.action).await {
-        return soap_fault(FaultCode::NotAuthorized, "WS-UsernameToken required");
+    if let Err(e) = auth_check(&state, &cam, &parsed.auth, &parsed.action).await {
+        return soap_fault(FaultCode::NotAuthorized, e.reason());
     }
 
     let result = match service {
@@ -161,37 +161,56 @@ async fn dispatch_service(
     }
 }
 
-/// Returns true if the request is allowed through. Anonymous access is
+/// Distinct auth-failure modes so the dispatcher can return the matching
+/// SOAP fault reason. All three map to `NotAuthorized`; the reason string is
+/// what differs and is what makes client troubleshooting tractable.
+enum AuthError {
+    MissingToken,
+    BadCredentials,
+    UserNotPermitted,
+}
+
+impl AuthError {
+    fn reason(&self) -> &'static str {
+        match self {
+            AuthError::MissingToken => "WS-UsernameToken required",
+            AuthError::BadCredentials => "Bad credentials",
+            AuthError::UserNotPermitted => "User not permitted",
+        }
+    }
+}
+
+/// Returns `Ok(())` if the request is allowed through. Anonymous access is
 /// allowed for the small ONVIF discovery whitelist, and for everything when
 /// no users / camera ACLs are configured (matching existing RTSP behaviour).
-async fn auth_ok(
+async fn auth_check(
     state: &OnvifState,
     cam: &crate::onvif::state::CameraEntry,
     auth: &Option<crate::onvif::soap::UsernameToken>,
     action: &str,
-) -> bool {
+) -> Result<(), AuthError> {
     if is_unauth_allowed(action) {
-        return true;
+        return Ok(());
     }
     let users_empty = state.inner().users.read().await.is_empty();
     let permitted = cam.permitted_users.clone();
     let no_acl = permitted.as_ref().map(|v| v.is_empty()).unwrap_or(true);
     if users_empty && no_acl {
-        return true;
+        return Ok(());
     }
     let Some(tok) = auth.as_ref() else {
-        return false;
+        return Err(AuthError::MissingToken);
     };
     let users = state.inner().users.read().await.clone();
     if !verify_token(tok, &users) {
-        return false;
+        return Err(AuthError::BadCredentials);
     }
     if let Some(allow) = permitted.as_ref() {
         if !allow.is_empty() && !allow.iter().any(|u| u == &tok.username) {
-            return false;
+            return Err(AuthError::UserNotPermitted);
         }
     }
-    true
+    Ok(())
 }
 
 fn soap_ok(xml: String) -> Response {

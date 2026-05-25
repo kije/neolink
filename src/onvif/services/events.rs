@@ -26,8 +26,12 @@ use crate::onvif::soap::{wrap_envelope, xml_escape, FaultCode, NS_ALL};
 use crate::onvif::state::{CameraEntry, OnvifState};
 
 /// Extra XML namespace declarations needed for event payloads.
+///
+/// `wsa` is intentionally NOT redeclared here — `NS_ALL` already declares it.
+/// Repeating it on the `Envelope` element would emit a duplicate `xmlns:wsa`
+/// attribute, which is not well-formed XML and is rejected by stricter
+/// ONVIF clients.
 const NS_EVENT: &str = "xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\" \
-xmlns:wsa=\"http://www.w3.org/2005/08/addressing\" \
 xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\" \
 xmlns:tns1=\"http://www.onvif.org/ver10/topics\"";
 
@@ -73,7 +77,7 @@ PersistentNotificationStorage=\"false\"/>\
             create_pullpoint_subscription_response(
                 &endpoint,
                 sub.created_at,
-                sub.termination_time().await,
+                sub.termination_time(),
             )
         }
 
@@ -99,7 +103,7 @@ PersistentNotificationStorage=\"false\"/>\
                 cam = cam.name,
                 sub_id = sub.id,
             );
-            subscribe_response(&endpoint, sub.created_at, sub.termination_time().await)
+            subscribe_response(&endpoint, sub.created_at, sub.termination_time())
         }
 
         other => {
@@ -127,7 +131,7 @@ pub(crate) async fn dispatch_subscription(
     };
 
     // Expired? Drop and report.
-    if sub.termination_time().await < Utc::now() {
+    if sub.termination_time() < Utc::now() {
         cam.events.remove(sub_id).await;
         return Err(FaultBody {
             code: FaultCode::Other,
@@ -139,12 +143,12 @@ pub(crate) async fn dispatch_subscription(
         "PullMessages" => {
             let (timeout, limit) = parse_pull_messages(body_xml);
             let msgs = sub.pull(limit, timeout).await;
-            let term = sub.termination_time().await;
+            let term = sub.termination_time();
             render_pull_messages_response(term, msgs)
         }
         "Renew" => {
             let ttl = parse_termination_time(body_xml).unwrap_or(Duration::from_secs(60));
-            let new_term = sub.renew(ttl).await;
+            let new_term = sub.renew(ttl);
             render_renew_response(sub.created_at, new_term)
         }
         "Unsubscribe" => {
@@ -294,7 +298,7 @@ fn parse_termination_time(body_xml: &str) -> Option<Duration> {
 /// an `xs:duration` (relative, like `PT1M`) or an `xs:dateTime` (absolute).
 fn parse_termination_string(s: &str) -> Option<Duration> {
     let s = s.trim();
-    if s.starts_with('P') || s.starts_with('-') {
+    if s.starts_with('P') {
         parse_xs_duration(s)
     } else if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         let now = Utc::now();
@@ -312,11 +316,16 @@ fn parse_termination_string(s: &str) -> Option<Duration> {
 /// Best-effort xs:duration parser. We only honour years/months/days/hours/
 /// minutes/seconds and treat all months as 30 days, years as 365 (ONVIF
 /// subscriptions are short-lived anyway and we cap the absolute max).
+///
+/// Negative xs:durations (`-PT5S` and similar) are rejected — they have no
+/// meaningful interpretation as an ONVIF subscription TTL and silently
+/// flipping the sign would let a client request an "expired" subscription
+/// and still get a live one.
 fn parse_xs_duration(s: &str) -> Option<Duration> {
-    if !s.starts_with('P') && !s.starts_with("-P") {
+    if !s.starts_with('P') {
         return None;
     }
-    let s = s.trim_start_matches('-').trim_start_matches('P');
+    let s = s.trim_start_matches('P');
     let mut seconds: i64 = 0;
     let mut in_time = false;
     let mut acc = String::new();
@@ -427,6 +436,15 @@ mod tests {
             parse_xs_duration("PT1H30M"),
             Some(Duration::from_secs(5400))
         );
+    }
+
+    #[test]
+    fn rejects_negative_xs_duration() {
+        // A negative TTL has no sensible meaning for an ONVIF subscription;
+        // we must not silently treat it as positive.
+        assert_eq!(parse_xs_duration("-PT5S"), None);
+        assert_eq!(parse_xs_duration("-P1D"), None);
+        assert_eq!(parse_termination_string("-PT5S"), None);
     }
 
     #[test]
