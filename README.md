@@ -595,6 +595,25 @@ ONVIF spec: `GetSystemDateAndTime`, `GetCapabilities`, `GetServices`,
 - **No HTTPS yet** on the ONVIF port. Run behind a TLS-terminating reverse
   proxy if you need it.
 
+#### Deployment — file descriptor limit
+
+Neolink keeps an open TCP connection per active RTSP client and may serve
+many short-lived ONVIF HTTP requests under load. The default per-process
+file-descriptor limit on most distros (1024) can be exhausted, after which
+`accept error: Too many open files` floods the log and the bridge stops
+serving new connections.
+
+For systemd deployments, raise it with a drop-in:
+
+```ini
+# /etc/systemd/system/neolink.service.d/limits.conf
+[Service]
+LimitNOFILE=65536
+```
+
+For Docker / Kubernetes set `--ulimit nofile=65536:65536` (or the
+equivalent `securityContext`).
+
 ### Image
 
 You can write an image from the stream to disk using:

@@ -209,25 +209,36 @@ async fn abort_zoom_task(cam: &CameraEntry) {
 /// it's possible for both calls to abort the slot, both spawn a fresh task,
 /// then race to store — the loser's handle is dropped without being aborted
 /// and keeps stepping zoom in the background.
+///
+/// The spawned task holds a *Weak* reference to the CameraEntry, not Arc.
+/// Storing a JoinHandle for self on the entry would otherwise be a reference
+/// cycle (entry → JoinHandle for task → task closure → Arc<entry>) that
+/// keeps the entry alive forever after the bridge drops it from the map.
 async fn spawn_zoom_task(cam: &Arc<CameraEntry>, dir: f32) {
     let mut g = cam.zoom_task.lock().await;
     if let Some(h) = g.take() {
         h.abort();
     }
-    let cam2 = cam.clone();
+    let cam_weak = Arc::downgrade(cam);
     let h = tokio::spawn(async move {
-        let _ = run_zoom_loop(cam2, dir).await;
+        let _ = run_zoom_loop(cam_weak, dir).await;
     });
     *g = Some(h);
 }
 
-async fn run_zoom_loop(cam: Arc<CameraEntry>, dir: f32) -> Result<()> {
-    // Probe the current zoom range up-front.
+async fn run_zoom_loop(cam_weak: std::sync::Weak<CameraEntry>, dir: f32) -> Result<()> {
+    // The loop body upgrades the Weak to Arc only for the duration of a single
+    // step; if the entry has been dropped (config reload removed the camera,
+    // bridge shutdown, ...) we exit cleanly without holding it alive.
+    let Some(cam) = cam_weak.upgrade() else {
+        return Ok(());
+    };
     let zf = cam
         .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_zoom().await?) }))
         .await?;
     let min = zf.zoom.min_pos;
     let max = zf.zoom.max_pos;
+    drop(cam);
     if max <= min {
         return Ok(());
     }
@@ -243,6 +254,9 @@ async fn run_zoom_loop(cam: Arc<CameraEntry>, dir: f32) -> Result<()> {
             break;
         }
         let target = next;
+        let Some(cam) = cam_weak.upgrade() else {
+            return Ok(());
+        };
         cam.run(move |c: &BcCamera| {
             Box::pin(async move {
                 c.zoom_to(target).await?;
@@ -250,6 +264,7 @@ async fn run_zoom_loop(cam: Arc<CameraEntry>, dir: f32) -> Result<()> {
             })
         })
         .await?;
+        drop(cam);
         cur = next;
         // Roughly 4 steps/sec — fast enough for HA's typical 250-500ms
         // press-and-hold pulses, slow enough to not saturate the camera.

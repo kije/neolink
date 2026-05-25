@@ -134,7 +134,7 @@ impl BcCamera {
         let preset = Preset {
             id: preset_id,
             name: Some(name),
-            command: "setPos".to_owned(),
+            command: Some("setPos".to_owned()),
         };
         let send = Bc {
             meta: BcMeta {
@@ -191,7 +191,7 @@ impl BcCamera {
         let preset = Preset {
             id: preset_id,
             name: None,
-            command: "toPos".to_owned(),
+            command: Some("toPos".to_owned()),
         };
         let send = Bc {
             meta: BcMeta {
