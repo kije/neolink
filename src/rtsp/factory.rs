@@ -244,9 +244,9 @@ pub(super) async fn make_factory(
                         // This is not an async thread
                         let max_fps = config.max_fps;
                         std::thread::spawn(move || {
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
-                            let mut vid_frame_count = 0u32;
+                            let mut aud_ts = 0u64;
+                            let mut vid_ts = 0u64;
+                            let mut vid_frame_count = 0u64;
                             let mut pools = Default::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
@@ -310,9 +310,9 @@ fn send_to_sources(
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
-    vid_frame_count: &mut u32,
+    vid_ts: &mut u64,
+    aud_ts: &mut u64,
+    vid_frame_count: &mut u64,
     max_fps: Option<u32>,
     stream_config: &StreamConfig,
 ) -> AnyResult<()> {
@@ -321,57 +321,115 @@ fn send_to_sources(
         BcMedia::Aac(aac) => {
             let duration = aac.duration().expect("Could not calculate AAC duration");
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    aac.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
+                send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts), pools)?;
             }
-            *aud_ts += duration;
+            *aud_ts += duration as u64;
         }
         BcMedia::Adpcm(adpcm) => {
             let duration = adpcm
                 .duration()
                 .expect("Could not calculate ADPCM duration");
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
+                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
                 send_to_appsrc(
                     aud_src,
                     adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
+                    Duration::from_micros(*aud_ts),
                     pools,
                 )?;
             }
-            *aud_ts += duration;
+            *aud_ts += duration as u64;
         }
         BcMedia::Iframe(BcMediaIframe { data, .. })
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
-            // Feature 2 & 4: FPS limiting — drop frames before they enter the GStreamer/RTSP
-            // pipeline. Timestamps always advance at the camera rate so the pipeline's
-            // internal clock stays correct; we just don't push every buffer.
-            let should_send = match max_fps {
-                Some(limit) if limit > 0 && stream_config.fps > limit => {
-                    // ceiling-integer frame_skip: e.g. 15fps camera / 5fps limit → skip=3
-                    let frame_skip = (stream_config.fps + limit - 1) / limit;
-                    *vid_frame_count % frame_skip == 0
-                }
-                _ => true,
-            };
-            if should_send {
+            if should_send_frame(*vid_frame_count, stream_config.fps, max_fps) {
                 if let Some(vid_src) = vid_src.as_ref() {
-                    log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                    send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                    log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
+                    send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
                 }
             }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts = vid_ts.saturating_add(MICROSECONDS / stream_config.fps.max(1));
+            const MICROSECONDS: u64 = 1_000_000;
+            *vid_ts += MICROSECONDS / stream_config.fps.max(1) as u64;
             *vid_frame_count = vid_frame_count.wrapping_add(1);
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Returns `true` if this video frame should be forwarded to the GStreamer pipeline.
+///
+/// Timestamps always advance at the camera rate; only the payload is withheld.
+/// `limit = 0` or `limit >= camera_fps` means no frames are dropped.
+fn should_send_frame(vid_frame_count: u64, camera_fps: u32, max_fps: Option<u32>) -> bool {
+    match max_fps {
+        Some(limit) if limit > 0 && camera_fps > limit => {
+            // Ceiling-integer skip factor: 15 fps / 5 limit → skip 3
+            let frame_skip = (camera_fps as u64 + limit as u64 - 1) / limit as u64;
+            vid_frame_count % frame_skip == 0
+        }
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fps_15_to_5() {
+        // skip=3 → frames 0,3,6,9,12 pass out of 15
+        let sent: Vec<u64> = (0..15)
+            .filter(|&i| should_send_frame(i, 15, Some(5)))
+            .collect();
+        assert_eq!(sent, vec![0, 3, 6, 9, 12]);
+    }
+
+    #[test]
+    fn fps_no_limit() {
+        for i in 0..100 {
+            assert!(should_send_frame(i, 15, None));
+        }
+    }
+
+    #[test]
+    fn fps_limit_equals_camera() {
+        for i in 0..15 {
+            assert!(should_send_frame(i, 15, Some(15)));
+        }
+    }
+
+    #[test]
+    fn fps_camera_zero_no_panic() {
+        // camera_fps=0 means the condition `camera_fps > limit` is never true
+        for i in 0..10 {
+            assert!(should_send_frame(i, 0, Some(5)));
+        }
+    }
+
+    #[test]
+    fn fps_limit_one() {
+        // 30fps → skip=30 → only frame 0 (and 30, 60, …) pass
+        assert!(should_send_frame(0, 30, Some(1)));
+        for i in 1..30 {
+            assert!(!should_send_frame(i, 30, Some(1)));
+        }
+        assert!(should_send_frame(30, 30, Some(1)));
+    }
+
+    #[test]
+    fn fps_limit_zero_means_no_limit() {
+        for i in 0..15 {
+            assert!(should_send_frame(i, 15, Some(0)));
+        }
+    }
+
+    #[test]
+    fn fps_near_u64_max_no_panic() {
+        let near_max = u64::MAX - 1;
+        let _ = should_send_frame(near_max, 15, Some(5));
+    }
 }
 
 fn send_to_appsrc(

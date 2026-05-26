@@ -295,7 +295,7 @@ pub(crate) struct CameraConfig {
     /// Limit the RTSP output to at most this many frames per second.
     /// When set, the ingest path drops excess video frames before they enter
     /// the GStreamer pipeline, reducing both CPU load and RTSP bandwidth.
-    /// Audio is never throttled. `null` / omitted means no limit.
+    /// Audio is never throttled. `null` / omitted (or `0`) means no limit.
     #[serde(default, alias = "fps_limit")]
     pub(crate) max_fps: Option<u32>,
 
