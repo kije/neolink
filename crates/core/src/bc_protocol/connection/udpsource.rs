@@ -344,7 +344,7 @@ impl UdpPayloadInner {
         // Keep-warm: on receive timeout, probe the camera with extra heartbeats before
         // declaring the session dead. Total grace time = KEEP_WARM_PROBES * KEEP_WARM_INTERVAL_SECS.
         const KEEP_WARM_PROBES: u32 = 5;
-        const KEEP_WARM_INTERVAL_SECS: u64 = 2;
+        const KEEP_WARM_INTERVAL_SECS: u64 = 5;
         let probe_sender = socket_in_tx.clone();
         let mut recv_timeout = Box::pin(sleep(Duration::from_secs(TIME_OUT)));
         let mut probe_timer = Box::pin(sleep(Duration::from_secs(KEEP_WARM_INTERVAL_SECS)));

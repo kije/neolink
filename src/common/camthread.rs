@@ -67,16 +67,11 @@ impl NeoCamThread {
                 loop {
                     interval.tick().await;
                     log::trace!("Sending ping");
-                    match timeout(Duration::from_secs(5), camera.get_linktype()).await {
+                    match timeout(Duration::from_secs(5), camera.ping()).await {
                         Ok(Ok(_)) => {
                             log::trace!("Ping reply");
                             missed_pings = 0;
                             continue
-                        },
-                        Ok(Err(neolink_core::Error::UnintelligibleReply { reply, why })) => {
-                            // Camera does not support pings just wait forever
-                            log::trace!("Pings not supported: {reply:?}: {why}");
-                            futures::future::pending().await
                         },
                         Ok(Err(e)) => {
                             break Err(e.into());
