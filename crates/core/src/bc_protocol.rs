@@ -14,6 +14,7 @@ use Md5Trunc::*;
 
 mod abilityinfo;
 mod battery;
+mod config;
 mod connection;
 mod credentials;
 mod email;
