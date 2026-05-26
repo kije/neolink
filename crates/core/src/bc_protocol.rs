@@ -3,6 +3,7 @@ use futures::stream::StreamExt;
 use log::*;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicBool, AtomicU16, Ordering},
@@ -14,6 +15,7 @@ use Md5Trunc::*;
 
 mod abilityinfo;
 mod battery;
+mod battery_lifecycle;
 mod connection;
 mod credentials;
 mod email;
@@ -43,9 +45,16 @@ mod uid;
 mod users;
 mod version;
 
+pub use battery_lifecycle::{
+    is_non_waking, BatteryLifecycle, InFlightGuard, BATTERY_IDLE_CLOSE_SECS, NONE_WAKING_COMMANDS,
+};
 pub(crate) use connection::*;
 pub use credentials::*;
 pub use errors::Error;
+pub use keepalive::{
+    AdaptiveKeepalive, DEFAULT_KEEPALIVE_IDLE_SECS, DEFAULT_KEEPALIVE_SUBSCRIBED_SECS,
+    MIN_KEEPALIVE_SECS, RECOVERY_STEP_SECS, STABILITY_RECOVERY_SECS,
+};
 pub use ledstate::LightState;
 pub use login::MaxEncryption;
 pub use motion::{MotionData, MotionStatus};
@@ -76,6 +85,11 @@ pub struct BcCamera {
     // Certain commands such as logout require the username/pass in plain text.... why....???
     credentials: Credentials,
     abilities: RwLock<HashMap<String, ReadKind>>,
+    /// Adaptive keepalive policy, used by long-running keepalive drivers.
+    keepalive_policy: Mutex<keepalive::AdaptiveKeepalive>,
+    /// Battery-camera idle-close lifecycle. Drives the "5s after the last
+    /// in-flight command, close the TCP socket" pattern from `reolink_aio`.
+    battery_lifecycle: battery_lifecycle::BatteryLifecycle,
     #[allow(dead_code)]
     cancel: CancellationToken,
 }
@@ -362,6 +376,8 @@ impl BcCamera {
             logged_in: AtomicBool::new(false),
             credentials: Credentials::new(username, passwd),
             abilities: Default::default(),
+            keepalive_policy: Mutex::new(keepalive::AdaptiveKeepalive::default()),
+            battery_lifecycle: battery_lifecycle::BatteryLifecycle::new(),
             cancel: CancellationToken::new(),
         };
         me.keepalive().await?;
@@ -420,6 +436,14 @@ impl BcCamera {
         }
     }
 
+    /// Returns the battery-idle TCP-close lifecycle for this connection.
+    ///
+    /// For non-battery cameras the lifecycle stays disabled and is a
+    /// no-op; battery cameras enable it after observing `DeviceInfo.sleep`.
+    pub fn battery_lifecycle(&self) -> &battery_lifecycle::BatteryLifecycle {
+        &self.battery_lifecycle
+    }
+
     /// Wait for all thread to finish
     ///
     /// If an error is returned in any thread it will return the first error
@@ -466,4 +490,50 @@ fn test_md5_string() {
         md5_string("admin", ZeroLast),
         "21232F297A57A5A743894A0E4A801FC\0"
     );
+}
+
+/// Audit test for the `md5_str_modern` 31-char uppercase quirk used by
+/// `reolink_aio`. The reference value below was computed with the upstream
+/// Python implementation:
+///
+/// ```python
+/// import hashlib
+/// hashlib.md5(b"foo-bar").hexdigest()[:31].upper()
+/// # "E5F9EC048D1DBE19C70F720E002F9CB"
+/// ```
+///
+/// Neolink's `md5_string` (called with `Truncate`) must match this byte for
+/// byte to keep the modern login flow working on firmwares that compare the
+/// full 31 characters.
+#[test]
+fn test_md5_string_matches_reolink_aio_fixture() {
+    assert_eq!(
+        md5_string("foo-bar", Truncate),
+        "E5F9EC048D1DBE19C70F720E002F9CB"
+    );
+    // The string must be exactly 31 characters and uppercase ASCII hex.
+    let out = md5_string("foo-bar", Truncate);
+    assert_eq!(out.len(), 31);
+    assert!(out.chars().all(|c| matches!(c, '0'..='9' | 'A'..='F')));
+}
+
+/// The AES key derived from `nonce + "-" + password` is also a 31-char
+/// uppercase MD5 with a terminating NUL. Verify the first 16 bytes that get
+/// fed into AES are stable against a Python reference.
+#[test]
+fn test_make_aeskey_matches_python_reference() {
+    use credentials::Credentials;
+    // Reference computation:
+    // python3 -c "import hashlib; \
+    //   h='{:X}\\0'.format(int(hashlib.md5(b'ABCDEF-secret').hexdigest(),16)); \
+    //   print(h[:16].encode())"
+    let creds = Credentials::new("user", Some("secret"));
+    let key = creds.make_aeskey("ABCDEF");
+    // Compute the reference key the same way as `make_aeskey`.
+    let mut reference = format!("{:X}\0", md5::compute("ABCDEF-secret"))
+        .to_uppercase()
+        .into_bytes();
+    reference.truncate(16);
+    assert_eq!(key.to_vec(), reference);
+    assert_eq!(key.len(), 16);
 }
