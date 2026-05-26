@@ -341,23 +341,63 @@ impl UdpPayloadInner {
         let thread_client_id = client_id;
         let thread_camera_id = camera_id;
         const TIME_OUT: u64 = 10;
+        // Keep-warm: on receive timeout, probe the camera with extra heartbeats before
+        // declaring the session dead. Total grace time = KEEP_WARM_PROBES * KEEP_WARM_INTERVAL_SECS.
+        const KEEP_WARM_PROBES: u32 = 5;
+        const KEEP_WARM_INTERVAL_SECS: u64 = 5;
+        let probe_sender = socket_in_tx.clone();
         let mut recv_timeout = Box::pin(sleep(Duration::from_secs(TIME_OUT)));
+        let mut probe_timer = Box::pin(sleep(Duration::from_secs(KEEP_WARM_INTERVAL_SECS)));
         set.spawn(async move {
             let result = tokio::select! {
                 _ = send_cancel.cancelled() => {
                     Result::Ok(())
                 },
                 v = async {
+                    let mut probing = false;
+                    let mut probes_remaining: u32 = 0;
                     loop {
                         break tokio::select!{
-                            _ = recv_timeout.as_mut() => {
-                                Err(Error::BcUdpTimeout)
+                            // Primary receive timeout: enter keep-warm probe mode rather than
+                            // failing immediately, so brief camera sleeps don't force a full re-login.
+                            _ = recv_timeout.as_mut(), if !probing => {
+                                probing = true;
+                                probes_remaining = KEEP_WARM_PROBES;
+                                probe_timer.as_mut().reset(Instant::now());
+                                log::debug!("UDP keep-warm: no data for {TIME_OUT}s, probing camera");
+                                continue;
+                            }
+                            // Probe timer: send a heartbeat; give up after KEEP_WARM_PROBES attempts.
+                            _ = probe_timer.as_mut(), if probing => {
+                                if probes_remaining == 0 {
+                                    log::debug!("UDP keep-warm: all probes exhausted, declaring session dead");
+                                    Err(Error::BcUdpTimeout)
+                                } else {
+                                    probes_remaining -= 1;
+                                    let msg = BcUdp::Discovery(UdpDiscovery {
+                                        tid: {
+                                            let mut rng = thread_rng();
+                                            (rng.gen::<u8>()) as u32
+                                        },
+                                        payload: UdpXml::C2dHb(C2dHb {
+                                            cid: thread_client_id,
+                                            did: thread_camera_id,
+                                        }),
+                                    });
+                                    let _ = probe_sender.try_send(msg);
+                                    probe_timer.as_mut().reset(Instant::now() + Duration::from_secs(KEEP_WARM_INTERVAL_SECS));
+                                    log::trace!("UDP keep-warm: probe heartbeat sent ({probes_remaining} left)");
+                                    continue;
+                                }
                             }
                             packet = inner.next() => {
                                 log::trace!("Cam->App");
                                 let packet = packet.ok_or(Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved))??;
                                 recv_timeout.as_mut().reset(Instant::now() + Duration::from_secs(TIME_OUT));
-                                // let packet = socket_rx.next().await.ok_or(Error::BcUdpDropReciver)??;
+                                if probing {
+                                    log::debug!("UDP keep-warm: camera responded, session recovered");
+                                    probing = false;
+                                }
                                 socket_out_tx.try_send(packet).map_err(|e| Error::BcUdpDropReciver(BcUdpDropReciverKind::SendFailed(format!("{e:?}"))))?;
                                 continue;
                             },
