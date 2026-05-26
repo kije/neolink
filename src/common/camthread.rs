@@ -38,7 +38,9 @@ impl NeoCamThread {
     async fn run_camera(&mut self, config: &CameraConfig) -> AnyResult<()> {
         let name = config.name.clone();
         log::trace!("Attempting connection with config: {config:?}");
+        let t0 = Instant::now();
         let camera = Arc::new(connect_and_login(config).await?);
+        log::info!("{name}: Camera connected in {:.2}s", t0.elapsed().as_secs_f64());
         log::trace!("  - Connected");
 
         sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
