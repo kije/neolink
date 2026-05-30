@@ -91,10 +91,11 @@ impl BcCamera {
                 let tx = tx.clone();
                 Box::pin(async move {
                     if let Bc {
-                        meta: BcMeta {
-                            msg_id: MSG_ID_NETWORK_LINK_TYPE,
-                            ..
-                        },
+                        meta:
+                            BcMeta {
+                                msg_id: MSG_ID_NETWORK_LINK_TYPE,
+                                ..
+                            },
                         body:
                             BcBody::ModernMsg(ModernMsg {
                                 payload:

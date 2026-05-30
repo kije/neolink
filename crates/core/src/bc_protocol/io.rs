@@ -26,10 +26,11 @@ impl BcCamera {
                 let tx = tx.clone();
                 Box::pin(async move {
                     if let Bc {
-                        meta: BcMeta {
-                            msg_id: MSG_ID_IO_INPUT,
-                            ..
-                        },
+                        meta:
+                            BcMeta {
+                                msg_id: MSG_ID_IO_INPUT,
+                                ..
+                            },
                         body:
                             BcBody::ModernMsg(ModernMsg {
                                 payload:

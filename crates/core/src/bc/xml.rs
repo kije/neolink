@@ -2293,8 +2293,14 @@ fn test_io_input_list_roundtrip() {
         io_input_list: Some(IoInputList {
             version: "1.1".to_string(),
             items: vec![
-                IoItem { index: 0, result: 1 },
-                IoItem { index: 1, result: 0 },
+                IoItem {
+                    index: 0,
+                    result: 1,
+                },
+                IoItem {
+                    index: 1,
+                    result: 0,
+                },
             ],
         }),
         ..BcXml::default()
