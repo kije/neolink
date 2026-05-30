@@ -27,6 +27,7 @@ mod logout;
 mod motion;
 mod ping;
 mod pirstate;
+mod privacy;
 mod ptz;
 mod pushinfo;
 mod reboot;
