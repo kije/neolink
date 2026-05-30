@@ -9,8 +9,59 @@
 
 use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
+use tokio::sync::mpsc::{channel, Receiver};
 
 impl BcCamera {
+    /// Listen for camera-pushed privacy-mode updates on cmd 623.
+    ///
+    /// The camera pushes a cmd-623 reply asynchronously whenever the privacy
+    /// state flips (e.g. user pressed the physical shutter button or the
+    /// state changed via another client). The returned [`Receiver`] yields
+    /// `bool` (true = privacy on, false = off) per push.
+    ///
+    /// The handler is registered on the connection's dispatcher and stays
+    /// alive for as long as the connection. Drop the receiver to stop
+    /// consuming events (the handler itself is best-effort: if the channel
+    /// is full or dropped, events are silently discarded).
+    ///
+    /// Note: when the persistent push-event subscription from #5 lands,
+    /// this hook should be migrated to the broadcast channel — see #19.
+    pub async fn listen_on_privacy_mode(&self) -> Result<Receiver<bool>> {
+        let (tx, rx) = channel(8);
+        let connection = self.get_connection();
+        connection
+            .handle_msg(MSG_ID_GET_PRIVACY_MODE, move |bc| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    if let Bc {
+                        meta:
+                            BcMeta {
+                                msg_id: MSG_ID_GET_PRIVACY_MODE,
+                                ..
+                            },
+                        body:
+                            BcBody::ModernMsg(ModernMsg {
+                                payload:
+                                    Some(BcPayloads::BcXml(BcXml {
+                                        sleep_state:
+                                            Some(SleepState {
+                                                sleep: Some(s), ..
+                                            }),
+                                        ..
+                                    })),
+                                ..
+                            }),
+                    } = bc
+                    {
+                        let _ = tx.send(*s != 0).await;
+                    }
+                    None
+                })
+            })
+            .await?;
+        Ok(rx)
+    }
+
     /// Get the current privacy-mode state.
     ///
     /// Returns `true` if privacy mode is currently on (shutter closed),
