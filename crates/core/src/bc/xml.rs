@@ -141,6 +141,21 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// Privacy-mode state payload (cmd 622 set, cmd 623 get + push)
+    ///
+    /// Set request uses `operate = 2` and `sleep = 0|1`. Get / push replies
+    /// echo a `sleep` boolean and may carry channel-scoped wrappers.
+    #[serde(rename = "sleepState", skip_serializing_if = "Option::is_none")]
+    pub sleep_state: Option<SleepState>,
+    /// Per-scene details (cmd 604 get + 604 reply)
+    #[serde(rename = "sceneCfg", skip_serializing_if = "Option::is_none")]
+    pub scene_cfg: Option<SceneCfg>,
+    /// Scene activation / deactivation (cmd 605)
+    #[serde(rename = "sceneModeCfg", skip_serializing_if = "Option::is_none")]
+    pub scene_mode_cfg: Option<SceneModeCfg>,
+    /// List of available host scenes (cmd 603 reply)
+    #[serde(rename = "sceneList", skip_serializing_if = "Option::is_none")]
+    pub scene_list: Option<SceneList>,
 }
 
 impl BcXml {
@@ -1618,6 +1633,111 @@ pub struct User {
     /// | modify | Indicates that the user should be modified. It seems like only the password can be changed.                        |
     #[serde(rename = "userSetState")]
     pub user_set_state: String,
+}
+
+/// sleepState xml — Baichuan privacy-mode payload
+///
+/// Sent on cmd 622 (set) and received on cmd 623 (get + push).
+///
+/// On a *set* request the camera expects `operate = 2` (the "magic value" that
+/// flags a privacy-mode write) together with `sleep = 0|1`. On a *get* / push
+/// the camera echoes the current `sleep` value; `operate` is typically absent
+/// from replies.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SleepState {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// "Operate" mode. Always `2` when *setting* privacy mode; absent (or any
+    /// other value) on replies / unrelated sleepState payloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operate: Option<u8>,
+    /// Privacy / sleep flag. `1` = privacy mode on (shutter closed, HTTP /
+    /// ONVIF unresponsive), `0` = off. Encoded as `0`/`1` on the wire; the
+    /// upstream Python parser treats the field as a boolean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<u8>,
+}
+
+/// sceneCfg xml — used when reading a single scene's details (cmd 604)
+///
+/// The *request* carries only `id` (the scene to look up). The *reply* echoes
+/// `id` and adds `name` (and may add other camera-side fields we currently
+/// pass through unmodified).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SceneCfg {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Scene id. Conventional ids: `0` off, `1` away, `2` home, `3` disarm.
+    pub id: u8,
+    /// Human-readable scene name as configured on the camera (only present in
+    /// the cmd-604 *reply*).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// sceneModeCfg xml — scene activation / deactivation (cmd 605)
+///
+/// Two shapes are sent on the wire:
+///
+/// - *SetScene*:    `enable = 1`, `curSceneId = <id>`
+/// - *DisableScene*: `enable = 0` (no `curSceneId`)
+///
+/// Replies (including push notifications when scene mode changes) carry the
+/// same shape so the same struct round-trips.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SceneModeCfg {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// `1` = scene mode active, `0` = disabled.
+    pub enable: u8,
+    /// Active scene id. Required when `enable == 1`; omitted on disable.
+    #[serde(rename = "curSceneId", skip_serializing_if = "Option::is_none")]
+    pub cur_scene_id: Option<u8>,
+}
+
+/// sceneList xml — available host scenes (cmd 603 reply)
+///
+/// Wraps a list of `<id>` entries. The upstream Python parser walks
+/// `.//id` and stores each value with `UNKNOWN` as the name — the camera
+/// does not return names on cmd 603. We surface the same minimal shape:
+/// callers that need names walk back through cmd 604 (`get_scene_info`).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SceneList {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The list of available scene-id entries.
+    #[serde(default, rename = "id")]
+    pub ids: Vec<u8>,
+    /// Some firmwares wrap the ids in `<item><id>...</id></item>` entries
+    /// instead of bare `<id>` siblings. We keep both shapes for round-trip
+    /// safety and expose a unified `all_ids()` helper on [`SceneList`].
+    #[serde(default, rename = "item", skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<SceneListItem>,
+}
+
+impl SceneList {
+    /// Normalized view of the available scene ids, unifying the two wire
+    /// shapes (bare `<id>` siblings vs. `<item><id>...</id></item>`
+    /// entries).
+    pub fn all_ids(&self) -> Vec<u8> {
+        let mut out: Vec<u8> = self.ids.clone();
+        out.extend(self.items.iter().map(|i| i.id));
+        out
+    }
+}
+
+/// sceneList item xml — alternate wrapper shape for sceneList entries
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SceneListItem {
+    /// Scene id
+    pub id: u8,
+    /// Optional name (some firmwares include it inline)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Convience function to return the xml version used throughout the library
