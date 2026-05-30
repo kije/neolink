@@ -208,9 +208,18 @@ impl BcCamera {
         }) = reply.body
         {
             let extracted = match kind {
-                SmartAiKind::Crossline => xml.crossline_detection.take().map(SmartAiPayload::Crossline),
-                SmartAiKind::Intrusion => xml.intrusion_detection.take().map(SmartAiPayload::Intrusion),
-                SmartAiKind::Loitering => xml.loitering_detection.take().map(SmartAiPayload::Loitering),
+                SmartAiKind::Crossline => xml
+                    .crossline_detection
+                    .take()
+                    .map(SmartAiPayload::Crossline),
+                SmartAiKind::Intrusion => xml
+                    .intrusion_detection
+                    .take()
+                    .map(SmartAiPayload::Intrusion),
+                SmartAiKind::Loitering => xml
+                    .loitering_detection
+                    .take()
+                    .map(SmartAiPayload::Loitering),
                 SmartAiKind::Legacy => xml.legacy_detection.take().map(SmartAiPayload::Legacy),
                 SmartAiKind::Loss => xml.loss_detection.take().map(SmartAiPayload::Loss),
             };
