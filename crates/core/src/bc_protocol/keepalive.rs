@@ -1,6 +1,6 @@
 use super::{BcCamera, Result};
 use crate::bc::model::*;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Default keepalive cadence in seconds when a camera is actively subscribed
@@ -189,6 +189,16 @@ impl BcCamera {
     /// on the camera itself.
     pub fn keepalive_policy(&self) -> &Mutex<AdaptiveKeepalive> {
         &self.keepalive_policy
+    }
+
+    /// Returns a cloneable handle on the keepalive policy.
+    ///
+    /// Useful when a spawned task or RAII guard needs to be able to
+    /// nudge the policy back to its idle cadence after the camera has
+    /// possibly been dropped — the `Arc` keeps the policy itself alive
+    /// without holding the camera open.
+    pub fn keepalive_policy_handle(&self) -> Arc<Mutex<AdaptiveKeepalive>> {
+        self.keepalive_policy.clone()
     }
 }
 

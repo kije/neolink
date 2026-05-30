@@ -31,6 +31,7 @@ mod ping;
 mod pirstate;
 mod ptz;
 mod pushinfo;
+mod pushsubscribe;
 mod reboot;
 mod resolution;
 mod services;
@@ -61,6 +62,7 @@ pub use motion::{MotionData, MotionStatus};
 pub use pirstate::PirState;
 pub use ptz::Direction;
 pub use pushinfo::PhoneType;
+pub use pushsubscribe::{PushEvent, PushSubscription};
 pub use resolution::*;
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind};
@@ -86,7 +88,7 @@ pub struct BcCamera {
     credentials: Credentials,
     abilities: RwLock<HashMap<String, ReadKind>>,
     /// Adaptive keepalive policy, used by long-running keepalive drivers.
-    keepalive_policy: Mutex<keepalive::AdaptiveKeepalive>,
+    keepalive_policy: Arc<Mutex<keepalive::AdaptiveKeepalive>>,
     /// Battery-camera idle-close lifecycle. Drives the "5s after the last
     /// in-flight command, close the TCP socket" pattern from `reolink_aio`.
     battery_lifecycle: battery_lifecycle::BatteryLifecycle,
@@ -376,7 +378,7 @@ impl BcCamera {
             logged_in: AtomicBool::new(false),
             credentials: Credentials::new(username, passwd),
             abilities: Default::default(),
-            keepalive_policy: Mutex::new(keepalive::AdaptiveKeepalive::default()),
+            keepalive_policy: Arc::new(Mutex::new(keepalive::AdaptiveKeepalive::default())),
             battery_lifecycle: battery_lifecycle::BatteryLifecycle::new(),
             cancel: CancellationToken::new(),
         };

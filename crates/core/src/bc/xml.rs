@@ -252,6 +252,22 @@ pub struct DeviceInfo {
     /// The resolution xml block
     /// Does not exist for floodlights
     pub resolution: Option<Resolution>,
+    /// Sleep capability flag. Set to `1` on battery cameras (cameras that
+    /// power-down their TCP socket aggressively). When `1`, the push-event
+    /// subscription should be skipped to avoid keeping the radio awake.
+    ///
+    /// Some firmwares omit the field entirely on mains-powered cameras —
+    /// treat absent as "not a battery camera".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<u8>,
+}
+
+impl DeviceInfo {
+    /// Returns `true` if this device is a battery (sleep-capable) camera
+    /// that should *not* be subscribed to the persistent push channel.
+    pub fn is_battery(&self) -> bool {
+        matches!(self.sleep, Some(s) if s != 0)
+    }
 }
 
 /// VersionInfo xml
@@ -774,7 +790,7 @@ pub struct DayNightEvent {
 /// transitions; multi-channel NVRs use it to announce per-channel login
 /// changes. Fields are all optional because firmwares vary in which
 /// subset they emit.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct ChannelInfo {
     /// XML Version
     #[serde(rename = "@version", default, skip_serializing_if = "String::is_empty")]
