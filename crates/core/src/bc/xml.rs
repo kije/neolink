@@ -141,6 +141,24 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// Wireless chime per-device operations (cmd 485) — del / getParam / setParam / ringWithMusic
+    #[serde(rename = "DingDongDeviceOpt", skip_serializing_if = "Option::is_none")]
+    pub ding_dong_device_opt: Option<DingDongDeviceOpt>,
+    /// Hardwired chime relay control (cmd 482/483)
+    #[serde(rename = "DingDongCtrl", skip_serializing_if = "Option::is_none")]
+    pub ding_dong_ctrl: Option<DingDongCtrl>,
+    /// Per-event ringtone mapping (cmd 486/487 or 606/607)
+    #[serde(rename = "DingDongCfg", skip_serializing_if = "Option::is_none")]
+    pub ding_dong_cfg: Option<DingDongCfg>,
+    /// Silent window (cmd 609/610) — periods where the chime stays silent
+    #[serde(rename = "DingDongSilentMode", skip_serializing_if = "Option::is_none")]
+    pub ding_dong_silent_mode: Option<DingDongSilentMode>,
+    /// Quick-reply audio playback (cmd 349)
+    #[serde(rename = "AudioFileInfo", skip_serializing_if = "Option::is_none")]
+    pub audio_file_info: Option<AudioFileInfo>,
+    /// List of wireless chimes paired with the doorbell (cmd 484/608)
+    #[serde(rename = "DingDongList", skip_serializing_if = "Option::is_none")]
+    pub ding_dong_list: Option<DingDongList>,
 }
 
 impl BcXml {
@@ -1618,6 +1636,196 @@ pub struct User {
     /// | modify | Indicates that the user should be modified. It seems like only the password can be changed.                        |
     #[serde(rename = "userSetState")]
     pub user_set_state: String,
+}
+
+/// DingDongDeviceOpt — wireless chime per-device operations (cmd 485)
+///
+/// Sub-operations are selected via the `type_` field:
+///
+/// | value | meaning |
+/// | --- | --- |
+/// | 1 | delDevice — unpair the chime referenced by `device_id` |
+/// | 2 | getParam — read the chime's current parameters |
+/// | 3 | setParam — write `vol_level` / `led_state` / `name` |
+/// | 4 | ringWithMusic — play the tone identified by `music_id` |
+///
+/// Most fields are optional because they are only meaningful for some sub-ops.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DingDongDeviceOpt {
+    /// XML Version
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// Channel ID of the doorbell on the (potential) NVR — usually 0
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Sub-operation: 1=del, 2=getParam, 3=setParam, 4=ringWithMusic
+    #[serde(rename = "type")]
+    pub type_: u32,
+    /// Identifier of the wireless chime, as returned by `DingDongList`
+    #[serde(rename = "deviceId")]
+    pub device_id: u32,
+    /// Volume level (1..3) — only meaningful for sub-op 3 (setParam)
+    #[serde(rename = "volLevel", skip_serializing_if = "Option::is_none")]
+    pub vol_level: Option<u32>,
+    /// LED state (0/1) — only meaningful for sub-op 3 (setParam)
+    #[serde(rename = "ledState", skip_serializing_if = "Option::is_none")]
+    pub led_state: Option<u32>,
+    /// Friendly name — only meaningful for sub-op 3 (setParam) or returned by getParam
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Music/tone ID — only meaningful for sub-op 4 (ringWithMusic), or returned by getParam
+    #[serde(rename = "musicId", skip_serializing_if = "Option::is_none")]
+    pub music_id: Option<u32>,
+}
+
+/// DingDongCtrl — hardwired chime relay (cmd 482/483)
+///
+/// `type_` is either `machineStateGet` (read current state, sent on cmd 483) or
+/// `machineStateSet` (apply new state, sent on cmd 482).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DingDongCtrl {
+    /// XML Version
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// Channel ID — usually 0
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Operation type: `"machineStateGet"` or `"machineStateSet"`
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// Enable the hardwired chime (1 = enabled, 0 = disabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bopen: Option<u32>,
+    /// Persist the setting across reboots (1 = save, 0 = don't save)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bsave: Option<u32>,
+    /// Relay hold-time in seconds when the doorbell is pressed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<u32>,
+}
+
+/// DingDongCfg — per-event ringtone mapping (cmd 486/487 or 606/607)
+///
+/// Wraps a `deviceCfg.alarminCfg` list that pairs each alarm event type
+/// (motion / people / vehicle / visitor / package / pet) with a tone.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DingDongCfg {
+    /// XML Version
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// Channel ID — usually 0
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Wireless chime identifier these mappings apply to
+    #[serde(rename = "deviceId")]
+    pub device_id: u32,
+    /// Wrapper containing the per-event alarm-in configuration list
+    #[serde(rename = "deviceCfg")]
+    pub device_cfg: DingDongDeviceCfg,
+}
+
+/// Wrapper for `deviceCfg` inside `DingDongCfg`
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DingDongDeviceCfg {
+    /// One entry per alarm-in event
+    #[serde(default, rename = "alarminCfg")]
+    pub alarmin_cfg: Vec<DingDongAlarminCfg>,
+}
+
+/// Per-event ringtone entry inside `DingDongCfg`/`deviceCfg`
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DingDongAlarminCfg {
+    /// Event class — one of `motion`, `people`, `vehicle`, `visitor`, `package`, `pet`
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// Whether the entry is valid (1 = use this tone for the event, 0 = ignore)
+    pub valid: u32,
+    /// Music/tone ID to play when this event fires
+    #[serde(rename = "musicId")]
+    pub music_id: u32,
+}
+
+/// DingDongSilentMode — silent windows during which the chime stays quiet (cmd 609/610)
+///
+/// `type_` is a weekday bitmask: bit 0 = Sunday, bit 1 = Monday, …, bit 6 = Saturday
+/// (the spec example `63` = Mon-Sat with Sunday off, i.e. `0b0111111`).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DingDongSilentMode {
+    /// XML Version
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// Channel ID — usually 0
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Weekday bitmask
+    #[serde(rename = "type")]
+    pub type_: u32,
+    /// Silent-window start, `HH:MM`
+    #[serde(rename = "startTime")]
+    pub start_time: String,
+    /// Silent-window end, `HH:MM`
+    #[serde(rename = "endTime")]
+    pub end_time: String,
+}
+
+/// AudioFileInfo — quick-reply audio playback (cmd 349)
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct AudioFileInfo {
+    /// XML Version
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// Channel ID — usually 0
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Identifier of the pre-recorded audio clip stored on the camera
+    #[serde(rename = "fileId")]
+    pub file_id: u32,
+    /// Play mode — observed values are 1/2 (single / loop)
+    #[serde(rename = "playMode")]
+    pub play_mode: u32,
+    /// Playback duration in seconds
+    #[serde(rename = "playDuration")]
+    pub play_duration: u32,
+    /// Number of times to repeat the clip
+    #[serde(rename = "playTimes")]
+    pub play_times: u32,
+}
+
+/// DingDongList — wireless chimes discovered for the doorbell (cmd 484/608)
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DingDongList {
+    /// XML Version
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// Channel ID — usually 0
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Paired chime devices
+    #[serde(default, rename = "dingdongDevice")]
+    pub devices: Vec<DingDongDevice>,
+}
+
+/// One entry in `DingDongList`
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DingDongDevice {
+    /// Identifier of the chime
+    #[serde(rename = "deviceId")]
+    pub device_id: u32,
+    /// Friendly name set by the user
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Volume level (1..3)
+    #[serde(rename = "volLevel", default, skip_serializing_if = "Option::is_none")]
+    pub vol_level: Option<u32>,
+    /// LED state (0/1)
+    #[serde(rename = "ledState", default, skip_serializing_if = "Option::is_none")]
+    pub led_state: Option<u32>,
+    /// Last-known music/tone ID
+    #[serde(rename = "musicId", default, skip_serializing_if = "Option::is_none")]
+    pub music_id: Option<u32>,
+    /// Online/paired state, if reported by the camera (1 = online)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<u32>,
 }
 
 /// Convience function to return the xml version used throughout the library
