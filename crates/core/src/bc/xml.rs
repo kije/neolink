@@ -141,6 +141,16 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// Begin / describe a firmware-upgrade upload session.
+    ///
+    /// Placeholder, see `UpgradeReq` for details. TODO: confirm via capture.
+    #[serde(rename = "ConfigFileInfo", skip_serializing_if = "Option::is_none")]
+    pub upgrade_req: Option<UpgradeReq>,
+    /// Restore-to-defaults / factory reset request.
+    ///
+    /// Placeholder, see `FactoryReset` for details. TODO: confirm via capture.
+    #[serde(rename = "Restore", skip_serializing_if = "Option::is_none")]
+    pub factory_reset: Option<FactoryReset>,
 }
 
 impl BcXml {
@@ -1618,6 +1628,87 @@ pub struct User {
     /// | modify | Indicates that the user should be modified. It seems like only the password can be changed.                        |
     #[serde(rename = "userSetState")]
     pub user_set_state: String,
+}
+
+// -- Device-lifecycle placeholders ------------------------------------------
+//
+// These XML payloads are placeholders for the firmware-upgrade and
+// factory-reset commands described in issue #14. The exact field names and
+// types have NOT been independently verified — they are best-guess shapes
+// derived from `dissector/baichuan.lua`, which labels:
+//
+//   cmd 65/66/67 -> `<ConfigFileInfo>` (Export / Import / FW Upgrade)
+//   cmd 99       -> `<Restore>` (factory default)
+//
+// All fields use `Option<...>` plus `skip_serializing_if` so that a future
+// capture can drop / rename individual fields without breaking the entire
+// struct's deserialization. See `docs/baichuan-lifecycle.md`.
+
+/// Begin / describe a firmware-upgrade upload session.
+///
+/// TODO: confirm via capture. Likely paired with cmd 67 (`MSG_ID_UPGRADE_BEGIN`)
+/// based on `dissector/baichuan.lua`. The field shape below is a guess — at
+/// minimum a length and integrity hash are expected; the Reolink app's
+/// `.pak` format includes its own internal header so the wrapping XML may
+/// be quite small.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct UpgradeReq {
+    /// XML version, typically "1.1"
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// Channel id (likely 0 for non-NVR cameras). TODO: confirm.
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Total size in bytes of the firmware payload. TODO: confirm field name.
+    #[serde(rename = "fileSize", skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+    /// SHA-256 of the firmware payload, lowercase hex. TODO: confirm field name
+    /// and whether SHA-256 (rather than MD5) is even what the camera expects.
+    #[serde(rename = "sha256", skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Optional file name. TODO: confirm.
+    #[serde(rename = "fileName", skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+}
+
+/// Chunk-level metadata for a single frame of a firmware upload.
+///
+/// TODO: confirm via capture. The streaming frames may be pure binary (no
+/// XML extension at all) using the `0x6482` file-download message class, in
+/// which case this struct is unused on the wire and only kept as
+/// documentation of the conjectured shape.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct UpgradeData {
+    /// XML version, typically "1.1"
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// Sequential chunk index, starting at 0. TODO: confirm.
+    #[serde(rename = "seq", skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u32>,
+    /// Offset in bytes of this chunk within the full firmware payload.
+    /// TODO: confirm.
+    #[serde(rename = "offset", skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    /// Length in bytes of this chunk. TODO: confirm.
+    #[serde(rename = "length", skip_serializing_if = "Option::is_none")]
+    pub length: Option<u32>,
+}
+
+/// Restore-to-defaults / factory reset payload.
+///
+/// TODO: confirm via capture. Dissector labels cmd 99 as `<Restore>`. The
+/// "keep network settings" flag is a guess based on what the Reolink mobile
+/// app exposes; the actual XML may simply be empty (header-only).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct FactoryReset {
+    /// XML version, typically "1.1"
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// If `1`, attempt to preserve network configuration across the reset.
+    /// If `0` (the camera default), wipe everything. TODO: confirm field
+    /// name; the real field may not exist at all.
+    #[serde(rename = "keepNetwork", skip_serializing_if = "Option::is_none")]
+    pub keep_network: Option<u8>,
 }
 
 /// Convience function to return the xml version used throughout the library
