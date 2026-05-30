@@ -1651,7 +1651,7 @@ pub struct User {
 /// link RSSI, link type (`2.4G`, `5G`, `wired`, ...) and an optional list
 /// of scanned APs. The exact field names are taken from the
 /// `starkillerOG/reolink_aio` reference.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct Wifi {
     /// XML Version
     #[serde(rename = "@version", default = "xml_ver")]
@@ -1676,7 +1676,7 @@ pub struct Wifi {
 }
 
 /// A list of access points returned by the WiFi scan (cmd 116).
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct WifiScanApList {
     /// The individual access points
     #[serde(default, rename = "ap")]
@@ -1684,7 +1684,7 @@ pub struct WifiScanApList {
 }
 
 /// A single access point in the WiFi scan list.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct WifiAp {
     /// SSID of the access point
     #[serde(rename = "ssid")]
@@ -1702,7 +1702,7 @@ pub struct WifiAp {
 
 /// I/O input list push (cmd 677). Hubs / NVRs send this when one of the
 /// physical alarm-in terminals changes state.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct IoInputList {
     /// XML Version
     #[serde(rename = "@version", default = "xml_ver")]

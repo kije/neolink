@@ -42,6 +42,7 @@ mod time;
 mod uid;
 mod users;
 mod version;
+mod wifi;
 
 pub(crate) use connection::*;
 pub use credentials::*;
