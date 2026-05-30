@@ -32,6 +32,7 @@ mod ptz;
 mod pushinfo;
 mod reboot;
 mod resolution;
+mod scene;
 mod services;
 mod siren;
 mod snap;
@@ -54,6 +55,7 @@ pub use pirstate::PirState;
 pub use ptz::Direction;
 pub use pushinfo::PhoneType;
 pub use resolution::*;
+pub use scene::SCENE_ID_DISABLED;
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind};
 
