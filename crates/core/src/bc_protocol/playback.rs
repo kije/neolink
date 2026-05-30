@@ -18,6 +18,26 @@
 //! session before they return (even on error). For very large SD cards the
 //! eager pattern keeps the public surface small; the [`MAX_PAGES`] cap
 //! guards against a buggy firmware never reporting an empty page.
+//!
+//! ## Replay-mode partial-AES quirk (not yet handled)
+//!
+//! `apocaliss92/nodelink-js` notes that on some Reolink firmwares the
+//! replay path encrypts only the *header* of P-frames while leaving the
+//! payload in clear text. nodelink-js works around this by attempting
+//! both candidate decodes and scoring them with `scoreBcMediaLike()`.
+//!
+//! We currently route replay frames through the existing
+//! [`crate::bcmedia`] parser unchanged. On affected firmwares the parser
+//! may reject some frames mid-stream. If you hit this, the workaround is
+//! to add a fallback parser path that:
+//!
+//! 1. Parses the BcMedia header from the *decrypted* bytes (status quo).
+//! 2. On magic-header mismatch, retries the parse using the *raw* bytes
+//!    of the payload while still treating the header as decrypted.
+//! 3. Picks whichever produced a plausible BcMedia frame.
+//!
+//! This is documented here so a future patch can add it once a real
+//! camera is available for verification.
 
 use super::{BcCamera, Error, Result};
 use crate::{

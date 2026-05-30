@@ -223,3 +223,33 @@ fn bcmedia_payload(media: &BcMedia) -> &[u8] {
         BcMedia::InfoV1(_) | BcMedia::InfoV2(_) => &[],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ymd_basic() {
+        assert_eq!(parse_ymd("2024-11-26").unwrap(), (2024, 11, 26));
+        assert_eq!(parse_ymd("2024-01-01").unwrap(), (2024, 1, 1));
+        assert_eq!(parse_ymd("2024-12-31").unwrap(), (2024, 12, 31));
+    }
+
+    #[test]
+    fn parse_ymd_rejects_garbage() {
+        assert!(parse_ymd("not-a-date").is_err());
+        assert!(parse_ymd("2024-13-01").is_err());
+        assert!(parse_ymd("2024-12-32").is_err());
+        assert!(parse_ymd("2024").is_err());
+    }
+
+    #[test]
+    fn format_playback_time_pads_correctly() {
+        let t = PlaybackTime::from_components(2024, 1, 5, 8, 7, 3);
+        assert_eq!(format_playback_time(t), "2024-01-05 08:07:03");
+        let t = PlaybackTime::from_components(2024, 12, 31, 23, 59, 59);
+        assert_eq!(format_playback_time(t), "2024-12-31 23:59:59");
+        let t = PlaybackTime::start_of_day(2024, 11, 26);
+        assert_eq!(format_playback_time(t), "2024-11-26 00:00:00");
+    }
+}
