@@ -19,6 +19,7 @@ mod credentials;
 mod email;
 mod errors;
 mod floodlight;
+mod io;
 mod keepalive;
 mod ledstate;
 mod link;
