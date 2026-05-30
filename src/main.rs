@@ -45,8 +45,10 @@ mod image;
 mod mqtt;
 mod onvif;
 mod pir;
+mod privacy;
 mod ptz;
 mod reboot;
+mod scene;
 #[cfg(feature = "gstreamer")]
 mod rtsp;
 mod services;
@@ -151,6 +153,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::Users(opts)) => {
             users::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Privacy(opts)) => {
+            privacy::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Scene(opts)) => {
+            scene::main(opts, neo_reactor.clone()).await?;
         }
     }
 
