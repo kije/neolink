@@ -44,8 +44,8 @@ mod uid;
 mod users;
 mod version;
 
-pub(crate) use connection::*;
 pub use chime::{ChimeParams, HardwiredChime, SilentWindow, ToneId};
+pub(crate) use connection::*;
 pub use credentials::*;
 pub use errors::Error;
 pub use ledstate::LightState;

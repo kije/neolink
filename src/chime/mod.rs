@@ -72,8 +72,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
             }
         }
         ChimeCommand::Ring { device_id, tone } => {
-            let tone_id = parse_tone(&tone)
-                .with_context(|| format!("Unknown tone: {tone:?}"))?;
+            let tone_id = parse_tone(&tone).with_context(|| format!("Unknown tone: {tone:?}"))?;
             camera
                 .run_task(|cam| {
                     Box::pin(async move {

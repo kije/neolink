@@ -214,8 +214,7 @@ impl BcCamera {
         match self.fetch_chime_cfg(MSG_ID_GET_DING_DONG_CFG, id).await {
             Ok(cfg) => Ok(cfg),
             Err(Error::CameraServiceUnavailable { .. }) => {
-                self.fetch_chime_cfg(MSG_ID_GET_DING_DONG_CFG_ALT, id)
-                    .await
+                self.fetch_chime_cfg(MSG_ID_GET_DING_DONG_CFG_ALT, id).await
             }
             Err(e) => Err(e),
         }
@@ -681,7 +680,9 @@ impl BcCamera {
     ) -> Result<()> {
         let connection = self.get_connection();
         let msg_num = self.new_message_num();
-        let mut sub = connection.subscribe(MSG_ID_QUICK_REPLY_PLAY, msg_num).await?;
+        let mut sub = connection
+            .subscribe(MSG_ID_QUICK_REPLY_PLAY, msg_num)
+            .await?;
         let bc = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_QUICK_REPLY_PLAY,
@@ -718,5 +719,54 @@ impl BcCamera {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tone_id_roundtrip() {
+        for tone in [
+            ToneId::Citybird,
+            ToneId::OriginalTune,
+            ToneId::PianoKey,
+            ToneId::Loop,
+            ToneId::Attraction,
+            ToneId::HopHop,
+            ToneId::GoodDay,
+            ToneId::Operetta,
+            ToneId::Moonlight,
+            ToneId::WayBackHome,
+        ] {
+            assert_eq!(ToneId::from_name(tone.name()), Some(tone));
+            assert_eq!(
+                ToneId::from_name(&tone.name().to_ascii_uppercase()),
+                Some(tone)
+            );
+            assert!(tone.id() >= 1);
+        }
+        assert_eq!(ToneId::from_name("bogus"), None);
+    }
+
+    #[test]
+    fn tone_ids_unique() {
+        let ids = [
+            ToneId::Citybird.id(),
+            ToneId::OriginalTune.id(),
+            ToneId::PianoKey.id(),
+            ToneId::Loop.id(),
+            ToneId::Attraction.id(),
+            ToneId::HopHop.id(),
+            ToneId::GoodDay.id(),
+            ToneId::Operetta.id(),
+            ToneId::Moonlight.id(),
+            ToneId::WayBackHome.id(),
+        ];
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "tone ids must be unique");
     }
 }

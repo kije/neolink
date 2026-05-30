@@ -2177,3 +2177,245 @@ fn test_empty_floodlight_status_list() {
         _ => panic!(),
     }
 }
+
+#[test]
+fn test_ding_dong_device_opt_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <DingDongDeviceOpt version="1.1">
+            <channelId>0</channelId>
+            <type>3</type>
+            <deviceId>7</deviceId>
+            <volLevel>2</volLevel>
+            <ledState>1</ledState>
+            <name>Front Chime</name>
+            <musicId>4</musicId>
+        </DingDongDeviceOpt>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let opt = b.ding_dong_device_opt.expect("DingDongDeviceOpt");
+    assert_eq!(opt.version, "1.1");
+    assert_eq!(opt.channel_id, 0);
+    assert_eq!(opt.type_, 3);
+    assert_eq!(opt.device_id, 7);
+    assert_eq!(opt.vol_level, Some(2));
+    assert_eq!(opt.led_state, Some(1));
+    assert_eq!(opt.name.as_deref(), Some("Front Chime"));
+    assert_eq!(opt.music_id, Some(4));
+
+    // Round-trip through serialize -> parse
+    let serialized = BcXml {
+        ding_dong_device_opt: Some(opt.clone()),
+        ..Default::default()
+    }
+    .serialize(vec![])
+    .unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(reparsed.ding_dong_device_opt, Some(opt));
+}
+
+#[test]
+fn test_ding_dong_ctrl_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <DingDongCtrl version="1.1">
+            <channelId>0</channelId>
+            <type>machineStateSet</type>
+            <bopen>1</bopen>
+            <bsave>1</bsave>
+            <time>3</time>
+        </DingDongCtrl>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let ctrl = b.ding_dong_ctrl.expect("DingDongCtrl");
+    assert_eq!(ctrl.type_, "machineStateSet");
+    assert_eq!(ctrl.bopen, Some(1));
+    assert_eq!(ctrl.bsave, Some(1));
+    assert_eq!(ctrl.time, Some(3));
+
+    let serialized = BcXml {
+        ding_dong_ctrl: Some(ctrl.clone()),
+        ..Default::default()
+    }
+    .serialize(vec![])
+    .unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(reparsed.ding_dong_ctrl, Some(ctrl));
+}
+
+#[test]
+fn test_ding_dong_cfg_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <DingDongCfg version="1.1">
+            <channelId>0</channelId>
+            <deviceId>2</deviceId>
+            <deviceCfg>
+                <alarminCfg>
+                    <type>visitor</type>
+                    <valid>1</valid>
+                    <musicId>4</musicId>
+                </alarminCfg>
+                <alarminCfg>
+                    <type>motion</type>
+                    <valid>0</valid>
+                    <musicId>1</musicId>
+                </alarminCfg>
+            </deviceCfg>
+        </DingDongCfg>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let cfg = b.ding_dong_cfg.expect("DingDongCfg");
+    assert_eq!(cfg.device_id, 2);
+    assert_eq!(cfg.device_cfg.alarmin_cfg.len(), 2);
+    assert_eq!(cfg.device_cfg.alarmin_cfg[0].type_, "visitor");
+    assert_eq!(cfg.device_cfg.alarmin_cfg[0].valid, 1);
+    assert_eq!(cfg.device_cfg.alarmin_cfg[0].music_id, 4);
+    assert_eq!(cfg.device_cfg.alarmin_cfg[1].type_, "motion");
+
+    let serialized = BcXml {
+        ding_dong_cfg: Some(cfg.clone()),
+        ..Default::default()
+    }
+    .serialize(vec![])
+    .unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(reparsed.ding_dong_cfg, Some(cfg));
+}
+
+#[test]
+fn test_ding_dong_silent_mode_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <DingDongSilentMode version="1.1">
+            <channelId>0</channelId>
+            <type>63</type>
+            <startTime>22:00</startTime>
+            <endTime>07:00</endTime>
+        </DingDongSilentMode>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let silent = b.ding_dong_silent_mode.expect("DingDongSilentMode");
+    assert_eq!(silent.type_, 63);
+    assert_eq!(silent.start_time, "22:00");
+    assert_eq!(silent.end_time, "07:00");
+
+    let serialized = BcXml {
+        ding_dong_silent_mode: Some(silent.clone()),
+        ..Default::default()
+    }
+    .serialize(vec![])
+    .unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(reparsed.ding_dong_silent_mode, Some(silent));
+}
+
+#[test]
+fn test_audio_file_info_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <AudioFileInfo version="1.1">
+            <channelId>0</channelId>
+            <fileId>1</fileId>
+            <playMode>2</playMode>
+            <playDuration>5</playDuration>
+            <playTimes>1</playTimes>
+        </AudioFileInfo>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let afi = b.audio_file_info.expect("AudioFileInfo");
+    assert_eq!(afi.file_id, 1);
+    assert_eq!(afi.play_mode, 2);
+    assert_eq!(afi.play_duration, 5);
+    assert_eq!(afi.play_times, 1);
+
+    let serialized = BcXml {
+        audio_file_info: Some(afi.clone()),
+        ..Default::default()
+    }
+    .serialize(vec![])
+    .unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(reparsed.audio_file_info, Some(afi));
+}
+
+#[test]
+fn test_ding_dong_list_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <DingDongList version="1.1">
+            <channelId>0</channelId>
+            <dingdongDevice>
+                <deviceId>1</deviceId>
+                <name>Front Chime</name>
+                <volLevel>2</volLevel>
+                <ledState>1</ledState>
+                <musicId>4</musicId>
+                <state>1</state>
+            </dingdongDevice>
+            <dingdongDevice>
+                <deviceId>2</deviceId>
+                <name>Back Chime</name>
+            </dingdongDevice>
+        </DingDongList>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let list = b.ding_dong_list.expect("DingDongList");
+    assert_eq!(list.devices.len(), 2);
+    assert_eq!(list.devices[0].device_id, 1);
+    assert_eq!(list.devices[0].name.as_deref(), Some("Front Chime"));
+    assert_eq!(list.devices[0].vol_level, Some(2));
+    assert_eq!(list.devices[0].state, Some(1));
+    assert_eq!(list.devices[1].device_id, 2);
+    assert_eq!(list.devices[1].vol_level, None);
+
+    let serialized = BcXml {
+        ding_dong_list: Some(list.clone()),
+        ..Default::default()
+    }
+    .serialize(vec![])
+    .unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(reparsed.ding_dong_list, Some(list));
+}
+
+#[test]
+fn test_empty_ding_dong_list() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <DingDongList version="1.1">
+            <channelId>0</channelId>
+        </DingDongList>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let list = b.ding_dong_list.expect("DingDongList");
+    assert!(list.devices.is_empty());
+}
