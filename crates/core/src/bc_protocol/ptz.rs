@@ -811,8 +811,7 @@ impl BcCamera {
         if let BcBody::ModernMsg(ModernMsg {
             payload:
                 Some(BcPayloads::BcXml(BcXml {
-                    ptz_pos: Some(pos),
-                    ..
+                    ptz_pos: Some(pos), ..
                 })),
             ..
         }) = msg.body
@@ -854,8 +853,7 @@ impl BcCamera {
                             BcBody::ModernMsg(ModernMsg {
                                 payload:
                                     Some(BcPayloads::BcXml(BcXml {
-                                        ptz_pos: Some(pos),
-                                        ..
+                                        ptz_pos: Some(pos), ..
                                     })),
                                 ..
                             }),
@@ -881,9 +879,7 @@ impl BcCamera {
                 let tx = tx.clone();
                 Box::pin(async move {
                     tokio::spawn(async move {
-                        if let Ok(pos) =
-                            poll_ptz_position(&conn, channel_id, push_msg_num).await
-                        {
+                        if let Ok(pos) = poll_ptz_position(&conn, channel_id, push_msg_num).await {
                             let _ = tx.send(pos).await;
                         }
                     });
@@ -937,11 +933,9 @@ async fn poll_ptz_position(
         });
     }
     if let BcBody::ModernMsg(ModernMsg {
-        payload:
-            Some(BcPayloads::BcXml(BcXml {
-                ptz_pos: Some(pos),
-                ..
-            })),
+        payload: Some(BcPayloads::BcXml(BcXml {
+            ptz_pos: Some(pos), ..
+        })),
         ..
     }) = msg.body
     {
