@@ -28,10 +28,24 @@ pub const MSG_ID_PTZ_CONTROL: u32 = 18;
 pub const MSG_ID_PTZ_CONTROL_PRESET: u32 = 19;
 /// Reboot messages have this ID
 pub const MSG_ID_REBOOT: u32 = 23;
-/// Request motion detection messages
+/// Request motion detection messages.
+///
+/// Also re-used as the persistent "push subscribe" cmd: send with
+/// `channel_id = MAGIC_CHANNEL_PUSH_SUBSCRIBE` (251) and an empty body
+/// after login and the camera will push asynchronous events
+/// (motion, AI, day/night, sleep, battery, config-changed, ...) on the
+/// same TCP socket.
 pub const MSG_ID_MOTION_REQUEST: u32 = 31;
+/// Alias for [`MSG_ID_MOTION_REQUEST`] used in the push-channel code paths
+/// where the request is semantically a "subscribe to all events" rather
+/// than a motion-only request.
+pub const MSG_ID_SUBSCRIBE_EVENTS: u32 = MSG_ID_MOTION_REQUEST;
 /// Motion detection messages
 pub const MSG_ID_MOTION: u32 = 33;
+/// Alias for [`MSG_ID_MOTION`]. Camera-initiated `AlarmEvent` push frames
+/// (including AI sub-events, smart-AI lists and day/night transitions) all
+/// arrive on this id.
+pub const MSG_ID_ALARM_EVENT: u32 = MSG_ID_MOTION;
 /// Set service ports
 pub const MSG_ID_SET_SERVICE_PORTS: u32 = 36;
 /// Get service ports
@@ -60,6 +74,13 @@ pub const MSG_ID_UID: u32 = 114;
 pub const MSG_ID_PUSH_INFO: u32 = 124;
 /// Send a test email configuration
 pub const MSG_ID_TEST_EMAIL: u32 = 141;
+/// Channel / sleep / loginState push messages.
+///
+/// Reolink uses cmd 145 as a free-form `ChannelInfo` payload that the
+/// camera emits when the sleep state, login state, or channel-online
+/// state changes. Battery cameras use this to announce wake/sleep
+/// transitions over the push channel.
+pub const MSG_ID_CHANNEL_INFO: u32 = 145;
 /// StreamInfoList messages have this ID
 pub const MSG_ID_STREAM_INFO_LIST: u32 = 146;
 /// Used to get the abilities of a user
@@ -104,6 +125,18 @@ pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
 pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Get the floodlight task xml
 pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
+/// Config-changed push notification from the camera.
+///
+/// Carries a `ModifyConfig` body with a single `<cmd>N</cmd>` value
+/// indicating which other cmd's cached response has just gone stale.
+/// Consumers should treat it as "invalidate the cached response for
+/// cmd N and refetch on next read".
+pub const MSG_ID_MODIFY_CONFIG: u32 = 580;
+
+/// Magic `channel_id` used when sending [`MSG_ID_SUBSCRIBE_EVENTS`] to
+/// open the persistent push-event subscription. Reolink reserves channel
+/// 251 as the "subscribe to all events" sentinel.
+pub const MAGIC_CHANNEL_PUSH_SUBSCRIBE: u8 = 251;
 
 /// An empty password in legacy format
 pub const EMPTY_LEGACY_PASSWORD: &str =
