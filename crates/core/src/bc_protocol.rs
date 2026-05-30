@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use Md5Trunc::*;
 
 mod abilityinfo;
+mod audio;
 mod battery;
 mod connection;
 mod credentials;
