@@ -141,6 +141,19 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// Day/night transition push event (cmd 33 sibling).
+    #[serde(rename = "DayNightEvent", skip_serializing_if = "Option::is_none")]
+    pub day_night_event: Option<DayNightEvent>,
+    /// Smart-AI sub-event list (cmd 33 sibling).
+    #[serde(rename = "smartAiTypeList", skip_serializing_if = "Option::is_none")]
+    pub smart_ai_type_list: Option<SmartAiTypeList>,
+    /// Channel / sleep / loginState push (cmd 145).
+    #[serde(rename = "ChannelInfo", skip_serializing_if = "Option::is_none")]
+    pub channel_info: Option<ChannelInfo>,
+    /// Config-stale push (cmd 580). Carries the cmd whose cached response
+    /// has been invalidated by a configuration change on the camera.
+    #[serde(rename = "ModifyConfig", skip_serializing_if = "Option::is_none")]
+    pub modify_config: Option<ModifyConfig>,
 }
 
 impl BcXml {
@@ -628,6 +641,12 @@ pub struct AlarmEventList {
 }
 
 /// An alarm event. Camera can send multiple per message as an array in AlarmEventList.
+///
+/// Newer firmwares send a comma-separated list of AI sub-types in `<AItype>`
+/// (e.g. `"people,vehicle,dog_cat,face,package"`). Use [`AlarmEvent::ai_types`]
+/// to get the normalized list — both legacy single values and the comma-list
+/// form are accepted, and aliases (`"person"`→`"people"`, `"pet"`→`"dog_cat"`)
+/// are normalized.
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
 pub struct AlarmEvent {
     /// XML Version
@@ -638,7 +657,8 @@ pub struct AlarmEvent {
     pub channel_id: u8,
     /// Motion status. Known values are `"MD"` or `"none"`
     pub status: String,
-    /// AI status. Known values are `"people"` or `"none"`
+    /// AI status. Known values are `"none"` or a comma-separated list of
+    /// `"people"`, `"vehicle"`, `"dog_cat"`, `"face"`, `"package"`.
     #[serde(rename = "AItype", skip_serializing_if = "Option::is_none")]
     pub ai_type: Option<String>,
     /// The recording status. Known values `0` or `1`
@@ -646,6 +666,151 @@ pub struct AlarmEvent {
     /// The timestamp associated with the recording. `0` if not recording
     #[serde(rename = "timeStamp")]
     pub timeStamp: i32,
+}
+
+impl AlarmEvent {
+    /// Parse the raw `<AItype>` field into a normalized list of AI sub-types.
+    ///
+    /// Returns an empty `Vec` when the field is missing or the value is
+    /// `"none"`. Comma-separated lists are split, each entry is trimmed and
+    /// the reolink_aio aliases (`"person"`→`"people"`, `"pet"`→`"dog_cat"`)
+    /// are applied. Empty entries are dropped.
+    pub fn ai_types(&self) -> Vec<String> {
+        match self.ai_type.as_deref() {
+            None | Some("") | Some("none") => Vec::new(),
+            Some(raw) => raw
+                .split(',')
+                .filter_map(|s| {
+                    let t = s.trim();
+                    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        Some(normalize_ai_type(t).to_string())
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Returns true when the event represents some form of motion or AI
+    /// detection (status != "none" or any AI sub-type present).
+    pub fn is_active(&self) -> bool {
+        self.status != "none" || !self.ai_types().is_empty()
+    }
+}
+
+/// Normalize an AI type string into the canonical form used by
+/// `reolink_aio`'s `AI_DETECT_CONVERSION` table.
+///
+/// Currently maps:
+///
+/// - `"person"` → `"people"`
+/// - `"pet"`    → `"dog_cat"`
+///
+/// All other values are passed through unchanged. The comparison is
+/// case-insensitive but the canonical output is the lower-case Reolink
+/// spelling.
+pub fn normalize_ai_type(raw: &str) -> &str {
+    match raw {
+        "person" => "people",
+        "pet" => "dog_cat",
+        _ => raw,
+    }
+}
+
+/// A `<smartAiTypeList>` payload that can ride on a cmd 33 frame alongside
+/// `AlarmEventList`. Each entry is a sub-AI label (e.g. `"package"`).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct SmartAiTypeList {
+    /// XML Version
+    #[serde(rename = "@version", default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    /// The channel the event occured on. Usually zero unless from an NVR.
+    #[serde(rename = "channelId", default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Individual `<smartAiType>` entries. Names are normalized via
+    /// [`normalize_ai_type`] by [`SmartAiTypeList::types`].
+    #[serde(default, rename = "smartAiType")]
+    pub items: Vec<SmartAiType>,
+}
+
+impl SmartAiTypeList {
+    /// Returns the contained type names in normalized form.
+    pub fn types(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .map(|t| normalize_ai_type(&t.name).to_string())
+            .collect()
+    }
+}
+
+/// A single `<smartAiType>` entry inside [`SmartAiTypeList`].
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct SmartAiType {
+    /// The label of the smart-AI sub-event (e.g. `"package"`, `"face"`).
+    #[serde(rename = "$text", default, alias = "name")]
+    pub name: String,
+}
+
+/// Day/night transition push payload that arrives as a sibling of
+/// `AlarmEventList` on cmd 33.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct DayNightEvent {
+    /// XML Version
+    #[serde(rename = "@version", default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    /// The channel the event occured on. Usually zero unless from an NVR.
+    #[serde(rename = "channelId", default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Reported mode. Known values `"day"`, `"night"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// Channel / sleep / loginState push payload (cmd 145).
+///
+/// The camera emits this when something about the channel or the device
+/// itself changes — battery cameras use it to announce wake/sleep
+/// transitions; multi-channel NVRs use it to announce per-channel login
+/// changes. Fields are all optional because firmwares vary in which
+/// subset they emit.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct ChannelInfo {
+    /// XML Version
+    #[serde(rename = "@version", default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    /// Channel the change is for. Usually zero unless from an NVR.
+    #[serde(rename = "channelId", default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Sleep state: `0` = awake, `1` = asleep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<u8>,
+    /// Login state: `0` = logged out, `1` = logged in.
+    #[serde(
+        rename = "loginState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub login_state: Option<u8>,
+    /// Channel-online state: `0` = offline, `1` = online.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<u8>,
+}
+
+/// Config-stale push payload (cmd 580). Carries the cmd whose cached
+/// response has just been invalidated by a configuration change on the
+/// camera. Consumers should treat this as "drop any cached state for cmd
+/// `cmd` and refetch on next read".
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct ModifyConfig {
+    /// XML Version
+    #[serde(rename = "@version", default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    /// The cmd_id of the response that has gone stale.
+    pub cmd: u32,
+    /// Optional channel filter for NVRs.
+    #[serde(rename = "channelId", default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
 }
 
 /// The Ptz messages used to move the camera
@@ -1944,6 +2109,205 @@ fn test_enc3_extension() {
         } => {}
         _ => panic!(),
     }
+}
+
+#[test]
+fn test_alarm_event_ai_type_comma_split() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <AlarmEventList version="1.1">
+        <AlarmEvent version="1.1">
+        <channelId>0</channelId>
+        <status>MD</status>
+        <AItype>people,vehicle,dog_cat,face,package</AItype>
+        <recording>1</recording>
+        <timeStamp>1700000000</timeStamp>
+        </AlarmEvent>
+        </AlarmEventList>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let list = b.alarm_event_list.unwrap();
+    assert_eq!(list.alarm_events.len(), 1);
+    let ev = &list.alarm_events[0];
+    assert_eq!(ev.status, "MD");
+    assert!(ev.is_active());
+    assert_eq!(
+        ev.ai_types(),
+        vec!["people", "vehicle", "dog_cat", "face", "package"]
+    );
+}
+
+#[test]
+fn test_alarm_event_ai_type_normalization() {
+    // Legacy single-value form.
+    let ev = AlarmEvent {
+        ai_type: Some("person".to_string()),
+        status: "MD".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(ev.ai_types(), vec!["people"]);
+    assert!(ev.is_active());
+
+    // Mixed comma list with whitespace and aliases.
+    let ev = AlarmEvent {
+        ai_type: Some(" person , pet , vehicle ".to_string()),
+        status: "none".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(ev.ai_types(), vec!["people", "dog_cat", "vehicle"]);
+    assert!(ev.is_active());
+
+    // Empty / "none" / missing forms.
+    let ev = AlarmEvent {
+        ai_type: Some("none".to_string()),
+        status: "none".to_string(),
+        ..Default::default()
+    };
+    assert!(ev.ai_types().is_empty());
+    assert!(!ev.is_active());
+
+    let ev = AlarmEvent {
+        ai_type: None,
+        status: "none".to_string(),
+        ..Default::default()
+    };
+    assert!(ev.ai_types().is_empty());
+    assert!(!ev.is_active());
+
+    // Empty entries are skipped.
+    let ev = AlarmEvent {
+        ai_type: Some(",people,,vehicle,".to_string()),
+        status: "MD".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(ev.ai_types(), vec!["people", "vehicle"]);
+}
+
+#[test]
+fn test_alarm_event_roundtrip() {
+    let original = BcXml {
+        alarm_event_list: Some(AlarmEventList {
+            version: "1.1".to_string(),
+            alarm_events: vec![AlarmEvent {
+                version: "1.1".to_string(),
+                channel_id: 0,
+                status: "MD".to_string(),
+                ai_type: Some("people,vehicle".to_string()),
+                recording: 1,
+                timeStamp: 1_700_000_000,
+            }],
+        }),
+        ..Default::default()
+    };
+    let bytes = original.serialize(Vec::new()).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(original, parsed);
+    assert_eq!(
+        parsed.alarm_event_list.as_ref().unwrap().alarm_events[0].ai_types(),
+        vec!["people", "vehicle"]
+    );
+}
+
+#[test]
+fn test_smart_ai_type_list_deser() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <smartAiTypeList version="1.1">
+        <channelId>0</channelId>
+        <smartAiType>package</smartAiType>
+        <smartAiType>person</smartAiType>
+        </smartAiTypeList>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let list = b.smart_ai_type_list.unwrap();
+    assert_eq!(list.channel_id, Some(0));
+    // Aliases are applied through `.types()`.
+    assert_eq!(list.types(), vec!["package", "people"]);
+}
+
+#[test]
+fn test_day_night_event_deser() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <DayNightEvent version="1.1">
+        <channelId>0</channelId>
+        <mode>night</mode>
+        </DayNightEvent>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let ev = b.day_night_event.unwrap();
+    assert_eq!(ev.channel_id, Some(0));
+    assert_eq!(ev.mode.as_deref(), Some("night"));
+}
+
+#[test]
+fn test_channel_info_deser() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <ChannelInfo version="1.1">
+        <channelId>0</channelId>
+        <sleep>1</sleep>
+        <loginState>1</loginState>
+        <online>1</online>
+        </ChannelInfo>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let ci = b.channel_info.unwrap();
+    assert_eq!(ci.channel_id, Some(0));
+    assert_eq!(ci.sleep, Some(1));
+    assert_eq!(ci.login_state, Some(1));
+    assert_eq!(ci.online, Some(1));
+}
+
+#[test]
+fn test_modify_config_deser_and_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <ModifyConfig version="1.1">
+        <cmd>56</cmd>
+        </ModifyConfig>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let mc = b.modify_config.as_ref().unwrap();
+    assert_eq!(mc.cmd, 56);
+
+    // Round-trip
+    let bytes = b.serialize(Vec::new()).unwrap();
+    let again = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(b, again);
+}
+
+#[test]
+fn test_normalize_ai_type() {
+    assert_eq!(normalize_ai_type("person"), "people");
+    assert_eq!(normalize_ai_type("pet"), "dog_cat");
+    assert_eq!(normalize_ai_type("people"), "people");
+    assert_eq!(normalize_ai_type("vehicle"), "vehicle");
+    assert_eq!(normalize_ai_type("face"), "face");
+    assert_eq!(normalize_ai_type("package"), "package");
+    assert_eq!(normalize_ai_type("dog_cat"), "dog_cat");
+    // Unknown values pass through.
+    assert_eq!(normalize_ai_type("unicorn"), "unicorn");
 }
 
 #[test]
