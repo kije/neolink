@@ -48,9 +48,9 @@ mod pir;
 mod privacy;
 mod ptz;
 mod reboot;
-mod scene;
 #[cfg(feature = "gstreamer")]
 mod rtsp;
+mod scene;
 mod services;
 mod statusled;
 #[cfg(feature = "gstreamer")]

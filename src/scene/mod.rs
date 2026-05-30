@@ -61,11 +61,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
             // just the id.
             let ids = camera
                 .run_task(|cam| {
-                    Box::pin(async move {
-                        cam.get_scenes()
-                            .await
-                            .context("Unable to list scenes")
-                    })
+                    Box::pin(async move { cam.get_scenes().await.context("Unable to list scenes") })
                 })
                 .await?;
             if ids.is_empty() {

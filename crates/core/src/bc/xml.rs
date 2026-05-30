@@ -2067,6 +2067,192 @@ fn test_enc3_extension() {
 }
 
 #[test]
+fn test_sleep_state_set_request_roundtrip() {
+    // The exact wire shape upstream's reolink_aio sends on cmd 622 (set
+    // privacy mode). The reply mirror only carries `sleep`; `operate` is
+    // optional on receive — that's exercised in
+    // `test_sleep_state_push_reply_deser` below.
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sleepState version="1.1">
+        <operate>2</operate>
+        <sleep>1</sleep>
+        </sleepState>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.sleep_state {
+        Some(SleepState {
+            operate: Some(2),
+            sleep: Some(1),
+            ..
+        }) => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+
+    let round = BcXml::try_parse(b.serialize(vec![]).unwrap().as_ref()).unwrap();
+    assert_eq!(round, b);
+}
+
+#[test]
+fn test_sleep_state_push_reply_deser() {
+    // Push / get reply shape: bare sleepState with just <sleep>.
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sleepState version="1.1">
+        <sleep>0</sleep>
+        </sleepState>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.sleep_state {
+        Some(SleepState {
+            sleep: Some(0),
+            operate: None,
+            ..
+        }) => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+}
+
+#[test]
+fn test_scene_cfg_get_request_roundtrip() {
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneCfg version="1.1">
+        <id>1</id>
+        </sceneCfg>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.scene_cfg {
+        Some(SceneCfg {
+            id: 1, name: None, ..
+        }) => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+    let round = BcXml::try_parse(b.serialize(vec![]).unwrap().as_ref()).unwrap();
+    assert_eq!(round, b);
+}
+
+#[test]
+fn test_scene_cfg_reply_with_name_deser() {
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneCfg version="1.1">
+        <id>2</id>
+        <name>Home</name>
+        </sceneCfg>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.scene_cfg {
+        Some(SceneCfg {
+            id: 2,
+            name: Some(n),
+            ..
+        }) if n == "Home" => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+}
+
+#[test]
+fn test_scene_mode_cfg_set_roundtrip() {
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneModeCfg version="1.1">
+        <enable>1</enable>
+        <curSceneId>1</curSceneId>
+        </sceneModeCfg>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.scene_mode_cfg {
+        Some(SceneModeCfg {
+            enable: 1,
+            cur_scene_id: Some(1),
+            ..
+        }) => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+    let round = BcXml::try_parse(b.serialize(vec![]).unwrap().as_ref()).unwrap();
+    assert_eq!(round, b);
+}
+
+#[test]
+fn test_scene_mode_cfg_disable_roundtrip() {
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneModeCfg version="1.1">
+        <enable>0</enable>
+        </sceneModeCfg>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.scene_mode_cfg {
+        Some(SceneModeCfg {
+            enable: 0,
+            cur_scene_id: None,
+            ..
+        }) => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+    let round = BcXml::try_parse(b.serialize(vec![]).unwrap().as_ref()).unwrap();
+    assert_eq!(round, b);
+}
+
+#[test]
+fn test_scene_list_bare_ids_deser() {
+    // The shape `reolink_aio` walks: `<sceneList><id>…</id><id>…</id></sceneList>`.
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneList version="1.1">
+        <id>0</id>
+        <id>1</id>
+        <id>2</id>
+        <id>3</id>
+        </sceneList>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let list = b.scene_list.as_ref().unwrap();
+    assert_eq!(list.all_ids(), vec![0u8, 1, 2, 3]);
+}
+
+#[test]
+fn test_scene_list_item_wrapper_deser() {
+    // The alternate shape some firmwares emit: `<item><id>…</id></item>`.
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneList version="1.1">
+        <item><id>1</id><name>Away</name></item>
+        <item><id>2</id><name>Home</name></item>
+        </sceneList>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let list = b.scene_list.as_ref().unwrap();
+    assert_eq!(list.all_ids(), vec![1u8, 2]);
+    assert_eq!(list.items[0].name.as_deref(), Some("Away"));
+}
+
+#[test]
 fn test_empty_floodlight_status_list() {
     let _ = env_logger::builder().is_test(true).try_init();
     let sample = indoc!(

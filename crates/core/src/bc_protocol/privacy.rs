@@ -43,10 +43,7 @@ impl BcCamera {
                             BcBody::ModernMsg(ModernMsg {
                                 payload:
                                     Some(BcPayloads::BcXml(BcXml {
-                                        sleep_state:
-                                            Some(SleepState {
-                                                sleep: Some(s), ..
-                                            }),
+                                        sleep_state: Some(SleepState { sleep: Some(s), .. }),
                                         ..
                                     })),
                                 ..
