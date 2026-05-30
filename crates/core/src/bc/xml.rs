@@ -1778,7 +1778,7 @@ pub struct AutoFocus {
 /// Returned by an explicit poll or pushed by the camera mid-move. Pan and
 /// tilt are reported in the camera's native angular units (typically
 /// hundredths of a degree).
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct PtzPos {
     /// XML Version
     #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
