@@ -1,12 +1,14 @@
 use std::sync::{Arc, Weak};
 use tokio::{
     sync::watch::{Receiver as WatchReceiver, Sender as WatchSender},
-    time::{interval, sleep, timeout, Duration, Instant},
+    time::{sleep, timeout, Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{config::CameraConfig, utils::connect_and_login, AnyResult};
-use neolink_core::bc_protocol::BcCamera;
+use neolink_core::bc_protocol::{
+    BcCamera, DEFAULT_KEEPALIVE_IDLE_SECS, DEFAULT_KEEPALIVE_SUBSCRIBED_SECS,
+};
 
 #[derive(Eq, PartialEq, Copy, Clone)]
 pub(crate) enum NeoCamThreadState {
@@ -60,15 +62,47 @@ impl NeoCamThread {
                 Ok(())
             },
             v = async {
-                let mut interval = interval(Duration::from_secs(5));
+                // Adaptive ping cadence. The actual interval comes from
+                // the per-camera `AdaptiveKeepalive` policy:
+                //
+                // * 30s while subscribed to the push channel.
+                // * 60s while idle.
+                // * Ratchets down to `max(9, T-2)` after a silent
+                //   disconnect, recovers by `1s` per hour of stability.
+                //
+                // We re-read the policy every tick so changes flow
+                // through within one ping interval at worst.
                 let mut missed_pings = 0;
+                let last_disconnect_start = Instant::now();
+                let mut last_successful = Instant::now();
                 loop {
-                    interval.tick().await;
+                    let interval_dur = camera
+                        .keepalive_policy()
+                        .lock()
+                        .ok()
+                        .map(|p| p.next_interval())
+                        .unwrap_or_else(|| Duration::from_secs(DEFAULT_KEEPALIVE_IDLE_SECS));
+                    let interval_dur = interval_dur.max(Duration::from_secs(1));
+                    log::trace!("Next ping in {:?}", interval_dur);
+                    sleep(interval_dur).await;
                     log::trace!("Sending ping");
-                    match timeout(Duration::from_secs(5), camera.get_linktype()).await {
+                    // Per-ping timeout is bounded by the keepalive cadence
+                    // itself (no point waiting longer than we'd wait until
+                    // the next ping). Floor at the subscribed cadence so
+                    // that aggressive adaptation doesn't starve us.
+                    let ping_timeout = interval_dur.max(Duration::from_secs(
+                        DEFAULT_KEEPALIVE_SUBSCRIBED_SECS,
+                    ));
+                    match timeout(ping_timeout, camera.get_linktype()).await {
                         Ok(Ok(_)) => {
                             log::trace!("Ping reply");
                             missed_pings = 0;
+                            // Tell the policy we are still alive.
+                            let stable_secs = last_successful.elapsed().as_secs();
+                            last_successful = Instant::now();
+                            if let Ok(mut policy) = camera.keepalive_policy().lock() {
+                                policy.notice_stable_period(stable_secs);
+                            }
                             continue
                         },
                         Ok(Err(neolink_core::Error::UnintelligibleReply { reply, why })) => {
@@ -77,6 +111,12 @@ impl NeoCamThread {
                             futures::future::pending().await
                         },
                         Ok(Err(e)) => {
+                            // Note disconnect *before* bubbling so the policy
+                            // ratchets down for the reconnect attempt.
+                            let silence_secs = last_disconnect_start.elapsed().as_secs();
+                            if let Ok(mut policy) = camera.keepalive_policy().lock() {
+                                policy.notice_disconnect(silence_secs);
+                            }
                             break Err(e.into());
                         },
                         Err(_) => {
@@ -85,6 +125,10 @@ impl NeoCamThread {
                                 missed_pings += 1;
                                 continue;
                             } else {
+                                let silence_secs = last_disconnect_start.elapsed().as_secs();
+                                if let Ok(mut policy) = camera.keepalive_policy().lock() {
+                                    policy.notice_disconnect(silence_secs);
+                                }
                                 log::error!("Timed out waiting for camera ping reply");
                                 break Err(anyhow::anyhow!("Timed out waiting for camera ping reply"));
                             }
