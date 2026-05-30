@@ -31,6 +31,7 @@ pub enum Command {
     #[cfg(feature = "gstreamer")]
     Image(super::image::Opt),
     Battery(super::battery::Opt),
+    Playback(super::playback::Opt),
     Services(super::services::Opt),
     Users(super::users::Opt),
     Onvif(super::onvif::Opt),
