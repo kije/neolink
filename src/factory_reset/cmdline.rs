@@ -31,3 +31,36 @@ pub struct Opt {
     #[arg(long)]
     pub keep_network: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    struct Wrap {
+        #[command(flatten)]
+        opt: Opt,
+    }
+
+    #[test]
+    fn requires_camera() {
+        assert!(Wrap::try_parse_from(["test"]).is_err());
+    }
+
+    #[test]
+    fn yes_and_keep_network_default_off() {
+        let parsed = Wrap::try_parse_from(["test", "cam"]).unwrap();
+        assert!(!parsed.opt.yes_i_am_sure);
+        assert!(!parsed.opt.keep_network);
+        assert_eq!(parsed.opt.camera, "cam");
+    }
+
+    #[test]
+    fn flags_parse() {
+        let parsed =
+            Wrap::try_parse_from(["test", "cam", "--yes-i-am-sure", "--keep-network"]).unwrap();
+        assert!(parsed.opt.yes_i_am_sure);
+        assert!(parsed.opt.keep_network);
+    }
+}

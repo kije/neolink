@@ -48,7 +48,9 @@ pub(crate) use connection::*;
 pub use credentials::*;
 pub use errors::Error;
 pub use ledstate::LightState;
-pub use lifecycle::{FirmwarePreflight, UPGRADE_CHUNK_SIZE};
+pub use lifecycle::{
+    compute_firmware_preflight, FirmwarePreflight, MAX_FIRMWARE_BYTES, UPGRADE_CHUNK_SIZE,
+};
 pub use login::MaxEncryption;
 pub use motion::{MotionData, MotionStatus};
 pub use pirstate::PirState;

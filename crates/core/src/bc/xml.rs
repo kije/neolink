@@ -2038,6 +2038,95 @@ fn test_enc3_extension() {
 }
 
 #[test]
+fn test_upgrade_req_roundtrip_placeholder() {
+    // NOTE: this verifies our placeholder UpgradeReq struct round-trips
+    // through quick-xml; it does NOT claim this is the real wire format.
+    // See docs/baichuan-lifecycle.md.
+    let req = UpgradeReq {
+        version: "1.1".to_string(),
+        channel_id: Some(0),
+        file_size: Some(1234567),
+        sha256: Some("deadbeef".to_string()),
+        file_name: Some("camera.pak".to_string()),
+    };
+    let xml = BcXml {
+        upgrade_req: Some(req),
+        ..Default::default()
+    };
+    let buf = xml.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(buf.as_slice()).unwrap();
+    let p = parsed.upgrade_req.as_ref().expect("UpgradeReq round-trips");
+    assert_eq!(p.version, "1.1");
+    assert_eq!(p.channel_id, Some(0));
+    assert_eq!(p.file_size, Some(1234567));
+    assert_eq!(p.sha256.as_deref(), Some("deadbeef"));
+    assert_eq!(p.file_name.as_deref(), Some("camera.pak"));
+}
+
+#[test]
+fn test_upgrade_req_optional_fields_are_skipped() {
+    // None fields must not appear in the serialized XML so a future
+    // capture-driven schema change can drop them without breaking the
+    // wire format.
+    let req = UpgradeReq {
+        version: "1.1".to_string(),
+        channel_id: None,
+        file_size: Some(42),
+        sha256: None,
+        file_name: None,
+    };
+    let xml = BcXml {
+        upgrade_req: Some(req),
+        ..Default::default()
+    };
+    let buf = xml.serialize(vec![]).unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    assert!(s.contains("<ConfigFileInfo"));
+    assert!(s.contains("<fileSize>42</fileSize>"));
+    assert!(!s.contains("<channelId"));
+    assert!(!s.contains("<sha256"));
+    assert!(!s.contains("<fileName"));
+}
+
+#[test]
+fn test_factory_reset_roundtrip_placeholder() {
+    // NOTE: placeholder, see docs/baichuan-lifecycle.md.
+    let fr = FactoryReset {
+        version: "1.1".to_string(),
+        keep_network: Some(1),
+    };
+    let xml = BcXml {
+        factory_reset: Some(fr),
+        ..Default::default()
+    };
+    let buf = xml.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(buf.as_slice()).unwrap();
+    let p = parsed
+        .factory_reset
+        .as_ref()
+        .expect("FactoryReset round-trips");
+    assert_eq!(p.version, "1.1");
+    assert_eq!(p.keep_network, Some(1));
+}
+
+#[test]
+fn test_factory_reset_default_omits_keep_network() {
+    // When keep_network is None the field must not appear in the XML.
+    let fr = FactoryReset {
+        version: "1.1".to_string(),
+        keep_network: None,
+    };
+    let xml = BcXml {
+        factory_reset: Some(fr),
+        ..Default::default()
+    };
+    let buf = xml.serialize(vec![]).unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    assert!(s.contains("<Restore"));
+    assert!(!s.contains("keepNetwork"));
+}
+
+#[test]
 fn test_empty_floodlight_status_list() {
     let _ = env_logger::builder().is_test(true).try_init();
     let sample = indoc!(

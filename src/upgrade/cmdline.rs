@@ -36,3 +36,41 @@ pub struct Opt {
     #[arg(long)]
     pub dry_run: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Wrapper so clap accepts the bare subcommand args in tests.
+    #[derive(Parser, Debug)]
+    struct Wrap {
+        #[command(flatten)]
+        opt: Opt,
+    }
+
+    #[test]
+    fn requires_camera_and_firmware_path() {
+        // Missing positional args must fail to parse.
+        assert!(Wrap::try_parse_from(["test"]).is_err());
+        assert!(Wrap::try_parse_from(["test", "cam"]).is_err());
+    }
+
+    #[test]
+    fn yes_i_am_sure_defaults_off() {
+        let parsed = Wrap::try_parse_from(["test", "cam", "fw.pak"]).unwrap();
+        assert!(!parsed.opt.yes_i_am_sure);
+        assert!(!parsed.opt.dry_run);
+        assert_eq!(parsed.opt.camera, "cam");
+        assert_eq!(parsed.opt.firmware.to_string_lossy(), "fw.pak");
+    }
+
+    #[test]
+    fn yes_flag_and_dry_run_parse() {
+        let parsed =
+            Wrap::try_parse_from(["test", "cam", "fw.pak", "--yes-i-am-sure", "--dry-run"])
+                .unwrap();
+        assert!(parsed.opt.yes_i_am_sure);
+        assert!(parsed.opt.dry_run);
+    }
+}

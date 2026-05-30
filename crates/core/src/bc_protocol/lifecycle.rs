@@ -29,6 +29,51 @@ use std::path::Path;
 /// reasonable per-frame cap.
 pub const UPGRADE_CHUNK_SIZE: usize = 8 * 1024;
 
+/// Sanity cap on firmware-file size. Real Reolink `.pak` files are typically
+/// single-digit MiB; anything an order of magnitude larger than this is
+/// overwhelmingly likely to be a mistake (wrong file, corrupted download,
+/// etc.) and so the pre-flight refuses it.
+pub const MAX_FIRMWARE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Compute the pre-flight metadata for a firmware file without talking to
+/// a camera.
+///
+/// Exposed as a free function so the file-handling can be unit-tested
+/// independently of a real camera connection.
+pub async fn compute_firmware_preflight(path: &Path) -> Result<FirmwarePreflight> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+        error!("upgrade_firmware: cannot stat {}: {}", path.display(), e);
+        Error::from(e)
+    })?;
+    if !metadata.is_file() {
+        return Err(Error::Other("firmware path is not a regular file"));
+    }
+    let size = metadata.len();
+    if size == 0 {
+        return Err(Error::Other("firmware file is empty"));
+    }
+    if size > MAX_FIRMWARE_BYTES {
+        return Err(Error::OtherString(format!(
+            "firmware file is suspiciously large ({} bytes); refusing as a safety check",
+            size
+        )));
+    }
+
+    let bytes = tokio::fs::read(path).await.map_err(Error::from)?;
+    let digest = md5::compute(&bytes);
+    let md5_hex = format!("{:x}", digest);
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+
+    Ok(FirmwarePreflight {
+        size,
+        md5_hex,
+        file_name,
+    })
+}
+
 /// Pre-flight metadata gathered before attempting a firmware upgrade.
 ///
 /// Returned by [`BcCamera::upgrade_firmware`] (via the error path while
@@ -112,42 +157,7 @@ impl BcCamera {
             );
         }
 
-        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
-            error!("upgrade_firmware: cannot stat {:?}: {}", path, e);
-            Error::from(e)
-        })?;
-        if !metadata.is_file() {
-            return Err(Error::Other("firmware path is not a regular file"));
-        }
-        let size = metadata.len();
-        if size == 0 {
-            return Err(Error::Other("firmware file is empty"));
-        }
-        // Sanity cap at 256 MiB. Real Reolink .pak files are typically
-        // single-digit MiB; anything an order of magnitude larger is
-        // overwhelmingly likely to be a mistake.
-        const MAX_FIRMWARE_BYTES: u64 = 256 * 1024 * 1024;
-        if size > MAX_FIRMWARE_BYTES {
-            return Err(Error::OtherString(format!(
-                "firmware file is suspiciously large ({} bytes); \
-                 refusing as a safety check",
-                size
-            )));
-        }
-
-        let bytes = tokio::fs::read(path).await.map_err(Error::from)?;
-        let digest = md5::compute(&bytes);
-        let md5_hex = format!("{:x}", digest);
-        let file_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string());
-
-        Ok(FirmwarePreflight {
-            size,
-            md5_hex,
-            file_name,
-        })
+        compute_firmware_preflight(path).await
     }
 
     /// Factory-reset the camera.
@@ -190,6 +200,7 @@ impl BcCamera {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// `FirmwarePreflight` is `Debug + Clone` so it can be threaded through
     /// log macros and test fixtures. Compile-time check via construction.
@@ -212,7 +223,75 @@ mod tests {
         // with comfortable headroom. The Baichuan TCP framing puts no hard
         // upper bound but practical reolink captures show frames well under
         // 64 KiB.
-        assert!(UPGRADE_CHUNK_SIZE > 0);
-        assert!(UPGRADE_CHUNK_SIZE <= 64 * 1024);
+        const _: () = assert!(UPGRADE_CHUNK_SIZE > 0);
+        const _: () = assert!(UPGRADE_CHUNK_SIZE <= 64 * 1024);
+    }
+
+    #[test]
+    fn max_firmware_bytes_is_generous_but_finite() {
+        // Real firmware images are a few MiB; the cap should be well
+        // above that but still finite enough to catch obvious mistakes
+        // like passing in a video file.
+        const _: () = assert!(MAX_FIRMWARE_BYTES >= 32 * 1024 * 1024);
+        const _: () = assert!(MAX_FIRMWARE_BYTES <= 1024 * 1024 * 1024);
+    }
+
+    fn write_tempfile(name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "neolink-lifecycle-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let mut f = std::fs::File::create(&path).expect("create tempfile");
+        f.write_all(contents).expect("write tempfile");
+        path
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_missing_file() {
+        let path = std::path::PathBuf::from("/nonexistent/path/firmware.pak");
+        let err = compute_firmware_preflight(&path).await.unwrap_err();
+        // Any IO error (NotFound) is acceptable here.
+        let msg = format!("{}", err);
+        assert!(
+            msg.to_lowercase().contains("io")
+                || msg.to_lowercase().contains("not found")
+                || msg.to_lowercase().contains("no such file"),
+            "expected IO-flavoured error, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_empty_file() {
+        let path = write_tempfile("empty.pak", b"");
+        let err = compute_firmware_preflight(&path).await.unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        match err {
+            Error::Other(s) => assert!(s.contains("empty"), "got: {}", s),
+            other => panic!("expected Other(empty), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_accepts_small_file_and_computes_hash() {
+        let path = write_tempfile("ok.pak", b"hello world");
+        let p = compute_firmware_preflight(&path).await.unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(p.size, 11);
+        // MD5("hello world") = 5eb63bbbe01eeed093cb22bb8f5acdc3
+        assert_eq!(p.md5_hex, "5eb63bbbe01eeed093cb22bb8f5acdc3");
+        assert!(p.file_name.unwrap().ends_with("ok.pak"));
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_directory() {
+        let dir = std::env::temp_dir();
+        let err = compute_firmware_preflight(&dir).await.unwrap_err();
+        match err {
+            Error::Other(s) => assert!(s.contains("regular file"), "got: {}", s),
+            other => panic!("expected Other(regular file), got {:?}", other),
+        }
     }
 }
