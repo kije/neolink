@@ -40,6 +40,24 @@ pub const MSG_ID_GET_SERVICE_PORTS: u32 = 37;
 pub const MSG_ID_GET_EMAIL: u32 = 42;
 /// Set email settings
 pub const MSG_ID_SET_EMAIL: u32 = 43;
+/// Get OSD (datetime + channel name overlay)
+pub const MSG_ID_GET_OSD: u32 = 44;
+/// Set OSD (datetime + channel name overlay)
+pub const MSG_ID_SET_OSD: u32 = 45;
+/// Get privacy mask regions
+pub const MSG_ID_GET_PRIVACY_MASK: u32 = 52;
+/// Set privacy mask regions
+pub const MSG_ID_SET_PRIVACY_MASK: u32 = 53;
+/// Get encoder configuration (codec/resolution/bitrate/framerate/GOP)
+pub const MSG_ID_GET_ENCODER: u32 = 56;
+/// Set encoder configuration (codec/resolution/bitrate/framerate/GOP)
+pub const MSG_ID_SET_ENCODER: u32 = 57;
+/// Set video input / ISP image controls (brightness/contrast/saturation/sharpness/hue)
+pub const MSG_ID_SET_VIDEO_INPUT: u32 = 25;
+/// Get video input / ISP image controls
+pub const MSG_ID_GET_VIDEO_INPUT: u32 = 26;
+/// Get ISP advanced settings (white balance, anti-flicker, day/night mode, ...)
+pub const MSG_ID_GET_ISP: u32 = 78;
 /// Get users and general system info
 pub const MSG_ID_GET_ABILITY_SUPPORT: u32 = 58;
 /// Update, create and remove users
@@ -102,6 +120,10 @@ pub const MSG_ID_FLOODLIGHT_STATUS_LIST: u32 = 291;
 pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
 /// Used for camera Zoom write
 pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
+/// Get day/night IR-cut threshold
+pub const MSG_ID_GET_DAY_NIGHT_THRESHOLD: u32 = 296;
+/// Set day/night IR-cut threshold
+pub const MSG_ID_SET_DAY_NIGHT_THRESHOLD: u32 = 297;
 /// Get the floodlight task xml
 pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
 

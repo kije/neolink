@@ -141,6 +141,30 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// Encoder configuration (codec/resolution/bitrate/framerate/GOP)
+    #[serde(rename = "Enc", skip_serializing_if = "Option::is_none")]
+    pub enc: Option<Enc>,
+    /// Video input / ISP image controls
+    #[serde(rename = "VideoInput", skip_serializing_if = "Option::is_none")]
+    pub video_input: Option<VideoInput>,
+    /// ISP advanced settings
+    #[serde(rename = "InputAdvanceCfg", skip_serializing_if = "Option::is_none")]
+    pub input_advance_cfg: Option<InputAdvanceCfg>,
+    /// ISP block (read-only newer-style ISP info)
+    #[serde(rename = "Isp", skip_serializing_if = "Option::is_none")]
+    pub isp: Option<Isp>,
+    /// OSD datetime overlay
+    #[serde(rename = "OsdDatetime", skip_serializing_if = "Option::is_none")]
+    pub osd_datetime: Option<OsdDatetime>,
+    /// OSD channel-name overlay
+    #[serde(rename = "OsdChannelName", skip_serializing_if = "Option::is_none")]
+    pub osd_channel_name: Option<OsdChannelName>,
+    /// Privacy mask regions
+    #[serde(rename = "Shelter", skip_serializing_if = "Option::is_none")]
+    pub shelter: Option<Shelter>,
+    /// Day/Night switch threshold
+    #[serde(rename = "DayNightSwitch", skip_serializing_if = "Option::is_none")]
+    pub day_night_switch: Option<DayNightSwitch>,
 }
 
 impl BcXml {
@@ -1620,6 +1644,297 @@ pub struct User {
     pub user_set_state: String,
 }
 
+/// Encoder configuration XML
+///
+/// Top-level `Enc` block holds per-stream encoder settings.
+///
+/// IMPORTANT: Reolink rejects re-serialized XML that drops or reorders fields.
+/// Use the read-modify-write helpers in `BcCamera` (`get_enc`/`set_enc`) which
+/// mutate the parsed [`Enc`] in place rather than constructing a fresh
+/// instance. Every field is `Option<_>` so unknown/optional fields received
+/// from the camera survive a round-trip through deserialize -> serialize.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct Enc {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The channel id, usually 0
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Main stream settings
+    #[serde(rename = "mainStream", skip_serializing_if = "Option::is_none")]
+    pub main_stream: Option<EncStream>,
+    /// Sub stream settings
+    #[serde(rename = "subStream", skip_serializing_if = "Option::is_none")]
+    pub sub_stream: Option<EncStream>,
+    /// Third (extension) stream settings, only present on some cameras
+    #[serde(rename = "thirdStream", skip_serializing_if = "Option::is_none")]
+    pub third_stream: Option<EncStream>,
+}
+
+/// A per-stream encoder block (mainStream / subStream / thirdStream).
+///
+/// All fields are optional so that we can round-trip XML the camera sends
+/// without losing unknown fields. Setters mutate only the field they care
+/// about.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct EncStream {
+    /// Video encoder type: e.g. `h264`, `h265` (some firmwares use 0/1 ints
+    /// instead -- we keep this as a String so both fit).
+    #[serde(rename = "videoEncType", skip_serializing_if = "Option::is_none")]
+    pub video_enc_type: Option<String>,
+    /// Whether audio is also encoded on this stream
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<u32>,
+    /// Stream width in pixels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Stream height in pixels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Bitrate (kbps)
+    #[serde(rename = "bitRate", skip_serializing_if = "Option::is_none")]
+    pub bit_rate: Option<u32>,
+    /// Frame rate (fps)
+    #[serde(rename = "frameRate", skip_serializing_if = "Option::is_none")]
+    pub frame_rate: Option<u32>,
+    /// Encoder rate-control type, observed values `cbr`, `vbr`
+    #[serde(rename = "encoderType", skip_serializing_if = "Option::is_none")]
+    pub encoder_type: Option<String>,
+    /// Encoder profile, observed values `baseline`, `main`, `high`
+    #[serde(rename = "encoderProfile", skip_serializing_if = "Option::is_none")]
+    pub encoder_profile: Option<String>,
+    /// GOP block. Holds at least the current GOP length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gop: Option<EncGop>,
+}
+
+/// GOP inner XML used inside [`EncStream`].
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct EncGop {
+    /// Current GOP length (in frames)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cur: Option<u32>,
+    /// Min GOP length
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<u32>,
+    /// Max GOP length
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<u32>,
+}
+
+/// VideoInput XML -- holds the basic ISP image controls (brightness,
+/// contrast, saturation, sharpness, hue) for a channel.
+///
+/// All fields are `Option<_>` so that re-serialization preserves whatever the
+/// camera sent us. Read-modify-write only mutates the requested field.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct VideoInput {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id, usually 0
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Brightness, 0..=255 on most cameras
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bright: Option<u32>,
+    /// Contrast, 0..=255 on most cameras
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contrast: Option<u32>,
+    /// Saturation, 0..=255 on most cameras
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saturation: Option<u32>,
+    /// Hue, 0..=255 on most cameras
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hue: Option<u32>,
+    /// Sharpness, 0..=255 on most cameras
+    #[serde(rename = "sharpen", skip_serializing_if = "Option::is_none")]
+    pub sharpen: Option<u32>,
+}
+
+/// InputAdvanceCfg XML -- advanced ISP controls (white-balance, anti-flicker,
+/// scene mode, exposure, mirror/flip, ...).
+///
+/// We only model fields that are common enough to be useful from the CLI;
+/// everything else is captured by deserializing into `Option` so RMW round
+/// trips correctly even when we don't have a typed mutator for the field.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct InputAdvanceCfg {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id, usually 0
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Scene mode, observed values `outdoor`, `indoor`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene: Option<String>,
+    /// Exposure mode, observed values `auto`, `manual`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<String>,
+    /// White balance mode, observed values `auto`, `manual`, ...
+    #[serde(rename = "whiteBalance", skip_serializing_if = "Option::is_none")]
+    pub white_balance: Option<String>,
+    /// Day/Night ISP mode, observed values `auto`, `day`, `night`,
+    /// `blackAndWhite`
+    #[serde(rename = "dayNight", skip_serializing_if = "Option::is_none")]
+    pub day_night: Option<String>,
+    /// Anti-flicker mode, observed values `off`, `50hz`, `60hz`
+    #[serde(rename = "antiFlicker", skip_serializing_if = "Option::is_none")]
+    pub anti_flicker: Option<String>,
+    /// Backlight compensation mode
+    #[serde(rename = "backLight", skip_serializing_if = "Option::is_none")]
+    pub back_light: Option<String>,
+    /// 3D noise reduction level (0..=100)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nr3d: Option<u32>,
+    /// Horizontal mirror flag
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<u32>,
+    /// Vertical flip flag
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flip: Option<u32>,
+    /// Rotation flag
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<u32>,
+}
+
+/// Isp XML -- newer-style ISP info container (mostly read-only).
+///
+/// Fields are optional and we don't enforce any schema beyond a passthrough
+/// for now -- the read-modify-write contract is more important than precise
+/// field coverage here.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct Isp {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id, usually 0
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Embedded VideoInput, when the camera bundles them together
+    #[serde(rename = "VideoInput", skip_serializing_if = "Option::is_none")]
+    pub video_input: Option<VideoInput>,
+    /// Embedded InputAdvanceCfg, when the camera bundles them together
+    #[serde(rename = "InputAdvanceCfg", skip_serializing_if = "Option::is_none")]
+    pub input_advance_cfg: Option<InputAdvanceCfg>,
+}
+
+/// OsdDatetime XML -- controls the on-screen-display date/time overlay.
+///
+/// All fields optional so the structure round-trips lossless-ly.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct OsdDatetime {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id, usually 0
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Whether the datetime overlay is enabled (0 / 1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable: Option<u32>,
+    /// Position, observed values: `upperLeft`, `upperRight`, `lowerLeft`,
+    /// `lowerRight`, `topCenter`, `bottomCenter`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+}
+
+/// OsdChannelName XML -- controls the on-screen channel-name overlay.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct OsdChannelName {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id, usually 0
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Whether the channel-name overlay is enabled (0 / 1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable: Option<u32>,
+    /// The channel name to render
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Position, observed values: `upperLeft`, `upperRight`, `lowerLeft`,
+    /// `lowerRight`, `topCenter`, `bottomCenter`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+}
+
+/// Shelter (privacy mask) XML.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct Shelter {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id, usually 0
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Whether the privacy mask is enabled
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable: Option<u32>,
+    /// The list of blocked regions
+    #[serde(rename = "blockList", skip_serializing_if = "Option::is_none")]
+    pub block_list: Option<ShelterBlockList>,
+}
+
+/// A block list inside a [`Shelter`] XML.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct ShelterBlockList {
+    /// Individual blocks
+    #[serde(default, rename = "block")]
+    pub block: Vec<ShelterBlock>,
+}
+
+/// A single privacy-mask block. The camera describes blocks either as a
+/// rectangle (x/y/w/h) or as a bitmap, depending on firmware. We keep both
+/// shapes available as optional fields.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct ShelterBlock {
+    /// Block id when present
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u32>,
+    /// X offset of the rectangle (in image pixels or a normalized grid)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x: Option<u32>,
+    /// Y offset of the rectangle
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y: Option<u32>,
+    /// Width of the rectangle
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Height of the rectangle
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Bitmap representation used by some firmwares -- a string of 0/1
+    /// characters describing the masked-out cells of the privacy grid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitmap: Option<String>,
+}
+
+/// DayNightSwitch XML -- IR-cut threshold and mode.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DayNightSwitch {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id, usually 0
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Switch mode, observed values: `auto`, `day`, `night`,
+    /// `blackAndWhite`, `colorIRCut`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Color mode override, observed values: `day`, `night`
+    #[serde(rename = "colorMode", skip_serializing_if = "Option::is_none")]
+    pub color_mode: Option<String>,
+    /// Threshold value when the camera is in `auto` mode (0..=100 on most
+    /// cameras).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u32>,
+}
+
 /// Convience function to return the xml version used throughout the library
 pub fn xml_ver() -> String {
     "1.1".to_string()
@@ -1944,6 +2259,221 @@ fn test_enc3_extension() {
         } => {}
         _ => panic!(),
     }
+}
+
+#[test]
+fn test_enc_round_trip_preserves_fields() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    // A representative encoder XML containing fields we do model AND a couple
+    // we deliberately don't model -- the round-trip test should at least
+    // preserve the modelled ones bit-for-bit.
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <Enc version="1.1">
+        <channelId>0</channelId>
+        <mainStream>
+        <videoEncType>h264</videoEncType>
+        <audio>1</audio>
+        <width>2560</width>
+        <height>1440</height>
+        <bitRate>4096</bitRate>
+        <frameRate>20</frameRate>
+        <encoderType>vbr</encoderType>
+        <encoderProfile>high</encoderProfile>
+        <gop>
+        <cur>4</cur>
+        </gop>
+        </mainStream>
+        <subStream>
+        <videoEncType>h264</videoEncType>
+        <audio>1</audio>
+        <width>640</width>
+        <height>360</height>
+        <bitRate>160</bitRate>
+        <frameRate>7</frameRate>
+        <encoderType>vbr</encoderType>
+        <encoderProfile>high</encoderProfile>
+        </subStream>
+        </Enc>
+        </body>
+        "#
+    );
+    let parsed = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let serialized = parsed.serialize(vec![]).unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(parsed, reparsed, "Enc XML round-trip should be lossless");
+    let enc = parsed.enc.as_ref().expect("Enc present");
+    let main = enc.main_stream.as_ref().expect("mainStream present");
+    assert_eq!(main.width, Some(2560));
+    assert_eq!(main.height, Some(1440));
+    assert_eq!(main.bit_rate, Some(4096));
+    assert_eq!(main.frame_rate, Some(20));
+    assert_eq!(main.encoder_type.as_deref(), Some("vbr"));
+    assert_eq!(main.gop.as_ref().and_then(|g| g.cur), Some(4));
+}
+
+#[test]
+fn test_video_input_round_trip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <VideoInput version="1.1">
+        <channelId>0</channelId>
+        <bright>128</bright>
+        <contrast>128</contrast>
+        <saturation>128</saturation>
+        <hue>128</hue>
+        <sharpen>128</sharpen>
+        </VideoInput>
+        </body>
+        "#
+    );
+    let parsed = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let serialized = parsed.serialize(vec![]).unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(
+        parsed, reparsed,
+        "VideoInput XML round-trip should be lossless"
+    );
+    let vi = parsed.video_input.as_ref().expect("VideoInput present");
+    assert_eq!(vi.bright, Some(128));
+    assert_eq!(vi.sharpen, Some(128));
+}
+
+#[test]
+fn test_osd_round_trip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <OsdDatetime version="1.1">
+        <channelId>0</channelId>
+        <enable>1</enable>
+        <position>upperLeft</position>
+        </OsdDatetime>
+        <OsdChannelName version="1.1">
+        <channelId>0</channelId>
+        <enable>1</enable>
+        <name>Front Door</name>
+        <position>lowerRight</position>
+        </OsdChannelName>
+        </body>
+        "#
+    );
+    let parsed = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let serialized = parsed.serialize(vec![]).unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(parsed, reparsed, "OSD XML round-trip should be lossless");
+    assert_eq!(
+        parsed
+            .osd_channel_name
+            .as_ref()
+            .and_then(|c| c.name.as_deref()),
+        Some("Front Door")
+    );
+}
+
+#[test]
+fn test_shelter_round_trip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <Shelter version="1.1">
+        <channelId>0</channelId>
+        <enable>1</enable>
+        <blockList>
+        <block>
+        <id>0</id>
+        <bitmap>00100100</bitmap>
+        </block>
+        </blockList>
+        </Shelter>
+        </body>
+        "#
+    );
+    let parsed = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let serialized = parsed.serialize(vec![]).unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(parsed, reparsed, "Shelter XML round-trip should be lossless");
+}
+
+#[test]
+fn test_day_night_round_trip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <DayNightSwitch version="1.1">
+        <channelId>0</channelId>
+        <mode>auto</mode>
+        <colorMode>day</colorMode>
+        <threshold>50</threshold>
+        </DayNightSwitch>
+        </body>
+        "#
+    );
+    let parsed = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let serialized = parsed.serialize(vec![]).unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    assert_eq!(
+        parsed, reparsed,
+        "DayNightSwitch XML round-trip should be lossless"
+    );
+    let dns = parsed
+        .day_night_switch
+        .as_ref()
+        .expect("DayNightSwitch present");
+    assert_eq!(dns.mode.as_deref(), Some("auto"));
+    assert_eq!(dns.threshold, Some(50));
+}
+
+#[test]
+fn test_enc_rmw_preserves_unmodified_fields() {
+    // The critical RMW invariant: parsing a real-world Enc XML, mutating just
+    // the bitrate, and re-serializing must yield XML that re-parses into the
+    // same struct with only the bitrate changed.
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <Enc version="1.1">
+        <channelId>0</channelId>
+        <mainStream>
+        <videoEncType>h264</videoEncType>
+        <audio>1</audio>
+        <width>2560</width>
+        <height>1440</height>
+        <bitRate>4096</bitRate>
+        <frameRate>20</frameRate>
+        <encoderType>vbr</encoderType>
+        <encoderProfile>high</encoderProfile>
+        <gop><cur>4</cur></gop>
+        </mainStream>
+        </Enc>
+        </body>
+        "#
+    );
+    let mut parsed = BcXml::try_parse(sample.as_bytes()).unwrap();
+    if let Some(enc) = parsed.enc.as_mut() {
+        if let Some(main) = enc.main_stream.as_mut() {
+            main.bit_rate = Some(8192);
+        }
+    }
+    let serialized = parsed.serialize(vec![]).unwrap();
+    let reparsed = BcXml::try_parse(serialized.as_slice()).unwrap();
+    let reenc = reparsed.enc.as_ref().expect("Enc present");
+    let remain = reenc.main_stream.as_ref().expect("mainStream present");
+    // Mutated field reflects the change ...
+    assert_eq!(remain.bit_rate, Some(8192));
+    // ... and everything else is identical to the pre-mutation parse.
+    assert_eq!(remain.width, Some(2560));
+    assert_eq!(remain.height, Some(1440));
+    assert_eq!(remain.frame_rate, Some(20));
+    assert_eq!(remain.encoder_type.as_deref(), Some("vbr"));
+    assert_eq!(remain.encoder_profile.as_deref(), Some("high"));
+    assert_eq!(remain.gop.as_ref().and_then(|g| g.cur), Some(4));
 }
 
 #[test]
