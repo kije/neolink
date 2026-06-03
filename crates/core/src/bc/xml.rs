@@ -141,6 +141,27 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// PTZ patrol / cruise list (get or set the list of configured patrols)
+    #[serde(rename = "PatrolList", skip_serializing_if = "Option::is_none")]
+    pub patrol_list: Option<PatrolList>,
+    /// PTZ guard / return-to-home configuration
+    #[serde(rename = "PtzGuard", skip_serializing_if = "Option::is_none")]
+    pub ptz_guard: Option<PtzGuard>,
+    /// PTZ 3D click-to-zoom request
+    #[serde(rename = "Ptz3DLocation", skip_serializing_if = "Option::is_none")]
+    pub ptz_3d_location: Option<Ptz3DLocation>,
+    /// Auto-focus get/set
+    #[serde(rename = "AutoFocus", skip_serializing_if = "Option::is_none")]
+    pub auto_focus: Option<AutoFocus>,
+    /// PTZ pan/tilt position
+    #[serde(rename = "PtzPos", skip_serializing_if = "Option::is_none")]
+    pub ptz_pos: Option<PtzPos>,
+    /// PTZ moving-status push payload
+    #[serde(rename = "PtzRunning", skip_serializing_if = "Option::is_none")]
+    pub ptz_running: Option<PtzRunning>,
+    /// Pre-record (battery-camera pre-roll) configuration
+    #[serde(rename = "LongRunModeCfg", skip_serializing_if = "Option::is_none")]
+    pub long_run_mode_cfg: Option<LongRunModeCfg>,
 }
 
 impl BcXml {
@@ -1620,6 +1641,218 @@ pub struct User {
     pub user_set_state: String,
 }
 
+/// PTZ patrol / cruise list
+///
+/// Returned from cmd 64 (`MSG_ID_PTZ_PATROL`). When sent with one of the
+/// patrol entries' `command` populated (`"start"`, `"stop"`) it is also used
+/// to drive the camera to begin or end a cruise tour.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct PatrolList {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id. Usually `0` unless from an NVR.
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// The patrols configured on the camera
+    #[serde(default, rename = "patrol")]
+    pub patrol: Vec<Patrol>,
+}
+
+/// A single PTZ patrol entry
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct Patrol {
+    /// Patrol id (the camera assigns this; range is hardware-dependent)
+    pub id: u32,
+    /// Optional human-readable name (`"tour1"`, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Command driving this entry. Only set on outgoing requests.
+    ///
+    /// Known values: `"start"`, `"stop"`. The camera's reply when listing
+    /// patrols omits this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The presets visited as part of this patrol (with per-step durations).
+    /// Omitted when issuing a start/stop command.
+    #[serde(rename = "presetList", skip_serializing_if = "Option::is_none")]
+    pub preset_list: Option<PatrolPresetList>,
+}
+
+/// List of preset stops within a patrol
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct PatrolPresetList {
+    /// The individual preset stops
+    #[serde(default, rename = "preset")]
+    pub preset: Vec<PresetItem>,
+}
+
+/// A single preset stop within a patrol
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct PresetItem {
+    /// Preset id to move to
+    pub id: u32,
+    /// How long (seconds) to dwell on this preset before moving on
+    #[serde(rename = "dwellTime")]
+    pub dwell_time: u32,
+}
+
+/// PTZ guard (return-to-home) configuration
+///
+/// Sent and received on cmd 73/74.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct PtzGuard {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id. Usually `0` unless from an NVR.
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Whether the guard / return-to-home is enabled (`0` or `1`)
+    pub benable: u8,
+    /// Command directing the camera what to do with the guard.
+    ///
+    /// Known values: `"setPos"` (save the current position as the guard
+    /// position), `"toPos"` (move to the guard position), `"delPos"`
+    /// (remove the configured guard position).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Inactivity timeout (seconds) after which the camera returns to guard
+    pub timeout: u32,
+    /// Whether to refresh / re-record the guard position when applying this
+    /// config (`0` or `1`). Read-only on cmd 73.
+    #[serde(rename = "needSetPos", skip_serializing_if = "Option::is_none")]
+    pub need_set_pos: Option<u8>,
+}
+
+/// PTZ 3D click-to-zoom request (cmd 75)
+///
+/// All coordinates are in screen-space (the pixel inside the displayed
+/// frame the user clicked). The camera computes pan/tilt/zoom from the
+/// supplied click rectangle vs the screen size.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct Ptz3DLocation {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id. Usually `0` unless from an NVR.
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Click position in screen-space, X (left edge of the click rectangle)
+    #[serde(rename = "posX")]
+    pub pos_x: u32,
+    /// Click position in screen-space, Y (top edge of the click rectangle)
+    #[serde(rename = "posY")]
+    pub pos_y: u32,
+    /// Width of the click rectangle in screen-space (use a small value such
+    /// as `1` for a single-pixel click, or the bounding box width for
+    /// drag-to-zoom)
+    pub width: u32,
+    /// Height of the click rectangle in screen-space
+    pub height: u32,
+    /// Movement / zoom speed, hardware-dependent (typical range 1-64)
+    pub speed: u32,
+    /// Screen width in pixels (so the camera can scale the click)
+    #[serde(rename = "screenWidth")]
+    pub screen_width: u32,
+    /// Screen height in pixels
+    #[serde(rename = "screenHeight")]
+    pub screen_height: u32,
+}
+
+/// Auto-focus enable state (cmd 224/225)
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct AutoFocus {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id. Usually `0` unless from an NVR.
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// `0` to disable auto-focus, `1` to enable
+    pub disable: u8,
+}
+
+/// Live pan/tilt position (cmd 433)
+///
+/// Returned by an explicit poll or pushed by the camera mid-move. Pan and
+/// tilt are reported in the camera's native angular units (typically
+/// hundredths of a degree).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct PtzPos {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id. Usually `0` unless from an NVR.
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Pan position (signed; camera-specific units, typically 1/100 degree)
+    #[serde(rename = "pPos")]
+    pub p_pos: i32,
+    /// Tilt position (signed; camera-specific units, typically 1/100 degree)
+    #[serde(rename = "tPos")]
+    pub t_pos: i32,
+}
+
+/// PTZ moving-status push (cmd 542)
+///
+/// Pushed by the camera while a PTZ move is in progress. The payload is a
+/// bare `<PtzRunning>0|1</PtzRunning>`.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct PtzRunning {
+    /// `1` while the camera is mid-move, `0` once it has settled
+    pub running: u8,
+}
+
+/// Pre-record (battery-camera pre-roll) configuration (cmd 594/595)
+///
+/// Configures the rolling-buffer "show me the seconds before the trigger"
+/// behaviour on battery-powered cameras. The schedule shape mirrors the
+/// existing per-day bitmask used elsewhere in the protocol but is
+/// somewhat speculative; treat as best-effort and verify on hardware.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct LongRunModeCfg {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Channel id. Usually `0` unless from an NVR.
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Seconds of pre-roll to keep before the trigger. `0` disables.
+    #[serde(rename = "preTime")]
+    pub pre_time: u32,
+    /// Frames-per-second the pre-roll buffer is captured at
+    pub fps: u32,
+    /// Per-day schedule controlling when pre-record is active. Optional —
+    /// some cameras accept just `preTime`/`fps`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<PreRecordSchedule>,
+    /// Battery-percentage threshold at which pre-record auto-disables.
+    /// `0` or omitted means "never auto-disable".
+    #[serde(rename = "batteryStop", skip_serializing_if = "Option::is_none")]
+    pub battery_stop: Option<u32>,
+}
+
+/// Pre-record schedule entry
+///
+/// Mirrors the shape used in other Reolink schedule XMLs: a `HH:MM-HH:MM`
+/// time-range plus a `1234567` day-of-week bitmask. The XML root is a
+/// single `<schedule>` rather than the usual `<scheduleList>` because the
+/// reference implementations only ever send a single window.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct PreRecordSchedule {
+    /// `HH:MM` start of the daily window
+    #[serde(rename = "startTime")]
+    pub start_time: String,
+    /// `HH:MM` end of the daily window
+    #[serde(rename = "endTime")]
+    pub end_time: String,
+    /// Days-of-week bitmask. Each character is `1`-`7` for Mon-Sun; if a
+    /// day is present pre-record applies on that day.
+    pub week: String,
+}
+
 /// Convience function to return the xml version used throughout the library
 pub fn xml_ver() -> String {
     "1.1".to_string()
@@ -1968,4 +2201,196 @@ fn test_empty_floodlight_status_list() {
         } if version == "1.1" && floodlight_status_list.is_empty() => {}
         _ => panic!(),
     }
+}
+
+#[test]
+fn test_patrol_list_deser() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <PatrolList version="1.1">
+        <channelId>0</channelId>
+        <patrol>
+        <id>1</id>
+        <name>tour1</name>
+        <presetList>
+        <preset>
+        <id>1</id>
+        <dwellTime>5</dwellTime>
+        </preset>
+        <preset>
+        <id>2</id>
+        <dwellTime>5</dwellTime>
+        </preset>
+        </presetList>
+        </patrol>
+        </PatrolList>
+        </body>"#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let pl = b.patrol_list.as_ref().expect("PatrolList present");
+    assert_eq!(pl.patrol.len(), 1);
+    assert_eq!(pl.patrol[0].id, 1);
+    assert_eq!(pl.patrol[0].name.as_deref(), Some("tour1"));
+    let presets = &pl.patrol[0].preset_list.as_ref().unwrap().preset;
+    assert_eq!(presets.len(), 2);
+    assert_eq!(presets[1].id, 2);
+    assert_eq!(presets[1].dwell_time, 5);
+}
+
+#[test]
+fn test_patrol_start_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let original = BcXml {
+        patrol_list: Some(PatrolList {
+            version: Some(xml_ver()),
+            channel_id: Some(0),
+            patrol: vec![Patrol {
+                id: 1,
+                name: None,
+                command: Some("start".to_string()),
+                preset_list: None,
+            }],
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(parsed, original);
+}
+
+#[test]
+fn test_ptz_guard_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let original = BcXml {
+        ptz_guard: Some(PtzGuard {
+            version: Some(xml_ver()),
+            channel_id: 0,
+            benable: 1,
+            command: Some("setPos".to_string()),
+            timeout: 60,
+            need_set_pos: Some(1),
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(parsed, original);
+}
+
+#[test]
+fn test_ptz_3d_location_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let original = BcXml {
+        ptz_3d_location: Some(Ptz3DLocation {
+            version: Some(xml_ver()),
+            channel_id: 0,
+            pos_x: 640,
+            pos_y: 360,
+            width: 1,
+            height: 1,
+            speed: 32,
+            screen_width: 1920,
+            screen_height: 1080,
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(parsed, original);
+}
+
+#[test]
+fn test_auto_focus_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let original = BcXml {
+        auto_focus: Some(AutoFocus {
+            version: Some(xml_ver()),
+            channel_id: 0,
+            disable: 0,
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(parsed, original);
+}
+
+#[test]
+fn test_ptz_pos_deser() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <PtzPos version="1.1">
+        <channelId>0</channelId>
+        <pPos>1800</pPos>
+        <tPos>900</tPos>
+        </PtzPos>
+        </body>"#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let pos = b.ptz_pos.as_ref().expect("PtzPos present");
+    assert_eq!(pos.channel_id, 0);
+    assert_eq!(pos.p_pos, 1800);
+    assert_eq!(pos.t_pos, 900);
+}
+
+#[test]
+fn test_ptz_running_deser() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <PtzRunning>1</PtzRunning>
+        </body>"#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let running = b.ptz_running.as_ref().expect("PtzRunning present");
+    assert_eq!(running.running, 1);
+}
+
+#[test]
+fn test_pre_record_roundtrip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let original = BcXml {
+        long_run_mode_cfg: Some(LongRunModeCfg {
+            version: Some(xml_ver()),
+            channel_id: 0,
+            pre_time: 5,
+            fps: 15,
+            schedule: Some(PreRecordSchedule {
+                start_time: "00:00".to_string(),
+                end_time: "23:59".to_string(),
+                week: "1234567".to_string(),
+            }),
+            battery_stop: Some(20),
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(parsed, original);
+}
+
+#[test]
+fn test_pre_record_minimal_deser() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <LongRunModeCfg version="1.1">
+        <channelId>0</channelId>
+        <preTime>0</preTime>
+        <fps>15</fps>
+        </LongRunModeCfg>
+        </body>"#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let cfg = b.long_run_mode_cfg.as_ref().expect("LongRunModeCfg");
+    assert_eq!(cfg.pre_time, 0);
+    assert_eq!(cfg.fps, 15);
+    assert!(cfg.schedule.is_none());
+    assert!(cfg.battery_stop.is_none());
 }
