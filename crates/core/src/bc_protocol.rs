@@ -13,12 +13,14 @@ use tokio_util::sync::CancellationToken;
 use Md5Trunc::*;
 
 mod abilityinfo;
+mod audio;
 mod battery;
 mod connection;
 mod credentials;
 mod email;
 mod errors;
 mod floodlight;
+mod io;
 mod keepalive;
 mod ledstate;
 mod link;
@@ -42,6 +44,7 @@ mod time;
 mod uid;
 mod users;
 mod version;
+mod wifi;
 
 pub(crate) use connection::*;
 pub use credentials::*;

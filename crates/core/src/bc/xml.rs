@@ -141,6 +141,33 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// WiFi info and scan results (cmd 115/116)
+    #[serde(rename = "Wifi", skip_serializing_if = "Option::is_none")]
+    pub wifi: Option<Wifi>,
+    /// I/O input state push (cmd 677)
+    #[serde(rename = "IoInputList", skip_serializing_if = "Option::is_none")]
+    pub io_input_list: Option<IoInputList>,
+    /// Scheduled siren times (cmd 480)
+    #[serde(rename = "SirenTimes", skip_serializing_if = "Option::is_none")]
+    pub siren_times: Option<SirenTimes>,
+    /// Hub-variant scheduled siren times (cmd 480)
+    #[serde(rename = "SirenHubTimes", skip_serializing_if = "Option::is_none")]
+    pub siren_hub_times: Option<SirenHubTimes>,
+    /// Manual siren control (cmd 481)
+    #[serde(rename = "SirenManual", skip_serializing_if = "Option::is_none")]
+    pub siren_manual: Option<SirenManual>,
+    /// Hub-variant manual siren control (cmd 481)
+    #[serde(rename = "SirenHubManual", skip_serializing_if = "Option::is_none")]
+    pub siren_hub_manual: Option<SirenHubManual>,
+    /// Push when the siren actually fires (cmd 547)
+    #[serde(rename = "SirenStatus", skip_serializing_if = "Option::is_none")]
+    pub siren_status: Option<SirenStatus>,
+    /// Audio configuration (cmd 264 / 265)
+    #[serde(rename = "AudioCfg", skip_serializing_if = "Option::is_none")]
+    pub audio_cfg: Option<AudioCfg>,
+    /// Audio noise reduction (cmd 438 / 439)
+    #[serde(rename = "AudioNoise", skip_serializing_if = "Option::is_none")]
+    pub audio_noise: Option<AudioNoise>,
 }
 
 impl BcXml {
@@ -1620,6 +1647,229 @@ pub struct User {
     pub user_set_state: String,
 }
 
+/// WiFi xml (cmd 115 / 116). Contains the currently associated SSID,
+/// link RSSI, link type (`2.4G`, `5G`, `wired`, ...) and an optional list
+/// of scanned APs. The exact field names are taken from the
+/// `starkillerOG/reolink_aio` reference.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct Wifi {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID of the camera / NVR
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Currently associated SSID. Some replies omit this for `GET_WIFI_SIGNAL`
+    /// (cmd 115) responses.
+    #[serde(rename = "currentSSID", skip_serializing_if = "Option::is_none")]
+    pub current_ssid: Option<String>,
+    /// Signal strength in dBm. Negative integer, typically -30 (strong) to
+    /// -90 (weak).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Link type / band. Known values: `"2.4G"`, `"5G"`, `"wired"`.
+    #[serde(rename = "linkType", skip_serializing_if = "Option::is_none")]
+    pub link_type: Option<String>,
+    /// List of access points from the most recent scan, if any.
+    #[serde(rename = "scanAp", skip_serializing_if = "Option::is_none")]
+    pub scan_ap: Option<WifiScanApList>,
+}
+
+/// A list of access points returned by the WiFi scan (cmd 116).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct WifiScanApList {
+    /// The individual access points
+    #[serde(default, rename = "ap")]
+    pub ap: Vec<WifiAp>,
+}
+
+/// A single access point in the WiFi scan list.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct WifiAp {
+    /// SSID of the access point
+    #[serde(rename = "ssid")]
+    pub ssid: String,
+    /// Signal strength in dBm
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Encryption type, e.g. `"WPA2-PSK"`, `"open"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypt: Option<String>,
+    /// Band / link type. Known values: `"2.4G"`, `"5G"`.
+    #[serde(rename = "linkType", skip_serializing_if = "Option::is_none")]
+    pub link_type: Option<String>,
+}
+
+/// I/O input list push (cmd 677). Hubs / NVRs send this when one of the
+/// physical alarm-in terminals changes state.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct IoInputList {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// The individual I/O inputs
+    #[serde(default, rename = "IoItem")]
+    pub items: Vec<IoItem>,
+}
+
+/// A single I/O input state.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct IoItem {
+    /// Index of the input terminal (0-based)
+    pub index: u8,
+    /// State of the input. `0` = open / inactive, `1` = closed / active.
+    pub result: u8,
+}
+
+/// Scheduled siren times (cmd 480).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct SirenTimes {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Play mode: `0` = manual, `2` = scheduled
+    #[serde(rename = "playMode")]
+    pub play_mode: u32,
+    /// Duration of each siren in seconds
+    #[serde(rename = "playDuration")]
+    pub play_duration: u32,
+    /// How many times to repeat the siren
+    #[serde(rename = "playTimes")]
+    pub play_times: u32,
+    /// On / off flag (`1` to enable the schedule)
+    #[serde(rename = "onOff")]
+    pub on_off: u32,
+}
+
+/// Hub variant of [`SirenTimes`] (cmd 480 on hubs / NVRs). Same fields,
+/// different XML root name.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct SirenHubTimes {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Play mode: `0` = manual, `2` = scheduled
+    #[serde(rename = "playMode")]
+    pub play_mode: u32,
+    /// Duration of each siren in seconds
+    #[serde(rename = "playDuration")]
+    pub play_duration: u32,
+    /// How many times to repeat the siren
+    #[serde(rename = "playTimes")]
+    pub play_times: u32,
+    /// On / off flag (`1` to enable the schedule)
+    #[serde(rename = "onOff")]
+    pub on_off: u32,
+}
+
+/// Manual siren control (cmd 481).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct SirenManual {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Manual play mode (typically `0`)
+    #[serde(rename = "playMode")]
+    pub play_mode: u32,
+    /// Duration in seconds. `0` means "siren default".
+    #[serde(rename = "playDuration")]
+    pub play_duration: u32,
+    /// How many times to repeat
+    #[serde(rename = "playTimes")]
+    pub play_times: u32,
+    /// `1` = fire, `0` = stop
+    #[serde(rename = "onOff")]
+    pub on_off: u32,
+}
+
+/// Hub variant of [`SirenManual`] (cmd 481 on hubs / NVRs).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct SirenHubManual {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Manual play mode (typically `0`)
+    #[serde(rename = "playMode")]
+    pub play_mode: u32,
+    /// Duration in seconds. `0` means "siren default".
+    #[serde(rename = "playDuration")]
+    pub play_duration: u32,
+    /// How many times to repeat
+    #[serde(rename = "playTimes")]
+    pub play_times: u32,
+    /// `1` = fire, `0` = stop
+    #[serde(rename = "onOff")]
+    pub on_off: u32,
+}
+
+/// Siren status push (cmd 547). Sent by the camera/hub when the siren
+/// actually starts or stops firing.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SirenStatus {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID, when present
+    #[serde(rename = "channelId", default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Siren state. `0` = off, `1` = on / firing.
+    pub status: u8,
+}
+
+/// Audio configuration (cmd 264 / 265). Speaker and microphone volume
+/// plus the configured audio encoding. Field names follow the reference
+/// implementation in `starkillerOG/reolink_aio`.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct AudioCfg {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Speaker volume, typically 0-100
+    #[serde(rename = "speakerVolume")]
+    pub speaker_volume: u8,
+    /// Microphone volume, typically 0-100
+    #[serde(rename = "micVolume")]
+    pub mic_volume: u8,
+    /// Audio encoding. Known values: `"aac"`, `"adpcm"`.
+    #[serde(rename = "audioEncode", skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<String>,
+}
+
+/// Audio noise reduction settings (cmd 438 / 439). Per-channel toggle,
+/// level, and denoise mode (AI vs classic).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct AudioNoise {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Noise reduction enable flag (`0` = off, `1` = on)
+    pub enable: u8,
+    /// Noise reduction level / intensity. Range varies per firmware but
+    /// is typically `0..=5`.
+    pub level: u8,
+    /// Denoise algorithm. Known values: `"ai"`, `"classic"`.
+    #[serde(rename = "denoiseMode", skip_serializing_if = "Option::is_none")]
+    pub denoise_mode: Option<String>,
+}
+
 /// Convience function to return the xml version used throughout the library
 pub fn xml_ver() -> String {
     "1.1".to_string()
@@ -1944,6 +2194,206 @@ fn test_enc3_extension() {
         } => {}
         _ => panic!(),
     }
+}
+
+#[test]
+fn test_wifi_deser() {
+    let sample = indoc!(
+        r#"
+        <?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <Wifi version="1.1">
+        <channelId>0</channelId>
+        <currentSSID>HomeNetwork</currentSSID>
+        <signal>-55</signal>
+        <linkType>5G</linkType>
+        <scanAp>
+        <ap>
+        <ssid>Guest</ssid>
+        <signal>-70</signal>
+        <encrypt>WPA2-PSK</encrypt>
+        <linkType>2.4G</linkType>
+        </ap>
+        <ap>
+        <ssid>HomeNetwork</ssid>
+        <signal>-55</signal>
+        <encrypt>WPA2-PSK</encrypt>
+        <linkType>5G</linkType>
+        </ap>
+        </scanAp>
+        </Wifi>
+        </body>"#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let wifi = b.wifi.as_ref().unwrap();
+    assert_eq!(wifi.current_ssid.as_deref(), Some("HomeNetwork"));
+    assert_eq!(wifi.signal, Some(-55));
+    assert_eq!(wifi.link_type.as_deref(), Some("5G"));
+    let aps = &wifi.scan_ap.as_ref().unwrap().ap;
+    assert_eq!(aps.len(), 2);
+    assert_eq!(aps[0].ssid, "Guest");
+    assert_eq!(aps[1].signal, Some(-55));
+}
+
+#[test]
+fn test_wifi_roundtrip() {
+    let original = BcXml {
+        wifi: Some(Wifi {
+            version: "1.1".to_string(),
+            channel_id: 0,
+            current_ssid: Some("HomeNetwork".to_string()),
+            signal: Some(-55),
+            link_type: Some("5G".to_string()),
+            scan_ap: Some(WifiScanApList {
+                ap: vec![WifiAp {
+                    ssid: "HomeNetwork".to_string(),
+                    signal: Some(-55),
+                    encrypt: Some("WPA2-PSK".to_string()),
+                    link_type: Some("5G".to_string()),
+                }],
+            }),
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(original, parsed);
+}
+
+#[test]
+fn test_io_input_list_deser() {
+    let sample = indoc!(
+        r#"
+        <?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <IoInputList version="1.1">
+        <IoItem>
+        <index>0</index>
+        <result>1</result>
+        </IoItem>
+        <IoItem>
+        <index>1</index>
+        <result>0</result>
+        </IoItem>
+        </IoInputList>
+        </body>"#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let list = b.io_input_list.as_ref().unwrap();
+    assert_eq!(list.items.len(), 2);
+    assert_eq!(list.items[0].index, 0);
+    assert_eq!(list.items[0].result, 1);
+    assert_eq!(list.items[1].index, 1);
+    assert_eq!(list.items[1].result, 0);
+}
+
+#[test]
+fn test_io_input_list_roundtrip() {
+    let original = BcXml {
+        io_input_list: Some(IoInputList {
+            version: "1.1".to_string(),
+            items: vec![
+                IoItem {
+                    index: 0,
+                    result: 1,
+                },
+                IoItem {
+                    index: 1,
+                    result: 0,
+                },
+            ],
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(original, parsed);
+}
+
+#[test]
+fn test_siren_times_roundtrip() {
+    let original = BcXml {
+        siren_times: Some(SirenTimes {
+            version: "1.1".to_string(),
+            channel_id: 0,
+            play_mode: 2,
+            play_duration: 10,
+            play_times: 1,
+            on_off: 1,
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(original, parsed);
+}
+
+#[test]
+fn test_siren_manual_roundtrip() {
+    let original = BcXml {
+        siren_manual: Some(SirenManual {
+            version: "1.1".to_string(),
+            channel_id: 0,
+            play_mode: 0,
+            play_duration: 5,
+            play_times: 1,
+            on_off: 1,
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(original, parsed);
+}
+
+#[test]
+fn test_siren_status_deser() {
+    let sample = indoc!(
+        r#"
+        <?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <SirenStatus version="1.1">
+        <status>1</status>
+        </SirenStatus>
+        </body>"#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let s = b.siren_status.as_ref().unwrap();
+    assert_eq!(s.status, 1);
+}
+
+#[test]
+fn test_audio_cfg_roundtrip() {
+    let original = BcXml {
+        audio_cfg: Some(AudioCfg {
+            version: "1.1".to_string(),
+            channel_id: 0,
+            speaker_volume: 50,
+            mic_volume: 50,
+            audio_encode: Some("aac".to_string()),
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(original, parsed);
+}
+
+#[test]
+fn test_audio_noise_roundtrip() {
+    let original = BcXml {
+        audio_noise: Some(AudioNoise {
+            version: "1.1".to_string(),
+            channel_id: 0,
+            enable: 1,
+            level: 3,
+            denoise_mode: Some("ai".to_string()),
+        }),
+        ..BcXml::default()
+    };
+    let bytes = original.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(bytes.as_slice()).unwrap();
+    assert_eq!(original, parsed);
 }
 
 #[test]

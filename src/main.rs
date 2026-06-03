@@ -36,12 +36,14 @@ use log::*;
 use std::fs;
 use validator::Validate;
 
+mod audio;
 mod battery;
 mod cmdline;
 mod common;
 mod config;
 #[cfg(feature = "gstreamer")]
 mod image;
+mod io;
 mod mqtt;
 mod onvif;
 mod pir;
@@ -50,11 +52,13 @@ mod reboot;
 #[cfg(feature = "gstreamer")]
 mod rtsp;
 mod services;
+mod siren;
 mod statusled;
 #[cfg(feature = "gstreamer")]
 mod talk;
 mod users;
 mod utils;
+mod wifi;
 
 use cmdline::{Command, Opt};
 use common::NeoReactor;
@@ -151,6 +155,18 @@ async fn main() -> Result<()> {
         }
         Some(Command::Users(opts)) => {
             users::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Wifi(opts)) => {
+            wifi::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Siren(opts)) => {
+            siren::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Audio(opts)) => {
+            audio::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Io(opts)) => {
+            io::main(opts, neo_reactor.clone()).await?;
         }
     }
 
