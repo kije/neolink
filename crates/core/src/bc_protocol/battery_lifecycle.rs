@@ -126,8 +126,8 @@ impl BatteryLifecycle {
     /// Record that a command is in-flight. Returns a guard that decrements
     /// the count when dropped.
     ///
-    /// `cmd_id == 0` and non-waking commands are not counted, so they
-    /// neither prevent nor reset the idle close timer.
+    /// Non-waking commands (see [`NONE_WAKING_COMMANDS`]) are not counted, so
+    /// they neither prevent nor reset the idle close timer.
     pub fn track(&self, cmd_id: u32) -> InFlightGuard<'_> {
         let counted = !is_non_waking(cmd_id);
         if counted {
@@ -149,10 +149,18 @@ impl BatteryLifecycle {
         if self.in_flight() == 0 {
             return;
         }
-        // Tight loop on the notification — `decrement` posts to `idle_notify`
+        // Tight loop on the notification — `drop` posts to `idle_notify`
         // whenever it observes a transition to zero.
+        //
+        // A `Notified` future only registers as a waiter on its first poll, so
+        // we `enable()` it *before* re-checking `in_flight()`. Without this, a
+        // `1 -> 0` drop racing between the check and the `.await` would
+        // `notify_waiters()` with no waiter registered, the notification would
+        // be lost, and we'd block forever.
         loop {
             let notified = self.idle_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.in_flight() == 0 {
                 return;
             }
