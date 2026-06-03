@@ -27,6 +27,7 @@ mod logout;
 mod motion;
 mod ping;
 mod pirstate;
+mod playback;
 mod ptz;
 mod pushinfo;
 mod reboot;
@@ -50,6 +51,10 @@ pub use ledstate::LightState;
 pub use login::MaxEncryption;
 pub use motion::{MotionData, MotionStatus};
 pub use pirstate::PirState;
+pub use playback::{
+    PlaybackTimeRange, RecordingHandle, ReplayStream, ALL_ALARM_TYPES, ALL_RECORD_TYPES,
+    DEFAULT_LIST_PAGE_SIZE, MAX_PAGES,
+};
 pub use ptz::Direction;
 pub use pushinfo::PhoneType;
 pub use resolution::*;
