@@ -17,6 +17,10 @@
 //! - `/control/ptz` [up|down|left|right|in|out] (amount) Control the PTZ movements, amount defaults to 32.0
 //! - `/control/ptz/preset` [id] Move the camera to a known preset
 //! - `/control/ptz/assign` [id] [name] Assign the current ptz position to an ID and name
+//! - `/control/privacy` [on|off] Toggle the Baichuan privacy-mode shutter
+//! - `/control/scene` [off|<id>] Activate a host scene (arming scenario)
+//!   by id, or disable scene mode. Conventional ids: 0/off = disable,
+//!   1 = away, 2 = home, 3 = disarm.
 //!
 //! Status Messages:
 //!
@@ -25,6 +29,11 @@
 //! `/status/battery` Sent in reply to a `/query/battery`
 //! `/status/pir` Sent in reply to a `/query/pir`
 //! `/status/ptz/preset` Sent in reply to a `/query/ptz/preset`
+//! `/status/privacy` Current Baichuan privacy-mode state (on|off).
+//!   Pushed by the camera on change and also on `/query/privacy`.
+//! `/status/scene` Last scene id activated via `/control/scene`
+//!   (or "off" when scene mode is disabled).
+//! `/status/scene_list` Comma-separated list of available scene ids.
 //!
 //! Query Messages:
 //!
@@ -33,6 +42,9 @@
 //! `/query/ptz/preset` Request that the camera reports the PTZ presets
 //! `/query/preview` Request that the camera post a base64 encoded jpeg
 //!    of the stream to `/status/preview`
+//! `/query/privacy` Request that the camera reports its current
+//!    privacy-mode state on `/status/privacy`
+//! `/query/scene` Request the available scene ids on `/status/scene_list`
 //!
 //!
 //! # Usage
@@ -345,6 +357,21 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                 let camera_floodlight_tasks = camera.clone();
                 let mqtt_floodlight_tasks = mqtt_instance.resubscribe().await?;
 
+                let camera_privacy = camera.clone();
+                let mqtt_privacy = mqtt_instance.resubscribe().await?;
+
+                let camera_scene = camera.clone();
+                let mqtt_scene = mqtt_instance.resubscribe().await?;
+
+                // Snapshot the per-feature flags + poll intervals up front so
+                // the &config borrow used by the select! guard expressions
+                // does not conflict with by-move captures inside the async
+                // branches below.
+                let enable_privacy = config.enable_privacy;
+                let privacy_update = config.privacy_update;
+                let enable_scene = config.enable_scene;
+                let scene_update = config.scene_update;
+
                 tokio::select! {
                     _ = cancel.cancelled() => AnyResult::Ok(()),
                     // Handles incomming requests
@@ -630,6 +657,80 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                         }
                         AnyResult::Ok(())
                     }, if config.enable_floodlight => v,
+                    // Handle the privacy-mode state (cmd 622 / 623).
+                    //
+                    // The cmd-623 push handler is registered on the camera
+                    // connection and forwarded over an mpsc channel; a
+                    // periodic poll primes the value at startup and acts as
+                    // a fallback for firmwares that don't push reliably.
+                    v = async {
+                        let initial = camera_privacy.run_passive_task(|cam| Box::pin(async move {
+                            Ok(cam.get_privacy_mode().await?)
+                        })).await;
+                        if initial.is_err() {
+                            // Assume privacy mode unsupported on this camera
+                            log::debug!("{}: Privacy mode unsupported, skipping", camera_name);
+                            futures::future::pending::<()>().await;
+                        }
+                        let on = initial.unwrap();
+                        let txt = if on { "on" } else { "off" };
+                        mqtt_privacy.send_message("status/privacy", txt, true).await.with_context(|| {
+                            format!("{}: Failed to publish privacy state", camera_name)
+                        })?;
+                        let mut wait = IntervalStream::new({
+                            let mut i = interval(Duration::from_millis(privacy_update));
+                            i.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                            i
+                        });
+                        while wait.next().await.is_some() {
+                            if let Ok(on) = camera_privacy.run_passive_task(|cam| Box::pin(async move {
+                                Ok(cam.get_privacy_mode().await?)
+                            })).await {
+                                let txt = if on { "on" } else { "off" };
+                                mqtt_privacy.send_message("status/privacy", txt, true).await.with_context(|| {
+                                    format!("{}: Failed to publish privacy state", camera_name)
+                                })?;
+                            }
+                        }
+                        AnyResult::Ok(())
+                    }, if enable_privacy => v,
+                    // Handle the scene-mode state (cmd 603 / 605).
+                    //
+                    // We poll the scene-list periodically. There is no
+                    // separately addressable "currently active scene id"
+                    // command in the public spec; status/scene_list
+                    // reports the configured ids and status/scene tracks
+                    // the last value we set through control/scene.
+                    v = async {
+                        let initial = camera_scene.run_passive_task(|cam| Box::pin(async move {
+                            Ok(cam.get_scenes().await?)
+                        })).await;
+                        if initial.is_err() {
+                            log::debug!("{}: Scene mode unsupported, skipping", camera_name);
+                            futures::future::pending::<()>().await;
+                        }
+                        let format_csv = |ids: &[u8]| {
+                            ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+                        };
+                        mqtt_scene.send_message("status/scene_list", &format_csv(&initial.unwrap()), true).await.with_context(|| {
+                            format!("{}: Failed to publish scene list", camera_name)
+                        })?;
+                        let mut wait = IntervalStream::new({
+                            let mut i = interval(Duration::from_millis(scene_update));
+                            i.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                            i
+                        });
+                        while wait.next().await.is_some() {
+                            if let Ok(ids) = camera_scene.run_passive_task(|cam| Box::pin(async move {
+                                Ok(cam.get_scenes().await?)
+                            })).await {
+                                mqtt_scene.send_message("status/scene_list", &format_csv(&ids), true).await.with_context(|| {
+                                    format!("{}: Failed to publish scene list", camera_name)
+                                })?;
+                            }
+                        }
+                        AnyResult::Ok(())
+                    }, if enable_scene => v,
                 }?;
                 AnyResult::Ok(())
             } => v,
@@ -1302,6 +1403,162 @@ async fn handle_mqtt_message(
             mqtt.send_message("query/ptz", &reply, false)
                 .await
                 .with_context(|| "Failed to publish ptz query")?;
+        }
+        MqttReplyRef {
+            topic: "control/privacy",
+            message,
+        } if message == "on" || message == "off" => {
+            let enable = message == "on";
+            let res = camera
+                .run_task(|cam| {
+                    Box::pin(async move {
+                        cam.set_privacy_mode(enable).await?;
+                        AnyResult::Ok(())
+                    })
+                })
+                .await;
+            let reply = if let Err(e) = res {
+                error!("Failed to set privacy mode: {:?}", e);
+                "FAIL"
+            } else {
+                // Optimistically publish the new state so subscribers see it
+                // before the camera pushes its own cmd-623 confirmation.
+                let new_state = if enable { "on" } else { "off" };
+                let _ = mqtt
+                    .send_message("status/privacy", new_state, true)
+                    .await
+                    .with_context(|| "Failed to publish privacy state");
+                "OK"
+            }
+            .to_string();
+            mqtt.send_message("control/privacy", &reply, false)
+                .await
+                .with_context(|| "Failed to publish privacy ack")?;
+        }
+        MqttReplyRef {
+            topic: "control/scene",
+            message,
+        } => {
+            // Accepted payloads: "off" (disable scene), or a numeric id.
+            // "0" is treated as off (matches set_scene's own semantics).
+            let parsed: Result<Option<u8>, _> = if message == "off" {
+                Ok(None)
+            } else {
+                message.parse::<u8>().map(Some)
+            };
+            let res = match parsed {
+                Ok(maybe_id) => {
+                    camera
+                        .run_task(|cam| {
+                            Box::pin(async move {
+                                match maybe_id {
+                                    None | Some(0) => cam.disable_scene().await?,
+                                    Some(id) => cam.set_scene(id).await?,
+                                }
+                                AnyResult::Ok(())
+                            })
+                        })
+                        .await
+                }
+                Err(ref e) => Err(anyhow!("Invalid scene payload {:?}: {}", message, e)),
+            };
+            let reply = if let Err(e) = res {
+                error!("Failed to set scene: {:?}", e);
+                "FAIL"
+            } else {
+                // Optimistic status publish so listeners reflect the change
+                // immediately. Normalised value: "off" or "<id>".
+                let normalised = match parsed.as_ref() {
+                    Ok(None) | Ok(Some(0)) => "off".to_string(),
+                    Ok(Some(id)) => id.to_string(),
+                    Err(_) => message.to_string(),
+                };
+                let _ = mqtt
+                    .send_message("status/scene", &normalised, true)
+                    .await
+                    .with_context(|| "Failed to publish scene state");
+                "OK"
+            }
+            .to_string();
+            mqtt.send_message("control/scene", &reply, false)
+                .await
+                .with_context(|| "Failed to publish scene ack")?;
+        }
+        MqttReplyRef {
+            topic: "query/privacy",
+            ..
+        } => {
+            let res = camera
+                .run_task(|cam| {
+                    Box::pin(async move {
+                        let on = cam.get_privacy_mode().await?;
+                        AnyResult::Ok(on)
+                    })
+                })
+                .await;
+            let reply = match res {
+                Ok(on) => {
+                    let txt = if on { "on" } else { "off" };
+                    if let Err(e) = mqtt
+                        .send_message("status/privacy", txt, true)
+                        .await
+                        .with_context(|| "Failed to publish privacy")
+                    {
+                        error!("Failed to send privacy state: {e:?}");
+                        "FAIL"
+                    } else {
+                        "OK"
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to read privacy mode: {:?}", e);
+                    "FAIL"
+                }
+            }
+            .to_string();
+            mqtt.send_message("query/privacy", &reply, false)
+                .await
+                .with_context(|| "Failed to publish privacy query ack")?;
+        }
+        MqttReplyRef {
+            topic: "query/scene",
+            ..
+        } => {
+            let res = camera
+                .run_task(|cam| {
+                    Box::pin(async move {
+                        let ids = cam.get_scenes().await?;
+                        AnyResult::Ok(ids)
+                    })
+                })
+                .await;
+            let reply = match res {
+                Ok(ids) => {
+                    let csv = ids
+                        .iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    if let Err(e) = mqtt
+                        .send_message("status/scene_list", &csv, true)
+                        .await
+                        .with_context(|| "Failed to publish scene list")
+                    {
+                        error!("Failed to send scene list: {e:?}");
+                        "FAIL"
+                    } else {
+                        "OK"
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to read scene list: {:?}", e);
+                    "FAIL"
+                }
+            }
+            .to_string();
+            mqtt.send_message("query/scene", &reply, false)
+                .await
+                .with_context(|| "Failed to publish scene query ack")?;
         }
         MqttReplyRef {
             topic: "query/preview",
