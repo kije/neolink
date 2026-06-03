@@ -12,7 +12,11 @@ use neolink_core::{
 };
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
-use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+use crate::{
+    common::NeoInstance,
+    rtsp::{gst::NeoMediaFactory, timestamps::TimestampTracker},
+    AnyResult,
+};
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -243,8 +247,7 @@ pub(super) async fn make_factory(
                         // Run blocking code on a seperate thread
                         // This is not an async thread
                         std::thread::spawn(move || {
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
+                            let mut tracker = TimestampTracker::new();
                             let mut pools = Default::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
@@ -254,9 +257,7 @@ pub(super) async fn make_factory(
                                     &mut pools,
                                     &vid_src,
                                     &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
+                                    &mut tracker,
                                 )?;
                             }
 
@@ -267,9 +268,7 @@ pub(super) async fn make_factory(
                                     &mut pools,
                                     &vid_src,
                                     &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
+                                    &mut tracker,
                                 );
                                 if let Err(r) = &r {
                                     log::info!("Failed to send to source: {r:?}");
@@ -304,48 +303,64 @@ fn send_to_sources(
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
-    stream_config: &StreamConfig,
+    tracker: &mut TimestampTracker,
 ) -> AnyResult<()> {
-    // Update TS
     match data {
         BcMedia::Aac(aac) => {
             let duration = aac.duration().expect("Could not calculate AAC duration");
+            let ts_us = tracker.next_audio_us(duration);
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    aac.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                log::debug!("Sending AAC: {:?}", Duration::from_micros(ts_us));
+                send_to_appsrc(aud_src, aac.data, Duration::from_micros(ts_us), pools)?;
             }
-            *aud_ts += duration;
         }
         BcMedia::Adpcm(adpcm) => {
             let duration = adpcm
                 .duration()
                 .expect("Could not calculate ADPCM duration");
+            let ts_us = tracker.next_audio_us(duration);
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(ts_us));
+                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(ts_us), pools)?;
             }
-            *aud_ts += duration;
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
-            if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+        BcMedia::Iframe(BcMediaIframe {
+            data,
+            microseconds,
+            time,
+            ..
+        }) => {
+            let ts_us = tracker.next_video_us(microseconds);
+            if let Some(posix) = time {
+                log::trace!(
+                    "IFrame: pts={:?} camera_us={} posix={}",
+                    Duration::from_micros(ts_us),
+                    microseconds,
+                    posix
+                );
+            } else {
+                log::trace!(
+                    "IFrame: pts={:?} camera_us={}",
+                    Duration::from_micros(ts_us),
+                    microseconds
+                );
             }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
+            if let Some(vid_src) = vid_src.as_ref() {
+                send_to_appsrc(vid_src, data, Duration::from_micros(ts_us), pools)?;
+            }
+        }
+        BcMedia::Pframe(BcMediaPframe {
+            data, microseconds, ..
+        }) => {
+            let ts_us = tracker.next_video_us(microseconds);
+            log::trace!(
+                "PFrame: pts={:?} camera_us={}",
+                Duration::from_micros(ts_us),
+                microseconds
+            );
+            if let Some(vid_src) = vid_src.as_ref() {
+                send_to_appsrc(vid_src, data, Duration::from_micros(ts_us), pools)?;
+            }
         }
         _ => {}
     }
