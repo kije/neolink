@@ -141,6 +141,16 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// Begin / describe a firmware-upgrade upload session.
+    ///
+    /// Placeholder, see `UpgradeReq` for details. TODO: confirm via capture.
+    #[serde(rename = "ConfigFileInfo", skip_serializing_if = "Option::is_none")]
+    pub upgrade_req: Option<UpgradeReq>,
+    /// Restore-to-defaults / factory reset request.
+    ///
+    /// Placeholder, see `FactoryReset` for details. TODO: confirm via capture.
+    #[serde(rename = "Restore", skip_serializing_if = "Option::is_none")]
+    pub factory_reset: Option<FactoryReset>,
 }
 
 impl BcXml {
@@ -1620,6 +1630,87 @@ pub struct User {
     pub user_set_state: String,
 }
 
+// -- Device-lifecycle placeholders ------------------------------------------
+//
+// These XML payloads are placeholders for the firmware-upgrade and
+// factory-reset commands described in issue #14. The exact field names and
+// types have NOT been independently verified — they are best-guess shapes
+// derived from `dissector/baichuan.lua`, which labels:
+//
+//   cmd 65/66/67 -> `<ConfigFileInfo>` (Export / Import / FW Upgrade)
+//   cmd 99       -> `<Restore>` (factory default)
+//
+// All fields use `Option<...>` plus `skip_serializing_if` so that a future
+// capture can drop / rename individual fields without breaking the entire
+// struct's deserialization. See `docs/baichuan-lifecycle.md`.
+
+/// Begin / describe a firmware-upgrade upload session.
+///
+/// TODO: confirm via capture. Likely paired with cmd 67 (`MSG_ID_UPGRADE_BEGIN`)
+/// based on `dissector/baichuan.lua`. The field shape below is a guess — at
+/// minimum a length and integrity hash are expected; the Reolink app's
+/// `.pak` format includes its own internal header so the wrapping XML may
+/// be quite small.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct UpgradeReq {
+    /// XML version, typically "1.1"
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// Channel id (likely 0 for non-NVR cameras). TODO: confirm.
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Total size in bytes of the firmware payload. TODO: confirm field name.
+    #[serde(rename = "fileSize", skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+    /// SHA-256 of the firmware payload, lowercase hex. TODO: confirm field name
+    /// and whether SHA-256 (rather than MD5) is even what the camera expects.
+    #[serde(rename = "sha256", skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Optional file name. TODO: confirm.
+    #[serde(rename = "fileName", skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+}
+
+/// Chunk-level metadata for a single frame of a firmware upload.
+///
+/// TODO: confirm via capture. The streaming frames may be pure binary (no
+/// XML extension at all) using the `0x6482` file-download message class, in
+/// which case this struct is unused on the wire and only kept as
+/// documentation of the conjectured shape.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct UpgradeData {
+    /// XML version, typically "1.1"
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// Sequential chunk index, starting at 0. TODO: confirm.
+    #[serde(rename = "seq", skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u32>,
+    /// Offset in bytes of this chunk within the full firmware payload.
+    /// TODO: confirm.
+    #[serde(rename = "offset", skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    /// Length in bytes of this chunk. TODO: confirm.
+    #[serde(rename = "length", skip_serializing_if = "Option::is_none")]
+    pub length: Option<u32>,
+}
+
+/// Restore-to-defaults / factory reset payload.
+///
+/// TODO: confirm via capture. Dissector labels cmd 99 as `<Restore>`. The
+/// "keep network settings" flag is a guess based on what the Reolink mobile
+/// app exposes; the actual XML may simply be empty (header-only).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct FactoryReset {
+    /// XML version, typically "1.1"
+    #[serde(rename = "@version")]
+    pub version: String,
+    /// If `1`, attempt to preserve network configuration across the reset.
+    /// If `0` (the camera default), wipe everything. TODO: confirm field
+    /// name; the real field may not exist at all.
+    #[serde(rename = "keepNetwork", skip_serializing_if = "Option::is_none")]
+    pub keep_network: Option<u8>,
+}
+
 /// Convience function to return the xml version used throughout the library
 pub fn xml_ver() -> String {
     "1.1".to_string()
@@ -1944,6 +2035,95 @@ fn test_enc3_extension() {
         } => {}
         _ => panic!(),
     }
+}
+
+#[test]
+fn test_upgrade_req_roundtrip_placeholder() {
+    // NOTE: this verifies our placeholder UpgradeReq struct round-trips
+    // through quick-xml; it does NOT claim this is the real wire format.
+    // See docs/baichuan-lifecycle.md.
+    let req = UpgradeReq {
+        version: "1.1".to_string(),
+        channel_id: Some(0),
+        file_size: Some(1234567),
+        sha256: Some("deadbeef".to_string()),
+        file_name: Some("camera.pak".to_string()),
+    };
+    let xml = BcXml {
+        upgrade_req: Some(req),
+        ..Default::default()
+    };
+    let buf = xml.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(buf.as_slice()).unwrap();
+    let p = parsed.upgrade_req.as_ref().expect("UpgradeReq round-trips");
+    assert_eq!(p.version, "1.1");
+    assert_eq!(p.channel_id, Some(0));
+    assert_eq!(p.file_size, Some(1234567));
+    assert_eq!(p.sha256.as_deref(), Some("deadbeef"));
+    assert_eq!(p.file_name.as_deref(), Some("camera.pak"));
+}
+
+#[test]
+fn test_upgrade_req_optional_fields_are_skipped() {
+    // None fields must not appear in the serialized XML so a future
+    // capture-driven schema change can drop them without breaking the
+    // wire format.
+    let req = UpgradeReq {
+        version: "1.1".to_string(),
+        channel_id: None,
+        file_size: Some(42),
+        sha256: None,
+        file_name: None,
+    };
+    let xml = BcXml {
+        upgrade_req: Some(req),
+        ..Default::default()
+    };
+    let buf = xml.serialize(vec![]).unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    assert!(s.contains("<ConfigFileInfo"));
+    assert!(s.contains("<fileSize>42</fileSize>"));
+    assert!(!s.contains("<channelId"));
+    assert!(!s.contains("<sha256"));
+    assert!(!s.contains("<fileName"));
+}
+
+#[test]
+fn test_factory_reset_roundtrip_placeholder() {
+    // NOTE: placeholder, see docs/baichuan-lifecycle.md.
+    let fr = FactoryReset {
+        version: "1.1".to_string(),
+        keep_network: Some(1),
+    };
+    let xml = BcXml {
+        factory_reset: Some(fr),
+        ..Default::default()
+    };
+    let buf = xml.serialize(vec![]).unwrap();
+    let parsed = BcXml::try_parse(buf.as_slice()).unwrap();
+    let p = parsed
+        .factory_reset
+        .as_ref()
+        .expect("FactoryReset round-trips");
+    assert_eq!(p.version, "1.1");
+    assert_eq!(p.keep_network, Some(1));
+}
+
+#[test]
+fn test_factory_reset_default_omits_keep_network() {
+    // When keep_network is None the field must not appear in the XML.
+    let fr = FactoryReset {
+        version: "1.1".to_string(),
+        keep_network: None,
+    };
+    let xml = BcXml {
+        factory_reset: Some(fr),
+        ..Default::default()
+    };
+    let buf = xml.serialize(vec![]).unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    assert!(s.contains("<Restore"));
+    assert!(!s.contains("keepNetwork"));
 }
 
 #[test]
