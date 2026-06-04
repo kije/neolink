@@ -6,9 +6,31 @@
 use crate::bc::model::*;
 use crate::bc::xml::*;
 use crate::{Credentials, Error, Result};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use nom::AsBytes;
 use tokio_util::codec::{Decoder, Encoder};
+
+/// On-wire byte pattern for the reversed magic (`MAGIC_HEADER_REV` in LE).
+/// Used by the reverse-magic recovery path.
+pub(crate) const MAGIC_HEADER_REV_BYTES: [u8; 4] = [0xa0, 0xcb, 0xed, 0x0f];
+/// On-wire byte pattern for the forward magic (`MAGIC_HEADER` in LE).
+pub(crate) const MAGIC_HEADER_BYTES: [u8; 4] = [0xf0, 0xde, 0xbc, 0x0a];
+
+/// If the buffer starts with the reversed-magic byte sequence and a forward
+/// magic appears later in the same buffer, returns the number of bytes that
+/// must be discarded to land on that forward magic. Otherwise returns `None`.
+pub(crate) fn find_next_forward_magic_after_reverse(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 4 || buf[0..4] != MAGIC_HEADER_REV_BYTES {
+        return None;
+    }
+    // Scan starting from byte 1 — the camera occasionally emits two reversed
+    // magic markers back-to-back, so we want to land on the *forward* one.
+    buf.windows(4)
+        .enumerate()
+        .skip(1)
+        .find(|(_, w)| *w == MAGIC_HEADER_BYTES)
+        .map(|(i, _)| i)
+}
 
 pub(crate) struct BcCodex {
     context: BcContext,
@@ -85,12 +107,47 @@ impl Decoder for BcCodex {
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         // trace!("Decoding: {:X?}", src);
-        let bc = Bc::deserialize(&self.context, src);
-        // trace!("As: {:?}", bc);
-        let bc = match bc {
-            Ok(bc) => bc,
-            Err(Error::NomIncomplete(_)) => return Ok(None),
-            Err(e) => return Err(e),
+        let bc = loop {
+            match Bc::deserialize(&self.context, src) {
+                Ok(bc) => break bc,
+                Err(Error::NomIncomplete(_)) => {
+                    // Need more bytes. Do *not* attempt reverse-magic recovery
+                    // here: `MAGIC_HEADER_REV` is itself an accepted header
+                    // start (some firmwares use it for snapshot replies), so a
+                    // legitimate reverse-magic frame that has only partially
+                    // arrived could coincidentally contain the forward-magic
+                    // byte sequence inside its not-yet-complete (binary) body.
+                    // Skipping to it would desync the stream. Wait for the rest
+                    // instead — we'll be called again once more data arrives.
+                    return Ok(None);
+                }
+                Err(e) => {
+                    // Reverse-magic recovery.
+                    //
+                    // Some firmwares emit a stray reversed-magic byte sequence
+                    // (`0xa0 0xcb 0xed 0x0f` on the wire — `MAGIC_HEADER_REV`
+                    // in LE) after large pushes. When the bogus "header" that
+                    // follows fails to parse, scan forward for the next forward
+                    // magic and resume from there. We only do this on a hard
+                    // parse error (never on `NomIncomplete`, see above) so we
+                    // can't skip into a frame that simply hasn't fully arrived.
+                    //
+                    // Looped rather than recursive so a stream with many
+                    // back-to-back desyncs can't blow the stack.
+                    //
+                    // Mirrors `nodelink-js`'s `BC_MAGIC_REV` handling in
+                    // `framing.ts`.
+                    if let Some(skip) = find_next_forward_magic_after_reverse(src) {
+                        log::warn!(
+                            "Reverse-magic desync detected; skipping {} bytes to next forward magic",
+                            skip
+                        );
+                        src.advance(skip);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         };
         // Update context
         if let Bc {
@@ -148,5 +205,163 @@ impl Decoder for BcCodex {
         }
 
         Ok(Some(bc))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bc::de::needs_xor_fallback;
+
+    #[test]
+    fn xor_fallback_only_triggers_on_aes() {
+        let garbage = b"\xff\xee\xdd\xcc some non-XML bytes";
+        assert!(!needs_xor_fallback(
+            &EncryptionProtocol::Unencrypted,
+            garbage
+        ));
+        assert!(!needs_xor_fallback(&EncryptionProtocol::BCEncrypt, garbage));
+        // AES with non-XML payload -> fallback wanted.
+        let aes = EncryptionProtocol::aes([0u8; 16]);
+        assert!(needs_xor_fallback(&aes, garbage));
+        // AES with XML payload -> no fallback.
+        assert!(!needs_xor_fallback(&aes, b"<?xml version=\"1.0\"?><Bc/>"));
+        // AES with leading whitespace + XML -> no fallback.
+        assert!(!needs_xor_fallback(&aes, b"  <Bc/>"));
+        // AES with UTF-8 BOM + XML -> no fallback.
+        assert!(!needs_xor_fallback(&aes, b"\xef\xbb\xbf<Bc/>"));
+        // Empty AES payload — nothing to fall back to.
+        assert!(!needs_xor_fallback(&aes, b""));
+    }
+
+    #[test]
+    fn aes_fallback_decodes_xor_encoded_frame() {
+        // Build a frame as the camera would emit it under BC-XOR for a
+        // login-success (msg_id=1, response_code=200). Then feed it through
+        // the codec while the codec believes AES is in effect — the
+        // fallback path should still parse the XML.
+        let xml_payload = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<DeviceInfo version=\"1.1\">\n<resolution>\n<resolutionName>2304*1296</resolutionName>\n<width>2304</width>\n<height>1296</height>\n</resolution>\n</DeviceInfo>\n</body>\n";
+        let body = EncryptionProtocol::BCEncrypt.encrypt(0, xml_payload.as_bytes());
+        let body_len = body.len() as u32;
+        // Header (class 0x0000, has payload_offset = 0, no extension).
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MAGIC_HEADER_BYTES);
+        frame.extend_from_slice(&1u32.to_le_bytes()); // msg_id
+        frame.extend_from_slice(&body_len.to_le_bytes()); // body_len
+        frame.push(0u8); // channel_id
+        frame.push(0u8); // stream_type
+        frame.extend_from_slice(&0u16.to_le_bytes()); // msg_num
+        frame.extend_from_slice(&200u16.to_le_bytes()); // response_code
+        frame.extend_from_slice(&0u16.to_le_bytes()); // class
+        frame.extend_from_slice(&0u32.to_le_bytes()); // payload_offset
+        frame.extend_from_slice(&body);
+
+        // Codec primed with AES, but the body is BC-XOR. The fallback should
+        // kick in and return a valid parsed Bc.
+        let mut codex = BcCodex::new(Credentials::default());
+        codex
+            .context
+            .set_encrypted(EncryptionProtocol::aes([0u8; 16]));
+        let mut buf = BytesMut::from(frame.as_slice());
+        let result = codex
+            .decode(&mut buf)
+            .expect("decode should succeed via XOR fallback")
+            .expect("frame should be fully parsed");
+        assert_eq!(result.meta.msg_id, 1);
+        assert_eq!(result.meta.response_code, 200);
+    }
+
+    /// A complete reverse-magic modern frame whose (unencrypted) body is not
+    /// valid XML. This parses far enough to consume the header but then fails
+    /// the payload XML parse with a *hard* error — exactly the desync signal
+    /// the recovery path keys on (as opposed to `NomIncomplete`).
+    fn bogus_reverse_magic_frame() -> Vec<u8> {
+        let body = b"junk"; // not XML -> hard parse error
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MAGIC_HEADER_REV_BYTES);
+        frame.extend_from_slice(&99u32.to_le_bytes()); // msg_id (not login)
+        frame.extend_from_slice(&(body.len() as u32).to_le_bytes()); // body_len
+        frame.push(0u8); // channel_id
+        frame.push(0u8); // stream_type
+        frame.extend_from_slice(&0u16.to_le_bytes()); // msg_num
+        frame.extend_from_slice(&0u16.to_le_bytes()); // response_code
+        frame.extend_from_slice(&0u16.to_le_bytes()); // class
+        frame.extend_from_slice(&0u32.to_le_bytes()); // payload_offset
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    #[test]
+    fn reverse_magic_recovery_skips_to_next_forward_magic() {
+        // Build a "desync" stream: a complete-but-garbage reverse-magic frame
+        // that hard-errors on parse, then a real forward-magic frame.
+        //
+        // We piggy-back on the well-known `modern_login_failed.bin` sample,
+        // which is a header-only modern message (body_len == 0). That gives
+        // us a real frame we can confidently round-trip.
+        let real_frame = include_bytes!("samples/modern_login_failed.bin").to_vec();
+
+        let mut stream = bogus_reverse_magic_frame();
+        stream.extend_from_slice(&real_frame);
+
+        let mut codex = BcCodex::new(Credentials::default());
+        codex.context.set_encrypted(EncryptionProtocol::Unencrypted);
+        let mut buf = BytesMut::from(stream.as_slice());
+        let result = codex
+            .decode(&mut buf)
+            .expect("decode should succeed after skipping desync")
+            .expect("frame should be fully parsed");
+        assert_eq!(result.meta.msg_id, 1); // MSG_ID_LOGIN
+        assert_eq!(result.meta.response_code, 400);
+    }
+
+    #[test]
+    fn incomplete_reverse_magic_frame_is_not_skipped() {
+        // A reverse-magic header that declares a body larger than what has
+        // arrived must yield `NomIncomplete` -> `Ok(None)` (wait for more),
+        // *not* trigger recovery. Otherwise a legitimate, partially-arrived
+        // reverse-magic frame whose tail happens to contain the forward-magic
+        // bytes would be skipped into and desync the stream.
+        let mut partial = Vec::new();
+        partial.extend_from_slice(&MAGIC_HEADER_REV_BYTES);
+        partial.extend_from_slice(&99u32.to_le_bytes()); // msg_id
+        partial.extend_from_slice(&4096u32.to_le_bytes()); // body_len >> available
+        partial.push(0u8); // channel_id
+        partial.push(0u8); // stream_type
+        partial.extend_from_slice(&0u16.to_le_bytes()); // msg_num
+        partial.extend_from_slice(&0u16.to_le_bytes()); // response_code
+        partial.extend_from_slice(&0u16.to_le_bytes()); // class
+        partial.extend_from_slice(&0u32.to_le_bytes()); // payload_offset
+                                                        // A forward-magic sequence sitting in the not-yet-complete body: this
+                                                        // must be ignored, not treated as a resync point.
+        partial.extend_from_slice(&MAGIC_HEADER_BYTES);
+
+        let mut codex = BcCodex::new(Credentials::default());
+        codex.context.set_encrypted(EncryptionProtocol::Unencrypted);
+        let mut buf = BytesMut::from(partial.as_slice());
+        let before = buf.len();
+        let result = codex.decode(&mut buf).expect("incomplete should be Ok");
+        assert!(
+            result.is_none(),
+            "incomplete frame should wait for more data"
+        );
+        assert_eq!(buf.len(), before, "no bytes should be consumed/skipped");
+    }
+
+    #[test]
+    fn find_next_forward_magic_returns_none_when_no_reverse_prefix() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC_HEADER_BYTES);
+        buf.extend_from_slice(b"junk");
+        assert_eq!(find_next_forward_magic_after_reverse(&buf), None);
+    }
+
+    #[test]
+    fn find_next_forward_magic_returns_offset() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC_HEADER_REV_BYTES);
+        buf.extend_from_slice(b"AAA");
+        buf.extend_from_slice(&MAGIC_HEADER_BYTES);
+        assert_eq!(find_next_forward_magic_after_reverse(&buf), Some(7));
     }
 }
