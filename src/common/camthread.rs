@@ -1,7 +1,7 @@
 use std::sync::{Arc, Weak};
 use tokio::{
     sync::watch::{Receiver as WatchReceiver, Sender as WatchSender},
-    time::{interval, sleep, timeout, Duration, Instant},
+    time::{sleep, timeout, Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -60,33 +60,58 @@ impl NeoCamThread {
                 Ok(())
             },
             v = async {
-                let mut interval = interval(Duration::from_secs(5));
-                let mut missed_pings = 0;
+                // Drive the ping loop off `AdaptiveKeepalive` instead of a
+                // fixed 5 s tick. On each iteration we:
+                //   1. Ask the policy for the next interval.
+                //   2. Sleep that long, then send a ping.
+                //   3. On success, feed `notice_stable_period(silence)` so
+                //      the policy can walk the cadence back towards the
+                //      default after sustained stability.
+                //   4. On a hard failure / repeated timeout, feed
+                //      `notice_disconnect(silence)` so the policy ratchets
+                //      the next cadence down to `max(min, silence - 2)`.
+                let policy = camera.keepalive_policy();
+                let mut last_recv = Instant::now();
+                let mut missed_pings = 0u32;
                 loop {
-                    interval.tick().await;
+                    let interval = policy.lock().unwrap().next_interval();
+                    sleep(interval).await;
                     log::trace!("Sending ping");
+                    let ping_started = Instant::now();
                     match timeout(Duration::from_secs(5), camera.get_linktype()).await {
                         Ok(Ok(_)) => {
+                            let stable_secs =
+                                ping_started.duration_since(last_recv).as_secs();
+                            policy.lock().unwrap().notice_stable_period(stable_secs);
                             log::trace!("Ping reply");
                             missed_pings = 0;
-                            continue
-                        },
+                            last_recv = Instant::now();
+                            continue;
+                        }
                         Ok(Err(neolink_core::Error::UnintelligibleReply { reply, why })) => {
-                            // Camera does not support pings just wait forever
+                            // Camera does not support pings — wait forever.
                             log::trace!("Pings not supported: {reply:?}: {why}");
                             futures::future::pending().await
-                        },
+                        }
                         Ok(Err(e)) => {
+                            let silence_secs =
+                                ping_started.duration_since(last_recv).as_secs();
+                            policy.lock().unwrap().notice_disconnect(silence_secs);
                             break Err(e.into());
-                        },
+                        }
                         Err(_) => {
-                            // Timeout
+                            // Timeout — five strikes before declaring dead.
                             if missed_pings < 5 {
                                 missed_pings += 1;
                                 continue;
                             } else {
+                                let silence_secs =
+                                    ping_started.duration_since(last_recv).as_secs();
+                                policy.lock().unwrap().notice_disconnect(silence_secs);
                                 log::error!("Timed out waiting for camera ping reply");
-                                break Err(anyhow::anyhow!("Timed out waiting for camera ping reply"));
+                                break Err(anyhow::anyhow!(
+                                    "Timed out waiting for camera ping reply"
+                                ));
                             }
                         }
                     }

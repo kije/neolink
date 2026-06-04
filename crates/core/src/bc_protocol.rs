@@ -89,7 +89,7 @@ pub struct BcCamera {
     keepalive_policy: Mutex<keepalive::AdaptiveKeepalive>,
     /// Battery-camera idle-close lifecycle. Drives the "5s after the last
     /// in-flight command, close the TCP socket" pattern from `reolink_aio`.
-    battery_lifecycle: battery_lifecycle::BatteryLifecycle,
+    battery_lifecycle: Arc<battery_lifecycle::BatteryLifecycle>,
     #[allow(dead_code)]
     cancel: CancellationToken,
 }
@@ -366,7 +366,8 @@ impl BcCamera {
             }
         };
 
-        let conn = BcConnection::new(sink, source).await?;
+        let battery_lifecycle = Arc::new(battery_lifecycle::BatteryLifecycle::new());
+        let conn = BcConnection::new(sink, source, battery_lifecycle.clone()).await?;
 
         trace!("Success");
         let me = Self {
@@ -377,7 +378,7 @@ impl BcCamera {
             credentials: Credentials::new(username, passwd),
             abilities: Default::default(),
             keepalive_policy: Mutex::new(keepalive::AdaptiveKeepalive::default()),
-            battery_lifecycle: battery_lifecycle::BatteryLifecycle::new(),
+            battery_lifecycle,
             cancel: CancellationToken::new(),
         };
         me.keepalive().await?;
@@ -440,7 +441,7 @@ impl BcCamera {
     ///
     /// For non-battery cameras the lifecycle stays disabled and is a
     /// no-op; battery cameras enable it after observing `DeviceInfo.sleep`.
-    pub fn battery_lifecycle(&self) -> &battery_lifecycle::BatteryLifecycle {
+    pub fn battery_lifecycle(&self) -> &Arc<battery_lifecycle::BatteryLifecycle> {
         &self.battery_lifecycle
     }
 
