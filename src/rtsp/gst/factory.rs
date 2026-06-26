@@ -139,8 +139,24 @@ impl NeoMediaFactoryImpl {
 impl ObjectImpl for NeoMediaFactoryImpl {}
 impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
     fn create_element(&self, url: &RTSPUrl) -> Option<Element> {
-        self.parent_create_element(url)
-            .and_then(|orig| self.build_pipeline(orig).expect("Could not build pipeline"))
+        // Build the placeholder/real pipeline from the parent's parsed launch
+        // line. If we cannot build a real pipeline yet (the camera is
+        // restarting / not ready / no callback set), we must NOT return `None`.
+        //
+        // Returning a NULL element here makes gst-rtsp-server abort the media
+        // construction and emit, on *every* client connection:
+        //   GLib-GObject-CRITICAL  g_object_force_floating: assertion 'G_IS_OBJECT (object)' failed
+        //   GStreamer-RTSP-Server-CRITICAL  could not create element
+        // The connecting client then receives a 503 and immediately retries,
+        // producing a tight error-spam loop. Instead we fall back to the
+        // parent's "Stream not Ready" splash pipeline so the client stays
+        // connected and simply sees the placeholder until the real stream
+        // becomes available.
+        let orig = self.parent_create_element(url)?;
+        self.build_pipeline(orig)
+            .ok()
+            .flatten()
+            .or_else(|| self.parent_create_element(url))
     }
 }
 

@@ -1,9 +1,9 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
-use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_app::{AppLeakyType, AppSrc, AppSrcCallbacks, AppStreamType};
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
@@ -248,28 +248,15 @@ pub(super) async fn make_factory(
                         // This is not an async thread
                         std::thread::spawn(move || {
                             let mut tracker = TimestampTracker::new();
-                            let mut pools = Default::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
-                                send_to_sources(
-                                    buffered,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut tracker,
-                                )?;
+                                send_to_sources(buffered, &vid_src, &aud_src, &mut tracker)?;
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
                             while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
-                                    data,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut tracker,
-                                );
+                                let r = send_to_sources(data, &vid_src, &aud_src, &mut tracker);
                                 if let Err(r) = &r {
                                     log::info!("Failed to send to source: {r:?}");
                                 }
@@ -300,7 +287,6 @@ pub(super) async fn make_factory(
 
 fn send_to_sources(
     data: BcMedia,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     tracker: &mut TimestampTracker,
@@ -311,7 +297,7 @@ fn send_to_sources(
             let ts_us = tracker.next_audio_us(duration);
             if let Some(aud_src) = aud_src.as_ref() {
                 log::debug!("Sending AAC: {:?}", Duration::from_micros(ts_us));
-                send_to_appsrc(aud_src, aac.data, Duration::from_micros(ts_us), pools)?;
+                send_to_appsrc(aud_src, aac.data, Duration::from_micros(ts_us))?;
             }
         }
         BcMedia::Adpcm(adpcm) => {
@@ -321,7 +307,7 @@ fn send_to_sources(
             let ts_us = tracker.next_audio_us(duration);
             if let Some(aud_src) = aud_src.as_ref() {
                 log::trace!("Sending ADPCM: {:?}", Duration::from_micros(ts_us));
-                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(ts_us), pools)?;
+                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(ts_us))?;
             }
         }
         BcMedia::Iframe(BcMediaIframe {
@@ -346,7 +332,7 @@ fn send_to_sources(
                 );
             }
             if let Some(vid_src) = vid_src.as_ref() {
-                send_to_appsrc(vid_src, data, Duration::from_micros(ts_us), pools)?;
+                send_to_appsrc(vid_src, data, Duration::from_micros(ts_us))?;
             }
         }
         BcMedia::Pframe(BcMediaPframe {
@@ -359,7 +345,7 @@ fn send_to_sources(
                 microseconds
             );
             if let Some(vid_src) = vid_src.as_ref() {
-                send_to_appsrc(vid_src, data, Duration::from_micros(ts_us), pools)?;
+                send_to_appsrc(vid_src, data, Duration::from_micros(ts_us))?;
             }
         }
         _ => {}
@@ -367,12 +353,7 @@ fn send_to_sources(
     Ok(())
 }
 
-fn send_to_appsrc(
-    appsrc: &AppSrc,
-    data: Vec<u8>,
-    mut ts: Duration,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
-) -> AnyResult<()> {
+fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     // In live mode we follow the advice in
@@ -395,69 +376,41 @@ fn send_to_appsrc(
             return Ok(());
         }
     }
-    let buf = {
-        let msg_size = data.len();
 
-        // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
+    // Wrap the frame bytes directly into a gstreamer buffer (zero-copy).
+    //
+    // This previously used a `HashMap<usize, BufferPool>` keyed by the frame
+    // length. Compressed video frame sizes vary continuously, so that map
+    // accumulated a separate, permanently-active `BufferPool` (each one
+    // preallocating several buffers of that exact size) for every unique
+    // frame size ever observed. Over a long-running stream that grows without
+    // bound and is the source of the reported memory leak. `from_mut_slice`
+    // hands the `Vec` straight to gstreamer with no pool and no extra copy.
+    let mut buf = gstreamer::Buffer::from_mut_slice(data);
+    {
+        let buf_mut = buf
+            .get_mut()
+            .expect("freshly created buffer is uniquely owned");
+        let time = ClockTime::from_useconds(ts.as_micros() as u64);
+        buf_mut.set_dts(time);
+        buf_mut.set_pts(time);
+    }
 
-        // Get a buffer from the pool and then copy in the data
-        let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
-            let time = ClockTime::from_useconds(ts.as_micros() as u64);
-            gst_buf_mut.set_dts(time);
-            gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-            gst_buf_data.copy_from_slice(data.as_slice());
-            drop(gst_buf_data);
-            new_buf
-        };
-
-        // Return the new buffer with the data
-        gst_buf
-    };
-
-    // Push buffer into the appsrc
+    // Push buffer into the appsrc. Back-pressure is handled by the appsrc
+    // itself: it is configured with `leaky-type=downstream` and a bounded
+    // `max-bytes` (see the appsrc setup in the `pipe_*` builders), so when a
+    // slow client cannot keep up the oldest queued frames are dropped rather
+    // than the queue (and our memory) growing without bound.
     match appsrc.push_buffer(buf) {
-        Ok(_) => {
-            // log::info!(
-            //     "Send {}{} on {}",
-            //     data.data.len(),
-            //     if data.keyframe { " (keyframe)" } else { "" },
-            //     appsrc.name()
-            // );
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(FlowError::Flushing) => {
-            // Buffer is full just skip
-            log::info!(
-                "Buffer full on {} pausing stream until client consumes frames",
-                appsrc.name()
-            );
+            // The pad is flushing (the media is being reconfigured or torn
+            // down); drop this frame.
+            log::debug!("{}: dropping frame while appsrc is flushing", appsrc.name());
             Ok(())
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
-    }?;
-    // Check if we need to pause
-    if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Paused)
-    {
-        appsrc.set_state(gstreamer::State::Playing).unwrap();
-    } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Playing)
-    {
-        appsrc.set_state(gstreamer::State::Paused).unwrap();
     }
-    Ok(())
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
@@ -542,6 +495,10 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // Bound memory use under a slow/stalled client: once `max-bytes` is
+    // reached the appsrc drops the oldest queued frames instead of letting
+    // its internal queue grow without limit.
+    source.set_leaky_type(AppLeakyType::Downstream);
 
     let source = source
         .dynamic_cast::<Element>()
@@ -593,6 +550,10 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // Bound memory use under a slow/stalled client: once `max-bytes` is
+    // reached the appsrc drops the oldest queued frames instead of letting
+    // its internal queue grow without limit.
+    source.set_leaky_type(AppLeakyType::Downstream);
 
     let source = source
         .dynamic_cast::<Element>()
@@ -646,6 +607,10 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // Bound memory use under a slow/stalled client: once `max-bytes` is
+    // reached the appsrc drops the oldest queued frames instead of letting
+    // its internal queue grow without limit.
+    source.set_leaky_type(AppLeakyType::Downstream);
 
     let source = source
         .dynamic_cast::<Element>()
@@ -732,6 +697,10 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // Bound memory use under a slow/stalled client: once `max-bytes` is
+    // reached the appsrc drops the oldest queued frames instead of letting
+    // its internal queue grow without limit.
+    source.set_leaky_type(AppLeakyType::Downstream);
 
     source.set_caps(Some(
         &Caps::builder("audio/x-adpcm")
@@ -804,6 +773,10 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // Bound memory use under a slow/stalled client: once `max-bytes` is
+    // reached the appsrc drops the oldest queued frames instead of letting
+    // its internal queue grow without limit.
+    source.set_leaky_type(AppLeakyType::Downstream);
 
     let source = source
         .dynamic_cast::<Element>()
