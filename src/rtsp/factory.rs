@@ -183,17 +183,26 @@ pub(super) async fn make_factory(
                         let mut frame_count = 0usize;
 
                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
-                            stream_config.update_from_media(&media);
-                            buffer.push(media);
-                            if frame_count > 10
-                                || (stream_config.vid_type.is_some()
-                                    && stream_config.aud_type.is_some())
-                            {
-                                break;
+                        // Bound stream-type negotiation. A slow or flaky camera that
+                        // never delivers frames must not hang this per-client task
+                        // forever holding `media_rx` / `element`; on timeout we build
+                        // with whatever we have learned so far (falling back to the
+                        // "Stream not Ready" splash when the video type is still
+                        // unknown).
+                        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                            while let Some(media) = media_rx.recv().await {
+                                stream_config.update_from_media(&media);
+                                buffer.push(media);
+                                if frame_count > 10
+                                    || (stream_config.vid_type.is_some()
+                                        && stream_config.aud_type.is_some())
+                                {
+                                    break;
+                                }
+                                frame_count += 1;
                             }
-                            frame_count += 1;
-                        }
+                        })
+                        .await;
 
                         log::trace!("{name}::{stream}: Building the pipeline");
                         // Build the right video pipeline
@@ -244,8 +253,9 @@ pub(super) async fn make_factory(
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
-                        // Run blocking code on a seperate thread
+                        // Run blocking code on a separate thread
                         // This is not an async thread
+                        let pump_handle = tokio::runtime::Handle::current();
                         std::thread::spawn(move || {
                             let mut tracker = TimestampTracker::new();
 
@@ -255,14 +265,44 @@ pub(super) async fn make_factory(
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(data, &vid_src, &aud_src, &mut tracker);
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                            loop {
+                                // Wait for the next frame, but wake periodically so we
+                                // notice the client disconnecting even when the camera
+                                // has stopped sending frames (e.g. motion paused).
+                                // Without this bound the thread parks on recv() forever
+                                // after the client leaves, pinning the AppSrcs and the
+                                // upstream camera session.
+                                match pump_handle.block_on(async {
+                                    tokio::time::timeout(Duration::from_secs(2), media_rx.recv())
+                                        .await
+                                }) {
+                                    Ok(Some(data)) => {
+                                        let r =
+                                            send_to_sources(data, &vid_src, &aud_src, &mut tracker);
+                                        if let Err(r) = &r {
+                                            log::info!("Failed to send to source: {r:?}");
+                                        }
+                                        r?;
+                                    }
+                                    // Channel closed: nothing more will arrive.
+                                    Ok(None) => break,
+                                    // No frame for a while: stop if the media has been
+                                    // torn down (i.e. the client disconnected). Log and
+                                    // break gracefully rather than `?`-ing the error
+                                    // away, since this thread's JoinHandle is discarded.
+                                    Err(_) => {
+                                        if let Some(src) = vid_src.as_ref().or(aud_src.as_ref()) {
+                                            if let Err(e) = check_live(src) {
+                                                log::debug!(
+                                                    "{name}::{stream}: Stopping frame pump: {e:?}"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
-                                r?;
                             }
-                            log::trace!("All media recieved");
+                            log::trace!("All media received");
                             AnyResult::Ok(())
                         });
                         AnyResult::Ok(())
