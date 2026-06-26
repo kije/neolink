@@ -253,7 +253,7 @@ pub(super) async fn make_factory(
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
-                        // Run blocking code on a seperate thread
+                        // Run blocking code on a separate thread
                         // This is not an async thread
                         let pump_handle = tokio::runtime::Handle::current();
                         std::thread::spawn(move || {
@@ -287,15 +287,22 @@ pub(super) async fn make_factory(
                                     // Channel closed: nothing more will arrive.
                                     Ok(None) => break,
                                     // No frame for a while: stop if the media has been
-                                    // torn down (i.e. the client disconnected).
+                                    // torn down (i.e. the client disconnected). Log and
+                                    // break gracefully rather than `?`-ing the error
+                                    // away, since this thread's JoinHandle is discarded.
                                     Err(_) => {
                                         if let Some(src) = vid_src.as_ref().or(aud_src.as_ref()) {
-                                            check_live(src)?;
+                                            if let Err(e) = check_live(src) {
+                                                log::debug!(
+                                                    "{name}::{stream}: Stopping frame pump: {e:?}"
+                                                );
+                                                break;
+                                            }
                                         }
                                     }
                                 }
                             }
-                            log::trace!("All media recieved");
+                            log::trace!("All media received");
                             AnyResult::Ok(())
                         });
                         AnyResult::Ok(())
