@@ -348,6 +348,19 @@ pub(crate) struct MqttConfig {
     #[serde(default = "default_2000")]
     pub(crate) floodlight_update: u64,
 
+    /// Enable the persistent push-event consumer (cmd 31 / channel 251).
+    ///
+    /// Surfaces AI-sub-type motion, smart-AI, day/night, channel-info, and
+    /// config-stale events from the camera onto MQTT topics under
+    /// `status/motion/{ai_type}`, `status/smart_ai/{type}`, `status/day_night`,
+    /// `status/channel_info`, and `status/config_stale/{cmd}`.
+    ///
+    /// Defaults to `true` for mains-powered cameras. Set to `false` on battery
+    /// cameras — the long-lived TCP socket required by the push channel keeps
+    /// the radio awake.
+    #[serde(default = "default_true")]
+    pub(crate) enable_push_events: bool,
+
     #[serde(default)]
     pub(crate) discovery: Option<MqttDiscoveryConfig>,
 }
@@ -387,6 +400,7 @@ fn default_mqtt() -> MqttConfig {
         preview_update: 2000,
         enable_floodlight: true,
         floodlight_update: 2000,
+        enable_push_events: true,
         discovery: Default::default(),
     }
 }
