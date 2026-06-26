@@ -242,7 +242,7 @@ mod tests {
         let mut t = TimestampTracker::new();
         assert_eq!(t.next_video_us(0x5000_0000), 0);
         let _ = t.next_video_us(0x5000_8235); // PTS 33_333
-        // 1st backward: transient reorder, nudge by 1μs.
+                                              // 1st backward: transient reorder, nudge by 1μs.
         let pts1 = t.next_video_us(0x100);
         assert_eq!(pts1, 33_333 + TIE_BREAKER_US);
         // 2nd consecutive backward: restart accepted, clamp advance.
@@ -273,7 +273,7 @@ mod tests {
         let mut t = TimestampTracker::new();
         assert_eq!(t.next_video_us(0x5000_0000), 0);
         let _ = t.next_video_us(0x5000_8235); // +33333 μs (≈30 fps)
-        // 1st post-restart frame looks like a reorder; 2nd confirms restart.
+                                              // 1st post-restart frame looks like a reorder; 2nd confirms restart.
         let pts1 = t.next_video_us(0x100);
         let pts2 = t.next_video_us(0x200);
         let pts3 = t.next_video_us(0x200 + 33_333);
@@ -294,7 +294,7 @@ mod tests {
         let mut t = TimestampTracker::new();
         let _ = t.next_video_us(1_000_000); // PTS 0
         let _ = t.next_video_us(1_033_333); // PTS 33_333
-        // First audio frame anchors to current video PTS.
+                                            // First audio frame anchors to current video PTS.
         assert_eq!(t.next_audio_us(20_000), 33_333);
         assert_eq!(t.next_audio_us(20_000), 53_333);
         // Video continues independently in the same domain.
