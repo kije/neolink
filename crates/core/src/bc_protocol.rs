@@ -33,6 +33,7 @@ mod reboot;
 mod resolution;
 mod services;
 mod siren;
+mod smart_ai;
 mod snap;
 mod stream;
 mod stream_info;
@@ -53,6 +54,7 @@ pub use pirstate::PirState;
 pub use ptz::Direction;
 pub use pushinfo::PhoneType;
 pub use resolution::*;
+pub use smart_ai::{SmartAiEvent, SmartAiKind, SmartAiPayload, SmartAiPush};
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind};
 
