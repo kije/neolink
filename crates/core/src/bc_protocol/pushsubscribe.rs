@@ -244,12 +244,18 @@ impl BcCamera {
                         }) = &bc.body {
                             if let Some(list) = xml.alarm_event_list.as_ref() {
                                 for ev in &list.alarm_events {
+                                    // Compute `ai_types` once and derive
+                                    // `active` from it — `is_active()` would
+                                    // otherwise re-parse the comma-separated
+                                    // AItype list per push.
+                                    let ai_types = ev.ai_types();
+                                    let active = ev.status != "none" || !ai_types.is_empty();
                                     out.push(PushEvent::Alarm {
                                         at: Instant::now(),
                                         channel_id: ev.channel_id,
                                         status: ev.status.clone(),
-                                        ai_types: ev.ai_types(),
-                                        active: ev.is_active(),
+                                        ai_types,
+                                        active,
                                     });
                                 }
                             }
@@ -354,7 +360,6 @@ where
 {
     let mut sub = connection.subscribe_to_id(msg_id).await?;
     loop {
-        tokio::task::yield_now().await;
         match sub.recv().await {
             Ok(bc) => {
                 let events = to_events(&bc);

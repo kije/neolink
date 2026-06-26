@@ -53,6 +53,13 @@ pub struct AdaptiveKeepalive {
     stability_recovery_secs: u64,
     /// True while at least one long-lived subscription is open.
     subscribed: bool,
+    /// Accumulated stable seconds since the last recovery step was
+    /// applied. Callers report stability in small increments (e.g.
+    /// the time between two successful pings, a few seconds each), so
+    /// without accumulation a single `stable_secs / stability_recovery_secs`
+    /// division would round to zero forever and the cadence would never
+    /// walk back up after a disconnect.
+    accumulated_stable_secs: u64,
 }
 
 impl Default for AdaptiveKeepalive {
@@ -81,6 +88,7 @@ impl AdaptiveKeepalive {
             min_secs,
             stability_recovery_secs,
             subscribed: false,
+            accumulated_stable_secs: 0,
         }
     }
 
@@ -95,14 +103,33 @@ impl AdaptiveKeepalive {
 
     /// Update subscription state.
     ///
-    /// Newly entering the subscribed state may immediately shorten the
-    /// cadence if the existing adapted value is larger than the new target.
+    /// * Entering subscribed mode immediately shortens the cadence to
+    ///   the (smaller) subscribed target if the current adapted value
+    ///   sits above it.
+    /// * Leaving subscribed mode lengthens the cadence back up to the
+    ///   (larger) idle target so the system stops pinging at the
+    ///   subscribed rate after the subscription is dropped.
+    ///
+    /// Any disconnect-driven ratchet history is intentionally discarded
+    /// on a transition — the ratchet adapts to the active cadence, and
+    /// observations from the old mode aren't a guide to the new one.
     pub fn set_subscribed(&mut self, subscribed: bool) {
+        let was = self.subscribed;
         self.subscribed = subscribed;
-        let target = self.target_secs();
-        if self.current_secs > target {
-            self.current_secs = target;
+        if was == subscribed {
+            return;
         }
+        let target = self.target_secs();
+        if subscribed {
+            // Shortening: clamp downward toward the new (smaller) target.
+            self.current_secs = self.current_secs.min(target);
+        } else {
+            // Lengthening: clamp upward toward the new (larger) target.
+            self.current_secs = self.current_secs.max(target);
+        }
+        // A mode change resets the stability accumulator so any pending
+        // recovery progress doesn't carry across regimes.
+        self.accumulated_stable_secs = 0;
     }
 
     /// Returns the interval that should be used for the next ping.
@@ -124,24 +151,36 @@ impl AdaptiveKeepalive {
         if proposed < self.current_secs {
             self.current_secs = proposed;
         }
+        // A disconnect means we are no longer accumulating stability.
+        // Reset so the next stable period has to clear a full window
+        // before stepping the cadence back up.
+        self.accumulated_stable_secs = 0;
     }
 
     /// Inform the scheduler that the connection has been stable for
-    /// `stable_secs` seconds. For every `stability_recovery_secs` of
-    /// uninterrupted stability we step the cadence one step back towards
-    /// the (subscription-dependent) target.
+    /// `stable_secs` seconds. Callers may report this in small
+    /// increments (e.g. the gap between two successful pings); the
+    /// scheduler accumulates internally and only steps the cadence
+    /// when the total crosses a `stability_recovery_secs` window.
     pub fn notice_stable_period(&mut self, stable_secs: u64) {
         if self.stability_recovery_secs == 0 {
             return;
         }
         let target = self.target_secs();
         if self.current_secs >= target {
+            // Already at target — drop any pending accumulator so a
+            // future disconnect ratchets from a clean slate.
+            self.accumulated_stable_secs = 0;
             return;
         }
-        let steps = stable_secs / self.stability_recovery_secs;
+        self.accumulated_stable_secs = self.accumulated_stable_secs.saturating_add(stable_secs);
+        let steps = self.accumulated_stable_secs / self.stability_recovery_secs;
         if steps == 0 {
             return;
         }
+        // Carry the remainder into the next accumulation window so we
+        // don't lose fractional progress.
+        self.accumulated_stable_secs %= self.stability_recovery_secs;
         let step = RECOVERY_STEP_SECS.max(1);
         let delta = steps.saturating_mul(step);
         self.current_secs = self.current_secs.saturating_add(delta).min(target);
@@ -150,6 +189,7 @@ impl AdaptiveKeepalive {
     /// Hard reset to default state. Useful at reconnect time.
     pub fn reset(&mut self) {
         self.current_secs = self.target_secs();
+        self.accumulated_stable_secs = 0;
     }
 }
 
@@ -272,6 +312,47 @@ mod tests {
         ka.notice_disconnect(11); // -> 9
         assert_eq!(ka.current_secs(), 9);
         ka.reset();
+        assert_eq!(ka.current_secs(), DEFAULT_KEEPALIVE_IDLE_SECS);
+    }
+
+    #[test]
+    fn small_stable_increments_accumulate_to_a_step() {
+        // Real callers report a few seconds at a time (e.g. the gap
+        // between successive successful pings). Verify the accumulator
+        // crosses a 1h boundary regardless of granularity.
+        let mut ka = AdaptiveKeepalive::default();
+        ka.set_subscribed(true);
+        ka.notice_disconnect(15); // -> 13
+                                  // 720 calls of 5s each = 3600s cumulative.
+        for _ in 0..720 {
+            ka.notice_stable_period(5);
+        }
+        assert_eq!(ka.current_secs(), 14);
+    }
+
+    #[test]
+    fn disconnect_resets_stability_accumulator() {
+        // A near-full window of stability followed by a disconnect must
+        // NOT immediately step the cadence on the very next small
+        // stability report.
+        let mut ka = AdaptiveKeepalive::default();
+        ka.set_subscribed(true);
+        ka.notice_disconnect(15); // -> 13
+        ka.notice_stable_period(STABILITY_RECOVERY_SECS - 5); // 3595 accumulated
+        ka.notice_disconnect(15); // resets accumulator
+        ka.notice_stable_period(10);
+        assert_eq!(ka.current_secs(), 13);
+    }
+
+    #[test]
+    fn unsubscribe_lengthens_to_idle_target() {
+        // After dropping a long-lived subscription the cadence must
+        // walk back up to the idle target; otherwise we keep pinging
+        // at the subscribed rate forever.
+        let mut ka = AdaptiveKeepalive::default();
+        ka.set_subscribed(true);
+        assert_eq!(ka.current_secs(), 30);
+        ka.set_subscribed(false);
         assert_eq!(ka.current_secs(), DEFAULT_KEEPALIVE_IDLE_SECS);
     }
 }

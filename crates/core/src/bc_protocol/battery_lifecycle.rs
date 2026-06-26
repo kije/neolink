@@ -126,8 +126,8 @@ impl BatteryLifecycle {
     /// Record that a command is in-flight. Returns a guard that decrements
     /// the count when dropped.
     ///
-    /// `cmd_id == 0` and non-waking commands are not counted, so they
-    /// neither prevent nor reset the idle close timer.
+    /// Non-waking commands (see [`NONE_WAKING_COMMANDS`]) are not counted,
+    /// so they neither prevent nor reset the idle close timer.
     pub fn track(&self, cmd_id: u32) -> InFlightGuard<'_> {
         let counted = !is_non_waking(cmd_id);
         if counted {

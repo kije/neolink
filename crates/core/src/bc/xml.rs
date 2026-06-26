@@ -727,10 +727,12 @@ impl AlarmEvent {
 /// case-insensitive but the canonical output is the lower-case Reolink
 /// spelling.
 pub fn normalize_ai_type(raw: &str) -> &str {
-    match raw {
-        "person" => "people",
-        "pet" => "dog_cat",
-        _ => raw,
+    if raw.eq_ignore_ascii_case("person") {
+        "people"
+    } else if raw.eq_ignore_ascii_case("pet") {
+        "dog_cat"
+    } else {
+        raw
     }
 }
 
@@ -2324,6 +2326,12 @@ fn test_normalize_ai_type() {
     assert_eq!(normalize_ai_type("dog_cat"), "dog_cat");
     // Unknown values pass through.
     assert_eq!(normalize_ai_type("unicorn"), "unicorn");
+    // Case-insensitive: mixed-case canonical inputs still get mapped.
+    assert_eq!(normalize_ai_type("Person"), "people");
+    assert_eq!(normalize_ai_type("PERSON"), "people");
+    assert_eq!(normalize_ai_type("PeRsOn"), "people");
+    assert_eq!(normalize_ai_type("Pet"), "dog_cat");
+    assert_eq!(normalize_ai_type("PET"), "dog_cat");
 }
 
 #[test]

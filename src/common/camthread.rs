@@ -73,7 +73,12 @@ impl NeoCamThread {
                 // We re-read the policy every tick so changes flow
                 // through within one ping interval at worst.
                 let mut missed_pings = 0;
-                let last_disconnect_start = Instant::now();
+                // `last_disconnect_start` is `None` while pings are succeeding,
+                // and `Some(instant)` from the moment the *first* ping timeout /
+                // error is observed. This way `silence_secs` reflects time since
+                // the connection actually went silent — not time since thread
+                // start.
+                let mut last_disconnect_start: Option<Instant> = None;
                 let mut last_successful = Instant::now();
                 loop {
                     let interval_dur = camera
@@ -97,6 +102,11 @@ impl NeoCamThread {
                         Ok(Ok(_)) => {
                             log::trace!("Ping reply");
                             missed_pings = 0;
+                            // Connection is alive again — close out any
+                            // disconnect window we were tracking so a later
+                            // failure measures silence from *its* first miss
+                            // rather than this point in time.
+                            last_disconnect_start = None;
                             // Tell the policy we are still alive.
                             let stable_secs = last_successful.elapsed().as_secs();
                             last_successful = Instant::now();
@@ -113,19 +123,29 @@ impl NeoCamThread {
                         Ok(Err(e)) => {
                             // Note disconnect *before* bubbling so the policy
                             // ratchets down for the reconnect attempt.
-                            let silence_secs = last_disconnect_start.elapsed().as_secs();
+                            let silence_start = *last_disconnect_start
+                                .get_or_insert_with(Instant::now);
+                            let silence_secs = silence_start.elapsed().as_secs();
                             if let Ok(mut policy) = camera.keepalive_policy().lock() {
                                 policy.notice_disconnect(silence_secs);
                             }
                             break Err(e.into());
                         },
                         Err(_) => {
-                            // Timeout
+                            // Timeout. Start the disconnect window on the
+                            // FIRST timeout so `silence_secs` measures the
+                            // actual silent period, not time since thread
+                            // start / last successful ping.
+                            if last_disconnect_start.is_none() {
+                                last_disconnect_start = Some(Instant::now());
+                            }
                             if missed_pings < 5 {
                                 missed_pings += 1;
                                 continue;
                             } else {
-                                let silence_secs = last_disconnect_start.elapsed().as_secs();
+                                let silence_secs = last_disconnect_start
+                                    .map(|t| t.elapsed().as_secs())
+                                    .unwrap_or(0);
                                 if let Ok(mut policy) = camera.keepalive_policy().lock() {
                                     policy.notice_disconnect(silence_secs);
                                 }
