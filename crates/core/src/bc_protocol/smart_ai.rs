@@ -540,35 +540,47 @@ impl BcCamera {
 }
 
 fn extract_basic(msg: Bc, channel_id: u8) -> Option<SmartAiEvent> {
+    // `reolink_aio` takes the channel from the surrounding event element,
+    // not from inside `YoloDetectInfo`. Mirror that: filter by the message
+    // envelope's `BcMeta::channel_id` and populate `yolo.channel_id` from
+    // it so the SmartAiEvent shape stays stable for consumers.
+    let envelope_channel = msg.meta.channel_id;
+    if envelope_channel != channel_id {
+        return None;
+    }
     if let BcBody::ModernMsg(ModernMsg {
         payload:
             Some(BcPayloads::BcXml(BcXml {
-                yolo_detect_info: Some(yolo),
+                yolo_detect_info: Some(mut yolo),
                 ..
             })),
         ..
     }) = msg.body
     {
-        if yolo.channel_id == channel_id {
-            return Some(SmartAiEvent::YoloBasic(yolo));
-        }
+        yolo.channel_id = envelope_channel;
+        return Some(SmartAiEvent::YoloBasic(yolo));
     }
     None
 }
 
 fn extract_detail(msg: Bc, channel_id: u8) -> Option<SmartAiEvent> {
+    // See `extract_basic` — channel comes from the message envelope, not
+    // from inside `YoloWorldType`.
+    let envelope_channel = msg.meta.channel_id;
+    if envelope_channel != channel_id {
+        return None;
+    }
     if let BcBody::ModernMsg(ModernMsg {
         payload:
             Some(BcPayloads::BcXml(BcXml {
-                yolo_world_type: Some(yolo),
+                yolo_world_type: Some(mut yolo),
                 ..
             })),
         ..
     }) = msg.body
     {
-        if yolo.channel_id == channel_id {
-            return Some(SmartAiEvent::YoloDetailed(yolo));
-        }
+        yolo.channel_id = envelope_channel;
+        return Some(SmartAiEvent::YoloDetailed(yolo));
     }
     None
 }
@@ -681,6 +693,8 @@ mod tests {
                     ai_type: "people".into(),
                     sesensitivity: 50,
                     stay_time: Some(2),
+                    time_thresh: None,
+                    location: Some(0),
                     direction: Some(0),
                     index: Some(0),
                     name: Some("line1".into()),
@@ -702,6 +716,8 @@ mod tests {
                     ai_type: "vehicle".into(),
                     sesensitivity: 80,
                     stay_time: Some(3),
+                    time_thresh: Some(1),
+                    location: None,
                     index: Some(1),
                     name: Some("area1".into()),
                     region: Some("0,0;1,1;2,2;3,3".into()),
@@ -722,6 +738,8 @@ mod tests {
                     ai_type: "people".into(),
                     sesensitivity: 60,
                     stay_time: Some(30),
+                    time_thresh: None,
+                    location: None,
                     index: Some(0),
                     name: Some("area1".into()),
                     region: None,
@@ -742,6 +760,8 @@ mod tests {
                     ai_type: "package".into(),
                     sesensitivity: 70,
                     stay_time: Some(60),
+                    time_thresh: None,
+                    location: None,
                     index: Some(0),
                     name: Some("zone1".into()),
                     region: Some("polygon".into()),
@@ -762,6 +782,8 @@ mod tests {
                     ai_type: "package".into(),
                     sesensitivity: 50,
                     stay_time: Some(15),
+                    time_thresh: None,
+                    location: None,
                     index: Some(0),
                     name: Some("zone1".into()),
                     region: None,

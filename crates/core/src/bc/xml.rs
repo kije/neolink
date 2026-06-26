@@ -1658,8 +1658,9 @@ pub struct CrosslineDetection {
     /// Channel ID
     #[serde(rename = "channelId")]
     pub channel_id: u8,
-    /// List of detect zones
-    #[serde(default, rename = "smartDetect")]
+    /// List of detect zones. Wire name is `<crosslineDetectItem>`,
+    /// confirmed against `reolink_aio/baichuan/baichuan.py::_parse_smart_ai_settings`.
+    #[serde(default, rename = "crosslineDetectItem")]
     pub items: Vec<CrosslineDetectItem>,
 }
 
@@ -1671,8 +1672,10 @@ pub struct CrosslineDetectItem {
     /// Whether this zone is enabled (0 disabled, 1 enabled)
     pub enable: u32,
     /// Sub-type AI category (`people`, `vehicle`, `dog_cat`, ...).
+    /// Wire name is `<aiType>`, confirmed against
+    /// `reolink_aio/baichuan/baichuan.py::_parse_smart_ai_settings`.
     /// Use [`canonical_ai_type`] to normalize incoming names.
-    #[serde(rename = "type")]
+    #[serde(rename = "aiType")]
     pub ai_type: String,
     /// Sensitivity from 0-100. The misspelling matches what the
     /// camera actually emits and accepts on the wire.
@@ -1681,6 +1684,13 @@ pub struct CrosslineDetectItem {
     /// Stay-time threshold in seconds
     #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
     pub stay_time: Option<u32>,
+    /// Alternative wire field for the stay/trigger threshold seen on some
+    /// firmwares; some cameras emit this instead of (or alongside) `stayTime`.
+    #[serde(rename = "timeThresh", skip_serializing_if = "Option::is_none")]
+    pub time_thresh: Option<u32>,
+    /// Zone location (camera-specific positional id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<u32>,
     /// Direction the line must be crossed in.
     /// Observed values: 0 = both ways, 1 = A->B, 2 = B->A.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1706,8 +1716,9 @@ pub struct IntrusionDetection {
     /// Channel ID
     #[serde(rename = "channelId")]
     pub channel_id: u8,
-    /// List of detect zones
-    #[serde(default, rename = "smartDetect")]
+    /// List of detect zones. Wire name is `<intrusionDetectItem>`,
+    /// confirmed against `reolink_aio/baichuan/baichuan.py::_parse_smart_ai_settings`.
+    #[serde(default, rename = "intrusionDetectItem")]
     pub items: Vec<IntrusionDetectItem>,
 }
 
@@ -1718,8 +1729,8 @@ pub struct IntrusionDetection {
 pub struct IntrusionDetectItem {
     /// Whether this zone is enabled (0/1)
     pub enable: u32,
-    /// AI category for this zone
-    #[serde(rename = "type")]
+    /// AI category for this zone. Wire name is `<aiType>`.
+    #[serde(rename = "aiType")]
     pub ai_type: String,
     /// Sensitivity 0-100 (Reolink misspelling preserved)
     #[serde(rename = "sesensitivity")]
@@ -1727,6 +1738,12 @@ pub struct IntrusionDetectItem {
     /// Required stay-time in seconds before an alarm fires
     #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
     pub stay_time: Option<u32>,
+    /// Alternative wire field for the stay/trigger threshold seen on some firmwares.
+    #[serde(rename = "timeThresh", skip_serializing_if = "Option::is_none")]
+    pub time_thresh: Option<u32>,
+    /// Zone location (camera-specific positional id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<u32>,
     /// Zone index
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
@@ -1747,8 +1764,8 @@ pub struct LoiteringDetection {
     /// Channel ID
     #[serde(rename = "channelId")]
     pub channel_id: u8,
-    /// List of detect zones
-    #[serde(default, rename = "smartDetect")]
+    /// List of detect zones. Wire name is `<loiteringDetectItem>`.
+    #[serde(default, rename = "loiteringDetectItem")]
     pub items: Vec<LoiteringDetectItem>,
 }
 
@@ -1757,8 +1774,8 @@ pub struct LoiteringDetection {
 pub struct LoiteringDetectItem {
     /// Whether this zone is enabled (0/1)
     pub enable: u32,
-    /// AI category for this zone
-    #[serde(rename = "type")]
+    /// AI category for this zone. Wire name is `<aiType>`.
+    #[serde(rename = "aiType")]
     pub ai_type: String,
     /// Sensitivity 0-100 (Reolink misspelling preserved)
     #[serde(rename = "sesensitivity")]
@@ -1766,6 +1783,12 @@ pub struct LoiteringDetectItem {
     /// Required loitering time in seconds before alarming
     #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
     pub stay_time: Option<u32>,
+    /// Alternative wire field for the stay/trigger threshold seen on some firmwares.
+    #[serde(rename = "timeThresh", skip_serializing_if = "Option::is_none")]
+    pub time_thresh: Option<u32>,
+    /// Zone location (camera-specific positional id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<u32>,
     /// Zone index
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
@@ -1786,8 +1809,8 @@ pub struct LegacyDetection {
     /// Channel ID
     #[serde(rename = "channelId")]
     pub channel_id: u8,
-    /// List of detect zones
-    #[serde(default, rename = "smartDetect")]
+    /// List of detect zones. Wire name is `<legacyDetectItem>`.
+    #[serde(default, rename = "legacyDetectItem")]
     pub items: Vec<LegacyDetectItem>,
 }
 
@@ -1796,8 +1819,9 @@ pub struct LegacyDetection {
 pub struct LegacyDetectItem {
     /// Whether this zone is enabled (0/1)
     pub enable: u32,
-    /// AI category for this zone (often left as a generic class for object detection)
-    #[serde(rename = "type")]
+    /// AI category for this zone (often left as a generic class for object detection).
+    /// Wire name is `<aiType>`.
+    #[serde(rename = "aiType")]
     pub ai_type: String,
     /// Sensitivity 0-100 (Reolink misspelling preserved)
     #[serde(rename = "sesensitivity")]
@@ -1805,6 +1829,12 @@ pub struct LegacyDetectItem {
     /// How long an object must be present before flagging "forgotten"
     #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
     pub stay_time: Option<u32>,
+    /// Alternative wire field for the stay/trigger threshold seen on some firmwares.
+    #[serde(rename = "timeThresh", skip_serializing_if = "Option::is_none")]
+    pub time_thresh: Option<u32>,
+    /// Zone location (camera-specific positional id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<u32>,
     /// Zone index
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
@@ -1825,8 +1855,8 @@ pub struct LossDetection {
     /// Channel ID
     #[serde(rename = "channelId")]
     pub channel_id: u8,
-    /// List of detect zones
-    #[serde(default, rename = "smartDetect")]
+    /// List of detect zones. Wire name is `<lossDetectItem>`.
+    #[serde(default, rename = "lossDetectItem")]
     pub items: Vec<LossDetectItem>,
 }
 
@@ -1835,8 +1865,8 @@ pub struct LossDetection {
 pub struct LossDetectItem {
     /// Whether this zone is enabled (0/1)
     pub enable: u32,
-    /// AI category for this zone
-    #[serde(rename = "type")]
+    /// AI category for this zone. Wire name is `<aiType>`.
+    #[serde(rename = "aiType")]
     pub ai_type: String,
     /// Sensitivity 0-100 (Reolink misspelling preserved)
     #[serde(rename = "sesensitivity")]
@@ -1844,6 +1874,12 @@ pub struct LossDetectItem {
     /// How long an object must be missing before flagging "taken"
     #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
     pub stay_time: Option<u32>,
+    /// Alternative wire field for the stay/trigger threshold seen on some firmwares.
+    #[serde(rename = "timeThresh", skip_serializing_if = "Option::is_none")]
+    pub time_thresh: Option<u32>,
+    /// Zone location (camera-specific positional id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<u32>,
     /// Zone index
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
@@ -1866,8 +1902,15 @@ pub struct YoloDetectInfo {
     /// XML Version
     #[serde(rename = "@version", default = "xml_ver")]
     pub version: String,
-    /// Channel ID the event occurred on
-    #[serde(rename = "channelId")]
+    /// Channel ID the event occurred on.
+    ///
+    /// NOTE: cmd 600 push payloads do NOT carry `<channelId>` on the wire —
+    /// `reolink_aio` extracts the channel from the surrounding event element.
+    /// The field is kept here so that we can populate it from
+    /// [`crate::bc::model::BcMeta::channel_id`] at the listener layer, but
+    /// it is marked `#[serde(default)]` so missing-on-wire is accepted and
+    /// never the basis for filtering decisions.
+    #[serde(rename = "channelId", default)]
     pub channel_id: u8,
     /// Detected AI category
     #[serde(rename = "type")]
@@ -1884,8 +1927,15 @@ pub struct YoloWorldType {
     /// XML Version
     #[serde(rename = "@version", default = "xml_ver")]
     pub version: String,
-    /// Channel ID the event occurred on
-    #[serde(rename = "channelId")]
+    /// Channel ID the event occurred on.
+    ///
+    /// NOTE: cmd 696 push payloads do NOT carry `<channelId>` on the wire —
+    /// `reolink_aio` extracts the channel from the surrounding event element.
+    /// The field is kept here so that we can populate it from
+    /// [`crate::bc::model::BcMeta::channel_id`] at the listener layer, but
+    /// it is marked `#[serde(default)]` so missing-on-wire is accepted and
+    /// never the basis for filtering decisions.
+    #[serde(rename = "channelId", default)]
     pub channel_id: u8,
     /// Top-level AI category (e.g. `people`, `vehicle`, `dog_cat`)
     #[serde(rename = "type")]
@@ -1915,11 +1965,13 @@ pub struct AiDetectCfg {
     /// XML Version
     #[serde(rename = "@version", default = "xml_ver")]
     pub version: String,
-    /// Channel ID
-    #[serde(rename = "channelId")]
+    /// Channel ID. Wire name is `<chn>` (not `<channelId>`); confirmed
+    /// against `reolink_aio/baichuan/xmls.py::GetAiAlarm`.
+    #[serde(rename = "chn")]
     pub channel_id: u8,
-    /// AI category this config applies to
-    #[serde(rename = "aiType")]
+    /// AI category this config applies to. Wire name is `<type>` (not
+    /// `<aiType>`); confirmed against `reolink_aio/baichuan/xmls.py::GetAiAlarm`.
+    #[serde(rename = "type")]
     pub ai_type: String,
     /// Sensitivity 0-100 (Reolink misspelling preserved)
     #[serde(rename = "sesensitivity")]
