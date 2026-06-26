@@ -1,9 +1,10 @@
 use super::*;
 
 use crate::common::UseCounter;
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::FutureExt;
 use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
+use tokio::task::JoinSet;
 
 #[cfg(feature = "pushnoti")]
 use crate::common::PushNoti;
@@ -22,7 +23,15 @@ impl NeoInstance {
             let counter = UseCounter::new().await;
 
             let mut md = self.motion().await?;
-            let mut tasks = FuturesUnordered::new();
+            // A JoinSet (rather than a FuturesUnordered of JoinHandles) so that
+            // when the stream-pump task below finishes (the client disconnects
+            // and `media_rx` is dropped) and this set is dropped, the motion /
+            // push-notification listener tasks are *aborted*. Dropping bare
+            // JoinHandles only detaches them, which previously left one motion
+            // listener (and one PN listener) — plus their permits and the
+            // backing UseCounter task — running forever for every client that
+            // ever connected while `pause.on_motion` was enabled.
+            let mut tasks = JoinSet::new();
             // Stream for 5s on a new client always
             // This lets us negotiate the camera stream type
             let init_permit = counter.create_activated().await?;
@@ -53,7 +62,7 @@ impl NeoInstance {
             };
             // Now listen to the motion
             let thread_name = name.clone();
-            tasks.push(tokio::spawn(
+            tasks.spawn(
                 async move {
                     loop {
                         match md.changed().await {
@@ -83,7 +92,7 @@ impl NeoInstance {
                     log::debug!("Motion thread stopped {e:?}");
                     e
                 }),
-            ));
+            );
 
             #[cfg(feature = "pushnoti")]
             {
@@ -92,7 +101,7 @@ impl NeoInstance {
                 let mut pn = self.push_notifications().await?;
                 pn.borrow_and_update(); // Ignore any PNs that have already been sent before this
                 let thread_name = name.clone();
-                tasks.push(tokio::spawn(
+                tasks.spawn(
                     async move {
                         loop {
                             let noti: Option<PushNoti> = pn.borrow_and_update().clone();
@@ -120,10 +129,10 @@ impl NeoInstance {
                         log::debug!("PN thread stopped {e:?}");
                         e
                     }),
-                ));
+                );
             }
 
-            // Send the camera when the pemit is active
+            // Send the camera when the permit is active
             let camera_permit = counter.create_deactivated().await?;
             let thread_camera = self.clone();
             tokio::spawn(
@@ -150,9 +159,9 @@ impl NeoInstance {
                                 log::debug!("Stopped stream: {v:?}");
                                 v
                             },
-                            v = tasks.next() => {
+                            v = tasks.join_next() => {
                                 log::debug!("Task failed: {v:?}");
-                                Err(anyhow!("Task ended prematurly: {v:?}"))
+                                Err(anyhow!("Task ended prematurely: {v:?}"))
                             }
                         }?;
                         log::debug!("Pausing stream");
