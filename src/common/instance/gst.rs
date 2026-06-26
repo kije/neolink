@@ -132,7 +132,7 @@ impl NeoInstance {
                 );
             }
 
-            // Send the camera when the pemit is active
+            // Send the camera when the permit is active
             let camera_permit = counter.create_deactivated().await?;
             let thread_camera = self.clone();
             tokio::spawn(
@@ -161,7 +161,7 @@ impl NeoInstance {
                             },
                             v = tasks.join_next() => {
                                 log::debug!("Task failed: {v:?}");
-                                Err(anyhow!("Task ended prematurly: {v:?}"))
+                                Err(anyhow!("Task ended prematurely: {v:?}"))
                             }
                         }?;
                         log::debug!("Pausing stream");
