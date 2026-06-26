@@ -138,8 +138,19 @@ impl NeoInstance {
             tokio::spawn(
                 async move {
                     loop {
-                        if let Err(e) = camera_permit.aquired_users().await {
-                            break AnyResult::Err(e);
+                        tokio::select! {
+                            biased;
+                            // The RTSP consumer dropped its receiver (the client
+                            // disconnected): tear the whole motion-watching
+                            // apparatus down now — including the listener tasks in
+                            // `tasks` — instead of lingering here, parked on the
+                            // permit, until the next motion event.
+                            _ = media_tx.closed() => break AnyResult::Ok(()),
+                            r = camera_permit.aquired_users() => {
+                                if let Err(e) = r {
+                                    break AnyResult::Err(e);
+                                }
+                            }
                         }
                         log::debug!("Starting stream");
                         tokio::select! {
@@ -189,27 +200,35 @@ impl NeoInstance {
         let config = self.config().await?.borrow().clone();
         let strict = config.strict;
         let thread_camera = self.clone();
-        tokio::task::spawn(
-            tokio::task::spawn(async move {
-                thread_camera
-                    .run_task(move |cam| {
-                        let media_tx = media_tx.clone();
-                        Box::pin(async move {
-                            let mut media_stream = cam.start_video(stream, 0, strict).await?;
-                            log::trace!("Camera started");
-                            while let Ok(media) = media_stream.get_data().await? {
-                                media_tx.send(media).await?;
+        tokio::task::spawn(async move {
+            let res = thread_camera
+                .run_task(move |cam| {
+                    let media_tx = media_tx.clone();
+                    Box::pin(async move {
+                        let mut media_stream = cam.start_video(stream, 0, strict).await?;
+                        log::trace!("Camera started");
+                        loop {
+                            let media = tokio::select! {
+                                biased;
+                                // The RTSP consumer dropped its receiver: stop pulling
+                                // from the camera so `StreamData::drop` sends the Stop
+                                // command instead of parking on `get_data()` forever
+                                // when the camera is idle.
+                                _ = media_tx.closed() => break,
+                                media = media_stream.get_data() => media?,
+                            };
+                            match media {
+                                Ok(media) => media_tx.send(media).await?,
+                                // Stream finished / inner error: stop pulling.
+                                Err(_) => break,
                             }
-                            AnyResult::Ok(())
-                        })
+                        }
+                        AnyResult::Ok(())
                     })
-                    .await
-            })
-            .and_then(|res| async move {
-                log::debug!("Camera finished streaming: {res:?}");
-                Ok(())
-            }),
-        );
+                })
+                .await;
+            log::debug!("Camera finished streaming: {res:?}");
+        });
 
         Ok(media_rx)
     }
