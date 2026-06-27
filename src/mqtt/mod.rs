@@ -26,6 +26,17 @@
 //! `/status/pir` Sent in reply to a `/query/pir`
 //! `/status/ptz/preset` Sent in reply to a `/query/ptz/preset`
 //!
+//! Push-event topics (gated on `enable_push_events`, default on):
+//!
+//! `/status/motion/{ai_type}` — AI sub-type motion (people/vehicle/dog_cat/face/package), retained `on`/`off`
+//! `/status/smart_ai/{type}` — Smart-AI sub-event pulses (non-retained)
+//! `/status/day_night` — `day` / `night` / `transition` (retained)
+//! `/status/sleep` — battery-camera sleep state (retained, `on`/`off`)
+//! `/status/login_state` — channel login state (retained, `on`/`off`)
+//! `/status/channel_online` — channel-online state (retained, `on`/`off`)
+//! `/status/config_stale/{cmd}` — non-retained pulse when the camera reports
+//!     a cached response is stale
+//!
 //! Query Messages:
 //!
 //! `/query/battery` Request that the camera reports its battery level
@@ -70,7 +81,7 @@ use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use validator::Validate;
 
-use neolink_core::bc_protocol::{Direction as BcDirection, LightState};
+use neolink_core::bc_protocol::{Direction as BcDirection, LightState, PushEvent};
 
 mod cmdline;
 mod discovery;
@@ -344,6 +355,9 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
 
                 let camera_floodlight_tasks = camera.clone();
                 let mqtt_floodlight_tasks = mqtt_instance.resubscribe().await?;
+
+                let camera_push = camera.clone();
+                let mqtt_push = mqtt_instance.resubscribe().await?;
 
                 tokio::select! {
                     _ = cancel.cancelled() => AnyResult::Ok(()),
@@ -630,6 +644,186 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                         }
                         AnyResult::Ok(())
                     }, if config.enable_floodlight => v,
+                    // Handle the persistent push-event consumer (cmd 31 / ch 251).
+                    //
+                    // Surfaces AI sub-type motion, smart-AI, day/night,
+                    // channel-info, and config-stale events from the camera
+                    // onto MQTT topics. The push subscription is opened via
+                    // `subscribe_push_events_unchecked` — the user is
+                    // expected to set `enable_push_events = false` on battery
+                    // cameras (the long-lived TCP socket would keep the
+                    // radio awake). On non-supporting cameras the camera
+                    // refuses the subscribe frame, the subscriber call
+                    // errors, and we pend forever so the rest of the
+                    // select! tree keeps running.
+                    v = async {
+                        // Inner -> outer event channel. The closure passed
+                        // to `run_passive_task` owns the `PushSubscription`
+                        // and pumps events out via `event_tx`; the outer
+                        // task tracks AI-sub-type on/off state and publishes
+                        // per-topic.
+                        let (event_tx, mut event_rx) = mpsc(64);
+                        let v = tokio::select! {
+                            v = async {
+                                loop {
+                                    let event_tx = event_tx.clone();
+                                    let r = camera_push.run_passive_task(|cam| {
+                                        let event_tx = event_tx.clone();
+                                        Box::pin(async move {
+                                            let mut push = cam.subscribe_push_events_unchecked().await?;
+                                            loop {
+                                                let ev = push.next_event().await?;
+                                                if event_tx.send(ev).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            AnyResult::Ok(())
+                                        })
+                                    }).await;
+                                    if r.is_err() {
+                                        break r;
+                                    }
+                                }
+                            } => v,
+                            v = async {
+                                // Per-AI-sub-type on/off tracking: when an
+                                // Alarm event with `active=true` arrives,
+                                // diff `ai_types` against the previous set;
+                                // newly-present types publish "on", newly-
+                                // absent types publish "off". On a
+                                // `active=false` clear, publish "off" for
+                                // every still-on type.
+                                let mut active_ai_types: HashSet<String> = HashSet::new();
+                                while let Some(event) = event_rx.recv().await {
+                                    match event {
+                                        PushEvent::Alarm { channel_id: _, status: _, ai_types, active, .. } => {
+                                            if active {
+                                                let new: HashSet<String> = ai_types.into_iter().collect();
+                                                for added in new.difference(&active_ai_types) {
+                                                    mqtt_push.send_message(
+                                                        &format!("status/motion/{added}"),
+                                                        "on",
+                                                        true,
+                                                    ).await.with_context(|| {
+                                                        format!("{}: Failed to publish AI motion start for {}", camera_name, added)
+                                                    })?;
+                                                }
+                                                for removed in active_ai_types.difference(&new) {
+                                                    mqtt_push.send_message(
+                                                        &format!("status/motion/{removed}"),
+                                                        "off",
+                                                        true,
+                                                    ).await.with_context(|| {
+                                                        format!("{}: Failed to publish AI motion stop for {}", camera_name, removed)
+                                                    })?;
+                                                }
+                                                active_ai_types = new;
+                                            } else if !active_ai_types.is_empty() {
+                                                for cleared in std::mem::take(&mut active_ai_types) {
+                                                    mqtt_push.send_message(
+                                                        &format!("status/motion/{cleared}"),
+                                                        "off",
+                                                        true,
+                                                    ).await.with_context(|| {
+                                                        format!("{}: Failed to publish AI motion clear for {}", camera_name, cleared)
+                                                    })?;
+                                                }
+                                            }
+                                        }
+                                        PushEvent::SmartAi { channel_id: _, types, .. } => {
+                                            // Smart-AI sub-events fire as
+                                            // discrete pulses (the camera
+                                            // doesn't push a clear); publish
+                                            // each as a non-retained "on"
+                                            // and let the consumer treat
+                                            // them as triggers.
+                                            for t in types {
+                                                mqtt_push.send_message(
+                                                    &format!("status/smart_ai/{t}"),
+                                                    "on",
+                                                    false,
+                                                ).await.with_context(|| {
+                                                    format!("{}: Failed to publish smart-AI {}", camera_name, t)
+                                                })?;
+                                            }
+                                        }
+                                        PushEvent::DayNight { channel_id: _, mode, .. } => {
+                                            let value = mode.as_deref().unwrap_or("unknown");
+                                            mqtt_push.send_message("status/day_night", value, true)
+                                                .await
+                                                .with_context(|| {
+                                                    format!("{}: Failed to publish day/night", camera_name)
+                                                })?;
+                                        }
+                                        PushEvent::ChannelInfo { info, .. } => {
+                                            // Three optional u8 flags on
+                                            // the wire; publish each as a
+                                            // binary on/off for HA when
+                                            // the camera includes it.
+                                            if let Some(sleep) = info.sleep {
+                                                let value = if sleep != 0 { "on" } else { "off" };
+                                                mqtt_push.send_message("status/sleep", value, true)
+                                                    .await
+                                                    .with_context(|| {
+                                                        format!("{}: Failed to publish sleep state", camera_name)
+                                                    })?;
+                                            }
+                                            if let Some(login_state) = info.login_state {
+                                                let value = if login_state != 0 { "on" } else { "off" };
+                                                mqtt_push.send_message(
+                                                    "status/login_state",
+                                                    value,
+                                                    true,
+                                                ).await.with_context(|| {
+                                                    format!("{}: Failed to publish login state", camera_name)
+                                                })?;
+                                            }
+                                            if let Some(online) = info.online {
+                                                let value = if online != 0 { "on" } else { "off" };
+                                                mqtt_push.send_message("status/channel_online", value, true)
+                                                    .await
+                                                    .with_context(|| {
+                                                        format!("{}: Failed to publish channel online state", camera_name)
+                                                    })?;
+                                            }
+                                        }
+                                        PushEvent::ConfigStale { cmd, .. } => {
+                                            // Fire-and-forget: tell
+                                            // listeners that the camera
+                                            // reports the cached response
+                                            // for `cmd` is stale and should
+                                            // be re-fetched.
+                                            mqtt_push.send_message(
+                                                &format!("status/config_stale/{cmd}"),
+                                                "1",
+                                                false,
+                                            ).await.with_context(|| {
+                                                format!("{}: Failed to publish config-stale for cmd {}", camera_name, cmd)
+                                            })?;
+                                        }
+                                    }
+                                }
+                                AnyResult::Ok(())
+                            } => v,
+                        };
+                        match v.map_err(|e| e.downcast::<neolink_core::Error>()) {
+                            // Camera refused the subscribe frame (e.g. older
+                            // firmware) — wedge so the rest of the select!
+                            // tree keeps running.
+                            Err(Ok(neolink_core::Error::UnintelligibleReply{..})) => {
+                                log::debug!("{}: push-event subscription not supported by camera; the consumer will idle.", camera_name);
+                                futures::future::pending().await
+                            },
+                            Err(Ok(neolink_core::Error::CameraServiceUnavailable{..})) => {
+                                log::debug!("{}: push-event subscription unavailable; the consumer will idle.", camera_name);
+                                futures::future::pending().await
+                            },
+                            Ok(()) => AnyResult::Ok(()),
+                            Err(Ok(e)) => Err(e.into()),
+                            Err(Err(e)) => Err(e),
+                        }?;
+                        AnyResult::Ok(())
+                    }, if config.enable_push_events => v,
                 }?;
                 AnyResult::Ok(())
             } => v,

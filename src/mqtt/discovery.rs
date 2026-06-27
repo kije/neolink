@@ -30,6 +30,15 @@ pub(crate) enum Discoveries {
     Battery,
     #[serde(alias = "siren", alias = "alarm")]
     Siren,
+    /// Registers the AI sub-type / day-night / channel-info entities surfaced by
+    /// the persistent push-event consumer (cmd 31 / ch 251).
+    ///
+    /// Adds binary_sensor entities for the five canonical AI sub-types
+    /// (`people`, `vehicle`, `dog_cat`, `face`, `package`), a sensor for
+    /// the day/night mode, and binary_sensors for the sleep / channel-online
+    /// flags reported on cmd 145.
+    #[serde(alias = "push", alias = "push_events", alias = "ai")]
+    PushEvents,
 }
 
 #[derive(Debug, Clone)]
@@ -620,6 +629,119 @@ pub(crate) async fn enable_discovery(
                 .with_context(|| {
                     format!(
                         "Failed to publish sire auto-discover data on over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+            }
+            Discoveries::PushEvents => {
+                // Per-AI-sub-type binary_sensors for the canonical Reolink
+                // detection categories. The MQTT consumer publishes
+                // retained `on`/`off` on `status/motion/{ai_type}` as the
+                // camera's push channel reports them.
+                const AI_SUB_TYPES: &[(&str, &str, &str)] = &[
+                    ("people", "People", "mdi:account"),
+                    ("vehicle", "Vehicle", "mdi:car"),
+                    ("dog_cat", "Pet", "mdi:dog-side"),
+                    ("face", "Face", "mdi:face-recognition"),
+                    ("package", "Package", "mdi:package-variant"),
+                ];
+                for (wire_name, label, icon) in AI_SUB_TYPES {
+                    let config_data = DiscoveryBinarySensor {
+                        device: device.clone(),
+                        availability: availability.clone(),
+                        name: format!("{} {}", friendly_name.as_str(), label),
+                        unique_id: format!("neolink_{}_ai_{}", cam_config.name, wire_name),
+                        icon: Some((*icon).to_string()),
+                        state_topic: format!(
+                            "neolink/{}/status/motion/{}",
+                            cam_config.name, wire_name
+                        ),
+                        payload_off: "off".to_string(),
+                        payload_on: "on".to_string(),
+                    };
+                    mqtt.send_message_with_root_topic(
+                        &format!(
+                            "{}/binary_sensor/{}",
+                            discovery_config.topic, &config_data.unique_id
+                        ),
+                        "config",
+                        &serde_json::to_string(&config_data).with_context(|| {
+                            format!(
+                                "Could not serialise discovery push-AI {} config into json",
+                                wire_name
+                            )
+                        })?,
+                        true,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to publish push-AI {} auto-discover data over MQTT for {}",
+                            wire_name, cam_config.name
+                        )
+                    })?;
+                }
+
+                // Sleep state binary_sensor — driven by the `<sleep>` flag
+                // on the cmd 145 ChannelInfo push.
+                let sleep_cfg = DiscoveryBinarySensor {
+                    device: device.clone(),
+                    availability: availability.clone(),
+                    name: format!("{} Sleep", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_sleep", cam_config.name),
+                    icon: Some("mdi:sleep".to_string()),
+                    state_topic: format!("neolink/{}/status/sleep", cam_config.name),
+                    payload_off: "off".to_string(),
+                    payload_on: "on".to_string(),
+                };
+                mqtt.send_message_with_root_topic(
+                    &format!(
+                        "{}/binary_sensor/{}",
+                        discovery_config.topic, &sleep_cfg.unique_id
+                    ),
+                    "config",
+                    &serde_json::to_string(&sleep_cfg)
+                        .with_context(|| "Could not serialise discovery sleep config into json")?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish sleep auto-discover data over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+
+                // Channel online binary_sensor — driven by `<online>` on
+                // cmd 145 ChannelInfo. Skipped silently if the firmware
+                // doesn't emit it (the consumer just won't publish the
+                // topic, so HA will show the sensor as unknown until the
+                // first event arrives).
+                let online_cfg = DiscoveryBinarySensor {
+                    device: device.clone(),
+                    availability: availability.clone(),
+                    name: format!("{} Channel Online", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_channel_online", cam_config.name),
+                    icon: Some("mdi:lan-connect".to_string()),
+                    state_topic: format!("neolink/{}/status/channel_online", cam_config.name),
+                    payload_off: "off".to_string(),
+                    payload_on: "on".to_string(),
+                };
+                mqtt.send_message_with_root_topic(
+                    &format!(
+                        "{}/binary_sensor/{}",
+                        discovery_config.topic, &online_cfg.unique_id
+                    ),
+                    "config",
+                    &serde_json::to_string(&online_cfg).with_context(|| {
+                        "Could not serialise discovery channel-online config into json"
+                    })?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish channel-online auto-discover data over MQTT for {}",
                         cam_config.name
                     )
                 })?;
