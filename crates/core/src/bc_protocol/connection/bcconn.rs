@@ -34,6 +34,17 @@ pub(crate) type BcConnSource = Box<dyn Stream<Item = Result<Bc>> + Send + Sync +
 /// messages with that number; each incoming message is routed to its appropriate subscriber.
 ///
 /// There can be only one subscriber per kind of message at a time.
+///
+/// # `mess_id` channel packing (audit)
+///
+/// `reolink_aio` packs `mess_id = (ch_id << 24) | counter` on the wire so
+/// that a single TCP socket shared between channels can route replies to
+/// per-channel futures. In neolink each `BcCamera` (and therefore each
+/// channel) owns its own `BcConnection` and TCP socket, so the dispatcher
+/// only needs to key on `(msg_id, msg_num)` — `channel_id` is carried in
+/// the header for the camera's benefit (NVR routing) but is not used for
+/// response routing on this side. Keying on the `(msg_id, msg_num)` pair is
+/// equivalent to `reolink_aio`'s `mess_id` scheme under this constraint.
 pub struct BcConnection {
     sink: Sender<Result<Bc>>,
     poll_commander: Sender<PollCommand>,
