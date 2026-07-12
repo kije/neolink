@@ -234,6 +234,18 @@ pub enum Error {
     /// A generic catch all error
     #[error("Other error: {0}")]
     OtherString(String),
+
+    /// Raised when a command has been scaffolded but the underlying wire
+    /// format has not been verified and so the command refuses to transmit.
+    ///
+    /// This is used by the device-lifecycle commands (firmware upgrade,
+    /// factory reset) until their cmd_ids and XML payloads are confirmed
+    /// against a real Wireshark capture. See `docs/baichuan-lifecycle.md`.
+    #[error("Not implemented: {what} — needs Wireshark capture to confirm wire format")]
+    NotImplemented {
+        /// Short name of the operation that has not yet been implemented.
+        what: &'static str,
+    },
 }
 
 #[derive(Debug, Clone)]

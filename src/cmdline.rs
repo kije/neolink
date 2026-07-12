@@ -34,4 +34,15 @@ pub enum Command {
     Services(super::services::Opt),
     Users(super::users::Opt),
     Onvif(super::onvif::Opt),
+    /// Upload firmware to the camera and trigger a flash.
+    ///
+    /// SCAFFOLDING ONLY — wire format not yet confirmed; will refuse to
+    /// transmit until the cmd_ids are captured. See docs/baichuan-lifecycle.md.
+    Upgrade(super::upgrade::Opt),
+    /// Restore the camera to factory defaults.
+    ///
+    /// SCAFFOLDING ONLY — wire format not yet confirmed; will refuse to
+    /// transmit until the cmd_id is captured. See docs/baichuan-lifecycle.md.
+    #[command(name = "factory-reset")]
+    FactoryReset(super::factory_reset::Opt),
 }

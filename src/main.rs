@@ -40,6 +40,7 @@ mod battery;
 mod cmdline;
 mod common;
 mod config;
+mod factory_reset;
 #[cfg(feature = "gstreamer")]
 mod image;
 mod mqtt;
@@ -53,6 +54,7 @@ mod services;
 mod statusled;
 #[cfg(feature = "gstreamer")]
 mod talk;
+mod upgrade;
 mod users;
 mod utils;
 
@@ -151,6 +153,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::Users(opts)) => {
             users::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Upgrade(opts)) => {
+            upgrade::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::FactoryReset(opts)) => {
+            factory_reset::main(opts, neo_reactor.clone()).await?;
         }
     }
 

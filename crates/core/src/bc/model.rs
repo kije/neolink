@@ -105,6 +105,54 @@ pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Get the floodlight task xml
 pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
 
+// -- Device lifecycle (firmware upgrade + factory reset) ---------------------
+//
+// IMPORTANT: The wire format for the destructive lifecycle commands below has
+// NOT been independently verified by a Wireshark capture. The values listed
+// are best-guess defaults derived from `dissector/baichuan.lua` (which labels
+// `[67]` as `<ConfigFileInfo> (FW Upgrade)` and `[99]` as `<Restore> (factory
+// default)`).
+//
+// Because a wrong cmd_id on an upgrade flow can brick a camera, the
+// `lifecycle` module refuses to actually transmit these messages until the
+// values have been confirmed against a real capture. See
+// `docs/baichuan-lifecycle.md` for the discovery checklist.
+//
+// Once verified the `unverified-lifecycle` feature can be removed and these
+// constants treated like any other MSG_ID_*.
+
+/// Begin a firmware upgrade session.
+///
+/// TODO: confirm via capture. Dissector labels cmd 67 as
+/// `<ConfigFileInfo> (FW Upgrade)`; this is plausibly the session-open frame,
+/// but the multi-frame upgrade sequence may use additional ids.
+pub const MSG_ID_UPGRADE_BEGIN: u32 = 0;
+
+/// Stream chunks of firmware payload to the camera.
+///
+/// TODO: confirm via capture. Likely re-uses `MSG_ID_UPGRADE_BEGIN` with the
+/// `0x6482` file-download/upload message class and a binary body, but this
+/// has not been confirmed.
+pub const MSG_ID_UPGRADE_DATA: u32 = 0;
+
+/// Finalize the firmware upgrade and request the camera to flash + reboot.
+///
+/// TODO: confirm via capture.
+pub const MSG_ID_UPGRADE_COMMIT: u32 = 0;
+
+/// Restore-to-defaults / factory reset.
+///
+/// TODO: confirm via capture. Dissector labels cmd 99 as
+/// `<Restore> (factory default)`.
+pub const MSG_ID_FACTORY_RESET: u32 = 0;
+
+/// Baichuan message class used by the file-download / firmware-upload
+/// streaming frames.
+///
+/// TODO: confirm via capture. Referenced by `apocaliss92/nodelink-js` as
+/// `BC_CLASS_FILE_DOWNLOAD = 0x6482`.
+pub const MSG_CLASS_FILE_DOWNLOAD: u16 = 0x6482;
+
 /// An empty password in legacy format
 pub const EMPTY_LEGACY_PASSWORD: &str =
     "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
