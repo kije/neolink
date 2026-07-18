@@ -1,9 +1,11 @@
 use super::BcConnection;
+use crate::bc_protocol::battery_lifecycle::InFlightGuard;
 use crate::bcmedia::codex::BcMediaCodex;
 use crate::{bc::model::*, bcmedia::model::*, Error, Result};
 use futures::stream::{Stream, TryStreamExt};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -14,6 +16,11 @@ pub struct BcSubscription<'a> {
     rx: ReceiverStream<Result<Bc>>,
     msg_num: Option<u32>,
     conn: &'a BcConnection,
+    /// In-flight guard registered with the connection's `BatteryLifecycle`
+    /// on the first `send()` call. Released when this subscription drops,
+    /// so a single "request -> reply" command counts as one in-flight unit
+    /// regardless of how many round-trips it actually entails.
+    in_flight_guard: Mutex<Option<InFlightGuard<'a>>>,
 }
 
 pub struct BcStream<'a> {
@@ -45,6 +52,7 @@ impl<'a> BcSubscription<'a> {
             rx: ReceiverStream::new(rx),
             msg_num,
             conn,
+            in_flight_guard: Mutex::new(None),
         }
     }
 
@@ -53,6 +61,17 @@ impl<'a> BcSubscription<'a> {
             assert!(bc.meta.msg_num as u32 == msg_num);
         } else {
             log::debug!("Sending message before msg_num has been aquired");
+        }
+        // Register this command with the battery-lifecycle on first send.
+        // Non-waking commands (per `NONE_WAKING_COMMANDS`) are a no-op
+        // inside `track()`. The guard is held until this subscription
+        // drops so a command that does multiple send/recv round-trips is
+        // counted as a single in-flight unit.
+        {
+            let mut slot = self.in_flight_guard.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(self.conn.battery_lifecycle().track(bc.meta.msg_id));
+            }
         }
         self.conn.send(bc).await?;
         Ok(())

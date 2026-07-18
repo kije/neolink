@@ -97,14 +97,23 @@ fn bc_modern_msg<'a>(
     let payload_len = header.body_len - ext_len;
     let (buf, payload_buf) = take(payload_len)(buf)?;
 
-    let decrypted;
-    let processed_ext_buf = match context.get_encrypted() {
-        EncryptionProtocol::Unencrypted => ext_buf,
+    // Decrypt the extension buffer. For AES-negotiated connections, some
+    // firmwares occasionally mix encryption modes for the first packet after a
+    // stream-mode change; if the AES-decrypted bytes don't look like XML we
+    // transparently fall back to BC-XOR. Mirrors `reolink_aio._decrypt`'s
+    // try-AES-then-fall-back-to-XOR path.
+    let decrypted_ext: Vec<u8> = match context.get_encrypted() {
+        EncryptionProtocol::Unencrypted => ext_buf.to_vec(),
         encryption_protocol => {
-            decrypted = encryption_protocol.decrypt(header.channel_id as u32, ext_buf);
-            &decrypted
+            let primary = encryption_protocol.decrypt(header.channel_id as u32, ext_buf);
+            if needs_xor_fallback(encryption_protocol, &primary) {
+                EncryptionProtocol::BCEncrypt.decrypt(header.channel_id as u32, ext_buf)
+            } else {
+                primary
+            }
         }
     };
+    let processed_ext_buf: &[u8] = &decrypted_ext;
 
     let mut in_binary = false;
     let mut encrypted_len = None;
@@ -176,9 +185,19 @@ fn bc_modern_msg<'a>(
             _ => context.get_encrypted(),
         };
 
-        let processed_payload_buf =
-            encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
-        if context.in_bin_mode.contains(&(header.msg_num)) || in_binary {
+        let primary_payload = encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
+        let in_bin = context.in_bin_mode.contains(&(header.msg_num)) || in_binary;
+        // AES decrypt fallback for XML payloads: if the AES-decrypted bytes
+        // don't look like an XML document, retry with BC-XOR before passing
+        // them on to the parser. Binary payloads are passed through as-is
+        // because their shape is opaque to us here.
+        let processed_payload_buf: Vec<u8> =
+            if !in_bin && needs_xor_fallback(encryption_protocol, &primary_payload) {
+                EncryptionProtocol::BCEncrypt.decrypt(header.channel_id as u32, payload_buf)
+            } else {
+                primary_payload
+            };
+        if in_bin {
             payload = match (context.get_encrypted(), encrypted_len) {
                 (EncryptionProtocol::FullAes { .. }, Some(encrypted_len)) => {
                     // if if context.debug {
@@ -219,6 +238,49 @@ fn bc_modern_msg<'a>(
     }
 
     Ok((buf, ModernMsg { extension, payload }))
+}
+
+/// Heuristic used by the AES-decrypt fallback path.
+///
+/// Returns `true` if `decrypted` *should* contain XML based on the leading
+/// bytes of a well-formed Baichuan XML payload but does not. The decision is
+/// only meaningful when the active encryption protocol is AES / FullAes — for
+/// other protocols we never want to second-guess the camera.
+///
+/// Baichuan XML payloads always begin with either an XML declaration
+/// (`<?xml`) or a top-level element (`<`). If the decrypted buffer is
+/// non-empty but doesn't start with `<` or `?` (after an optional BOM /
+/// whitespace) we treat the AES decryption as suspect and let the caller
+/// retry with BC-XOR.
+pub(crate) fn needs_xor_fallback(proto: &EncryptionProtocol, decrypted: &[u8]) -> bool {
+    if !matches!(
+        proto,
+        EncryptionProtocol::Aes { .. } | EncryptionProtocol::FullAes { .. }
+    ) {
+        return false;
+    }
+    if decrypted.is_empty() {
+        return false;
+    }
+    // Strip a UTF-8 BOM if present.
+    let bytes = if decrypted.len() >= 3 && decrypted.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        &decrypted[3..]
+    } else {
+        decrypted
+    };
+    // Skip leading ASCII whitespace.
+    let bytes = bytes
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .map(|i| &bytes[i..])
+        .unwrap_or(b"");
+    if bytes.is_empty() {
+        return false;
+    }
+    // `<` covers both `<?xml ...?>` and root-element openers. Some payloads
+    // (notably `Extension`) have been observed to start with `?` directly
+    // due to whitespace stripping by the camera.
+    !matches!(bytes[0], b'<' | b'?')
 }
 
 fn bc_header(buf: &[u8]) -> IResult<&[u8], BcHeader> {

@@ -1,4 +1,5 @@
 use super::BcSubscription;
+use crate::bc_protocol::battery_lifecycle::BatteryLifecycle;
 use crate::{bc::model::*, Error, Result};
 use futures::future::BoxFuture;
 use futures::sink::{Sink, SinkExt};
@@ -8,6 +9,7 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
@@ -34,15 +36,43 @@ pub(crate) type BcConnSource = Box<dyn Stream<Item = Result<Bc>> + Send + Sync +
 /// messages with that number; each incoming message is routed to its appropriate subscriber.
 ///
 /// There can be only one subscriber per kind of message at a time.
+///
+/// # `mess_id` channel packing (audit)
+///
+/// `reolink_aio` packs `mess_id = (ch_id << 24) | counter` on the wire so
+/// that a single TCP socket shared between channels can route replies to
+/// per-channel futures. In neolink each `BcCamera` (and therefore each
+/// channel) owns its own `BcConnection` and TCP socket, so the dispatcher
+/// only needs to key on `(msg_id, msg_num)` — `channel_id` is carried in
+/// the header for the camera's benefit (NVR routing) but is not used for
+/// response routing on this side. Keying on the `(msg_id, msg_num)` pair is
+/// equivalent to `reolink_aio`'s `mess_id` scheme under this constraint.
 pub struct BcConnection {
     sink: Sender<Result<Bc>>,
     poll_commander: Sender<PollCommand>,
     rx_thread: RwLock<JoinSet<Result<()>>>,
     cancel: CancellationToken,
+    /// Shared with [`BcCamera`] and [`BcSubscription`] so subscriptions
+    /// can call `track()` on send and the idle-monitor task can call
+    /// `wait_idle()`.
+    battery_lifecycle: Arc<BatteryLifecycle>,
+    /// Observable "should-close" signal driven by the idle-monitor task.
+    ///
+    /// The actual TCP-socket close + reconnect-on-demand is a non-trivial
+    /// architectural refactor (the `Arc<BcConnection>` field on `BcCamera`
+    /// would need to be replaceable on the fly). Until that lands, the
+    /// idle-monitor task drives this watch — any downstream subsystem
+    /// (RTSP server, stream pumps, etc.) that wants to be told "the camera
+    /// has been idle long enough for a battery close" can subscribe.
+    idle_close_intent: watch::Receiver<bool>,
 }
 
 impl BcConnection {
-    pub async fn new(mut sink: BcConnSink, mut source: BcConnSource) -> Result<BcConnection> {
+    pub async fn new(
+        mut sink: BcConnSink,
+        mut source: BcConnSource,
+        battery_lifecycle: Arc<BatteryLifecycle>,
+    ) -> Result<BcConnection> {
         let (sinker, sinker_rx) = channel::<Result<Bc>>(100);
         let cancel = CancellationToken::new();
 
@@ -100,12 +130,96 @@ impl BcConnection {
             }
         });
 
+        // Idle-monitor task: while battery-managed, wait for the in-flight
+        // count to next hit zero, sleep for the configured idle window, and
+        // if still idle, emit a `true` on `idle_close_intent`. Any consumer
+        // that wants to drive the actual TCP close subscribes to the watch.
+        let (idle_tx, idle_rx) = watch::channel(false);
+        let idle_lc = battery_lifecycle.clone();
+        let thread_cancel = cancel.clone();
+        rx_thread.spawn(async move {
+            tokio::select! {
+                _ = thread_cancel.cancelled() => Result::Ok(()),
+                v = async {
+                    loop {
+                        // Cheap spin gate: do nothing unless this is a
+                        // battery camera.
+                        if !idle_lc.is_enabled() {
+                            tokio::time::sleep(idle_lc.idle_window()).await;
+                            continue;
+                        }
+                        idle_lc.wait_idle().await;
+                        // Race the idle window against the next command.
+                        let still_idle = tokio::select! {
+                            _ = tokio::time::sleep(idle_lc.idle_window()) => true,
+                            // Re-arm the moment the in-flight count goes
+                            // back up; wait_idle() returns only on the
+                            // next 1 -> 0 transition.
+                            _ = async {
+                                // Naive readiness poll for "in_flight > 0
+                                // again". A condvar-like API on the
+                                // lifecycle would be cleaner; in practice
+                                // this branch runs at most once per
+                                // idle-window and the loop just rearms.
+                                loop {
+                                    if idle_lc.in_flight() > 0 {
+                                        break;
+                                    }
+                                    tokio::time::sleep(
+                                        std::time::Duration::from_millis(50)
+                                    ).await;
+                                }
+                            } => false,
+                        };
+                        if still_idle {
+                            log::debug!(
+                                "Battery camera idle for {:?} — emitting close-intent",
+                                idle_lc.idle_window()
+                            );
+                            let _ = idle_tx.send(true);
+                            // Hold the signal until something flips
+                            // in_flight back up; clear once activity
+                            // resumes so downstream subscribers see a
+                            // clean false -> true edge next time.
+                            loop {
+                                if idle_lc.in_flight() > 0 {
+                                    let _ = idle_tx.send(false);
+                                    break;
+                                }
+                                tokio::time::sleep(
+                                    std::time::Duration::from_millis(100)
+                                ).await;
+                            }
+                        }
+                    }
+                } => v,
+            }
+        });
+
         Ok(BcConnection {
             sink: sinker,
             poll_commander,
             rx_thread: RwLock::new(rx_thread),
             cancel,
+            battery_lifecycle,
+            idle_close_intent: idle_rx,
         })
+    }
+
+    /// Returns the shared battery-lifecycle handle.
+    ///
+    /// `BcSubscription::send` uses this to call `track()` so the in-flight
+    /// count reflects real commands in production, not just unit tests.
+    pub(crate) fn battery_lifecycle(&self) -> &Arc<BatteryLifecycle> {
+        &self.battery_lifecycle
+    }
+
+    /// Subscribe to the idle-close intent signal. Becomes `true` whenever
+    /// a battery camera has been idle for [`BatteryLifecycle::idle_window`],
+    /// and back to `false` as soon as a tracked command lands again.
+    #[allow(dead_code)] // wired up by callers that want to react to idle
+    pub fn watch_idle_close_intent(&self) -> watch::Receiver<bool> {
+        self.idle_close_intent.clone()
     }
 
     pub(super) async fn send(&self, bc: Bc) -> crate::Result<()> {

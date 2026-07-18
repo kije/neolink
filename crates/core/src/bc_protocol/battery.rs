@@ -17,9 +17,19 @@ impl BcCamera {
     /// also on low battery events
     pub async fn monitor_battery(&self, format: PrintFormat) -> Result<()> {
         let connection = self.get_connection();
+        // A pushed BatteryInfoList is the camera telling us "I have a
+        // battery" — arm the idle-close lifecycle so the idle-monitor
+        // task in BcConnection starts observing in-flight commands and
+        // emits close-intent on `watch_idle_close_intent`.
+        let lc = self.battery_lifecycle.clone();
         connection
             .handle_msg(MSG_ID_BATTERY_INFO_LIST, move |bc| {
+                let lc = lc.clone();
                 Box::pin(async move {
+                    if !lc.is_enabled() {
+                        log::debug!("Observed BatteryInfoList push — arming battery lifecycle");
+                        lc.enable();
+                    }
                     if let Bc {
                         body:
                             BcBody::ModernMsg(ModernMsg {
@@ -120,6 +130,13 @@ impl BcCamera {
                 }),
         } = msg
         {
+            // Successful BatteryInfo reply is itself proof that the
+            // camera has a battery — arm the idle-close lifecycle so the
+            // idle-monitor task in `BcConnection` starts tracking.
+            if !self.battery_lifecycle.is_enabled() {
+                log::debug!("BatteryInfo reply observed — arming battery lifecycle");
+                self.battery_lifecycle.enable();
+            }
             Ok(battery_info)
         } else {
             Err(Error::UnintelligibleReply {
