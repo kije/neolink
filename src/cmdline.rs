@@ -34,4 +34,8 @@ pub enum Command {
     Services(super::services::Opt),
     Users(super::users::Opt),
     Onvif(super::onvif::Opt),
+    Wifi(super::wifi::Opt),
+    Siren(super::siren::Opt),
+    Audio(super::audio::Opt),
+    Io(super::io::Opt),
 }

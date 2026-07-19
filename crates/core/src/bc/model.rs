@@ -56,6 +56,10 @@ pub const MSG_ID_SET_GENERAL: u32 = 105;
 pub const MSG_ID_SNAP: u32 = 109;
 /// Used to grab the UID
 pub const MSG_ID_UID: u32 = 114;
+/// Get the WiFi signal strength
+pub const MSG_ID_GET_WIFI_SIGNAL: u32 = 115;
+/// Get the WiFi configuration including the current SSID and scan results
+pub const MSG_ID_GET_WIFI: u32 = 116;
 /// Used to pass the token and client ID for push notifications
 pub const MSG_ID_PUSH_INFO: u32 = 124;
 /// Send a test email configuration
@@ -92,6 +96,10 @@ pub const MSG_ID_BATTERY_INFO_LIST: u32 = 252;
 pub const MSG_ID_BATTERY_INFO: u32 = 253;
 /// Used for to play sounds like the siren
 pub const MSG_ID_PLAY_AUDIO: u32 = 263;
+/// Get the audio configuration (speaker / mic volume, encoding)
+pub const MSG_ID_GET_AUDIO_CFG: u32 = 264;
+/// Set the audio configuration
+pub const MSG_ID_SET_AUDIO_CFG: u32 = 265;
 /// Manual Floodlight Control
 pub const MSG_ID_FLOODLIGHT_MANUAL: u32 = 288;
 /// Set Floodlight tasks xml
@@ -103,7 +111,32 @@ pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
 /// Used for camera Zoom write
 pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Get the floodlight task xml
-pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
+///
+/// NOTE: This value was a placeholder/guess in the original code. According
+/// to the Baichuan command table this ID is actually `GET_AUDIO_NOISE`, see
+/// [`MSG_ID_GET_AUDIO_NOISE`]. The real floodlight-task-read command ID is
+/// currently unknown and this constant is kept as `289` (the natural pair
+/// for [`MSG_ID_FLOODLIGHT_TASKS_WRITE`] at 290) until firmware testing
+/// confirms the correct value.
+pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 289;
+/// Get the audio noise-reduction configuration
+pub const MSG_ID_GET_AUDIO_NOISE: u32 = 438;
+/// Set the audio noise-reduction configuration
+pub const MSG_ID_SET_AUDIO_NOISE: u32 = 439;
+/// Push: WiFi link type / signal change. Sent by the camera when the
+/// network link (wired/wifi) or RSSI changes.
+pub const MSG_ID_NETWORK_LINK_TYPE: u32 = 464;
+/// Set the scheduled siren windows (when the siren may fire)
+pub const MSG_ID_SET_SIREN_TIMES: u32 = 480;
+/// Fire the siren manually
+pub const MSG_ID_SIREN_MANUAL: u32 = 481;
+/// Push: the siren is actually firing (status change push)
+pub const MSG_ID_SIREN_STATUS: u32 = 547;
+/// I/O output (relay) control on supported NVRs / hubs
+pub const MSG_ID_IO_OUTPUT: u32 = 676;
+/// Push: I/O input (alarm-in terminals) state change on supported
+/// NVRs / hubs (door sensors, gate contacts, etc.)
+pub const MSG_ID_IO_INPUT: u32 = 677;
 
 /// An empty password in legacy format
 pub const EMPTY_LEGACY_PASSWORD: &str =
