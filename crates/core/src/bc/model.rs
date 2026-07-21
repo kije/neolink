@@ -28,6 +28,17 @@ pub const MSG_ID_PTZ_CONTROL: u32 = 18;
 pub const MSG_ID_PTZ_CONTROL_PRESET: u32 = 19;
 /// Reboot messages have this ID
 pub const MSG_ID_REBOOT: u32 = 23;
+/// Get/Start PTZ patrol (cruise tours)
+///
+/// Returns a `PatrolList` xml or accepts a `PtzControl`-style start/stop xml
+/// targeting a previously configured patrol id.
+pub const MSG_ID_PTZ_PATROL: u32 = 64;
+/// Get the current PTZ guard (return-to-home) configuration
+pub const MSG_ID_GET_PTZ_GUARD: u32 = 73;
+/// Set the PTZ guard (return-to-home) configuration
+pub const MSG_ID_SET_PTZ_GUARD: u32 = 74;
+/// PTZ 3D click-to-zoom: tells the camera to center on a given pixel
+pub const MSG_ID_PTZ_3D_LOCATION: u32 = 75;
 /// Request motion detection messages
 pub const MSG_ID_MOTION_REQUEST: u32 = 31;
 /// Motion detection messages
@@ -80,6 +91,10 @@ pub const MSG_ID_SET_LED_STATUS: u32 = 209;
 pub const MSG_ID_GET_PIR_ALARM: u32 = 212;
 /// Setting PIR status messages have this ID
 pub const MSG_ID_START_PIR_ALARM: u32 = 213;
+/// Get the camera auto-focus enable state
+pub const MSG_ID_GET_AUTO_FOCUS: u32 = 224;
+/// Set the camera auto-focus enable state
+pub const MSG_ID_SET_AUTO_FOCUS: u32 = 225;
 /// Set Email Task
 pub const MSG_ID_SET_EMAIL_TASK: u32 = 216;
 /// Get Email Task
@@ -104,6 +119,20 @@ pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
 pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Get the floodlight task xml
 pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
+/// Read or push the current pan/tilt position
+///
+/// Returns a `PtzPos` xml giving pan (`pPos`) and tilt (`tPos`) in the
+/// camera's native angular units. Cameras may also push this id mid-move.
+pub const MSG_ID_GET_PTZ_POSITION: u32 = 433;
+/// Push-only notification that the camera is currently moving
+///
+/// Payload is the bare integer/`PtzRunning` xml `0|1`. When a `1` arrives we
+/// should poll `MSG_ID_GET_PTZ_POSITION` so callers see a fresh position.
+pub const MSG_ID_PTZ_MOVING_STATUS: u32 = 542;
+/// Read the pre-record (battery camera pre-roll) configuration
+pub const MSG_ID_GET_PRE_RECORD: u32 = 594;
+/// Set the pre-record (battery camera pre-roll) configuration
+pub const MSG_ID_SET_PRE_RECORD: u32 = 595;
 
 /// An empty password in legacy format
 pub const EMPTY_LEGACY_PASSWORD: &str =
