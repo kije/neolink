@@ -141,6 +141,21 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// Privacy-mode state payload (cmd 622 set, cmd 623 get + push)
+    ///
+    /// Set request uses `operate = 2` and `sleep = 0|1`. Get / push replies
+    /// echo a `sleep` boolean and may carry channel-scoped wrappers.
+    #[serde(rename = "sleepState", skip_serializing_if = "Option::is_none")]
+    pub sleep_state: Option<SleepState>,
+    /// Per-scene details (cmd 604 get + 604 reply)
+    #[serde(rename = "sceneCfg", skip_serializing_if = "Option::is_none")]
+    pub scene_cfg: Option<SceneCfg>,
+    /// Scene activation / deactivation (cmd 605)
+    #[serde(rename = "sceneModeCfg", skip_serializing_if = "Option::is_none")]
+    pub scene_mode_cfg: Option<SceneModeCfg>,
+    /// List of available host scenes (cmd 603 reply)
+    #[serde(rename = "sceneList", skip_serializing_if = "Option::is_none")]
+    pub scene_list: Option<SceneList>,
 }
 
 impl BcXml {
@@ -1620,6 +1635,111 @@ pub struct User {
     pub user_set_state: String,
 }
 
+/// sleepState xml — Baichuan privacy-mode payload
+///
+/// Sent on cmd 622 (set) and received on cmd 623 (get + push).
+///
+/// On a *set* request the camera expects `operate = 2` (the "magic value" that
+/// flags a privacy-mode write) together with `sleep = 0|1`. On a *get* / push
+/// the camera echoes the current `sleep` value; `operate` is typically absent
+/// from replies.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SleepState {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// "Operate" mode. Always `2` when *setting* privacy mode; absent (or any
+    /// other value) on replies / unrelated sleepState payloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operate: Option<u8>,
+    /// Privacy / sleep flag. `1` = privacy mode on (shutter closed, HTTP /
+    /// ONVIF unresponsive), `0` = off. Encoded as `0`/`1` on the wire; the
+    /// upstream Python parser treats the field as a boolean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<u8>,
+}
+
+/// sceneCfg xml — used when reading a single scene's details (cmd 604)
+///
+/// The *request* carries only `id` (the scene to look up). The *reply* echoes
+/// `id` and adds `name` (and may add other camera-side fields we currently
+/// pass through unmodified).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SceneCfg {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Scene id. Conventional ids: `0` off, `1` away, `2` home, `3` disarm.
+    pub id: u8,
+    /// Human-readable scene name as configured on the camera (only present in
+    /// the cmd-604 *reply*).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// sceneModeCfg xml — scene activation / deactivation (cmd 605)
+///
+/// Two shapes are sent on the wire:
+///
+/// - *SetScene*:    `enable = 1`, `curSceneId = <id>`
+/// - *DisableScene*: `enable = 0` (no `curSceneId`)
+///
+/// Replies (including push notifications when scene mode changes) carry the
+/// same shape so the same struct round-trips.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SceneModeCfg {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// `1` = scene mode active, `0` = disabled.
+    pub enable: u8,
+    /// Active scene id. Required when `enable == 1`; omitted on disable.
+    #[serde(rename = "curSceneId", skip_serializing_if = "Option::is_none")]
+    pub cur_scene_id: Option<u8>,
+}
+
+/// sceneList xml — available host scenes (cmd 603 reply)
+///
+/// Wraps a list of `<id>` entries. The upstream Python parser walks
+/// `.//id` and stores each value with `UNKNOWN` as the name — the camera
+/// does not return names on cmd 603. We surface the same minimal shape:
+/// callers that need names walk back through cmd 604 (`get_scene_info`).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SceneList {
+    /// XML Version
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The list of available scene-id entries.
+    #[serde(default, rename = "id")]
+    pub ids: Vec<u8>,
+    /// Some firmwares wrap the ids in `<item><id>...</id></item>` entries
+    /// instead of bare `<id>` siblings. We keep both shapes for round-trip
+    /// safety and expose a unified `all_ids()` helper on [`SceneList`].
+    #[serde(default, rename = "item", skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<SceneListItem>,
+}
+
+impl SceneList {
+    /// Normalized view of the available scene ids, unifying the two wire
+    /// shapes (bare `<id>` siblings vs. `<item><id>...</id></item>`
+    /// entries).
+    pub fn all_ids(&self) -> Vec<u8> {
+        let mut out: Vec<u8> = self.ids.clone();
+        out.extend(self.items.iter().map(|i| i.id));
+        out
+    }
+}
+
+/// sceneList item xml — alternate wrapper shape for sceneList entries
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SceneListItem {
+    /// Scene id
+    pub id: u8,
+    /// Optional name (some firmwares include it inline)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// Convience function to return the xml version used throughout the library
 pub fn xml_ver() -> String {
     "1.1".to_string()
@@ -1944,6 +2064,192 @@ fn test_enc3_extension() {
         } => {}
         _ => panic!(),
     }
+}
+
+#[test]
+fn test_sleep_state_set_request_roundtrip() {
+    // The exact wire shape upstream's reolink_aio sends on cmd 622 (set
+    // privacy mode). The reply mirror only carries `sleep`; `operate` is
+    // optional on receive — that's exercised in
+    // `test_sleep_state_push_reply_deser` below.
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sleepState version="1.1">
+        <operate>2</operate>
+        <sleep>1</sleep>
+        </sleepState>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.sleep_state {
+        Some(SleepState {
+            operate: Some(2),
+            sleep: Some(1),
+            ..
+        }) => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+
+    let round = BcXml::try_parse(b.serialize(vec![]).unwrap().as_ref()).unwrap();
+    assert_eq!(round, b);
+}
+
+#[test]
+fn test_sleep_state_push_reply_deser() {
+    // Push / get reply shape: bare sleepState with just <sleep>.
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sleepState version="1.1">
+        <sleep>0</sleep>
+        </sleepState>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.sleep_state {
+        Some(SleepState {
+            sleep: Some(0),
+            operate: None,
+            ..
+        }) => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+}
+
+#[test]
+fn test_scene_cfg_get_request_roundtrip() {
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneCfg version="1.1">
+        <id>1</id>
+        </sceneCfg>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.scene_cfg {
+        Some(SceneCfg {
+            id: 1, name: None, ..
+        }) => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+    let round = BcXml::try_parse(b.serialize(vec![]).unwrap().as_ref()).unwrap();
+    assert_eq!(round, b);
+}
+
+#[test]
+fn test_scene_cfg_reply_with_name_deser() {
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneCfg version="1.1">
+        <id>2</id>
+        <name>Home</name>
+        </sceneCfg>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.scene_cfg {
+        Some(SceneCfg {
+            id: 2,
+            name: Some(n),
+            ..
+        }) if n == "Home" => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+}
+
+#[test]
+fn test_scene_mode_cfg_set_roundtrip() {
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneModeCfg version="1.1">
+        <enable>1</enable>
+        <curSceneId>1</curSceneId>
+        </sceneModeCfg>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.scene_mode_cfg {
+        Some(SceneModeCfg {
+            enable: 1,
+            cur_scene_id: Some(1),
+            ..
+        }) => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+    let round = BcXml::try_parse(b.serialize(vec![]).unwrap().as_ref()).unwrap();
+    assert_eq!(round, b);
+}
+
+#[test]
+fn test_scene_mode_cfg_disable_roundtrip() {
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneModeCfg version="1.1">
+        <enable>0</enable>
+        </sceneModeCfg>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    match &b.scene_mode_cfg {
+        Some(SceneModeCfg {
+            enable: 0,
+            cur_scene_id: None,
+            ..
+        }) => {}
+        other => panic!("unexpected: {:?}", other),
+    }
+    let round = BcXml::try_parse(b.serialize(vec![]).unwrap().as_ref()).unwrap();
+    assert_eq!(round, b);
+}
+
+#[test]
+fn test_scene_list_bare_ids_deser() {
+    // The shape `reolink_aio` walks: `<sceneList><id>…</id><id>…</id></sceneList>`.
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneList version="1.1">
+        <id>0</id>
+        <id>1</id>
+        <id>2</id>
+        <id>3</id>
+        </sceneList>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let list = b.scene_list.as_ref().unwrap();
+    assert_eq!(list.all_ids(), vec![0u8, 1, 2, 3]);
+}
+
+#[test]
+fn test_scene_list_item_wrapper_deser() {
+    // The alternate shape some firmwares emit: `<item><id>…</id></item>`.
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <sceneList version="1.1">
+        <item><id>1</id><name>Away</name></item>
+        <item><id>2</id><name>Home</name></item>
+        </sceneList>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let list = b.scene_list.as_ref().unwrap();
+    assert_eq!(list.all_ids(), vec![1u8, 2]);
+    assert_eq!(list.items[0].name.as_deref(), Some("Away"));
 }
 
 #[test]

@@ -348,6 +348,35 @@ pub(crate) struct MqttConfig {
     #[serde(default = "default_2000")]
     pub(crate) floodlight_update: u64,
 
+    /// Enable polling + publishing of the Baichuan privacy-mode state
+    /// (lens-shutter on/off). Cameras that don't support cmd 623 are
+    /// auto-skipped on the first failed read.
+    #[serde(default = "default_true")]
+    pub(crate) enable_privacy: bool,
+    /// Privacy-mode poll interval (ms). Push-driven updates do not honour
+    /// this; the polling loop is a fallback for firmwares that don't push
+    /// cmd 623 reliably.
+    #[validate(range(
+        min = 500,
+        message = "Update ms should be > 500",
+        code = "privacy_update"
+    ))]
+    #[serde(default = "default_5000")]
+    pub(crate) privacy_update: u64,
+
+    /// Enable polling + publishing of the Baichuan scene (arming-scenario)
+    /// state. Cameras that don't support cmd 603 / 604 are auto-skipped.
+    #[serde(default = "default_true")]
+    pub(crate) enable_scene: bool,
+    /// Scene-mode poll interval (ms).
+    #[validate(range(
+        min = 500,
+        message = "Update ms should be > 500",
+        code = "scene_update"
+    ))]
+    #[serde(default = "default_5000")]
+    pub(crate) scene_update: u64,
+
     #[serde(default)]
     pub(crate) discovery: Option<MqttDiscoveryConfig>,
 }
@@ -387,6 +416,10 @@ fn default_mqtt() -> MqttConfig {
         preview_update: 2000,
         enable_floodlight: true,
         floodlight_update: 2000,
+        enable_privacy: true,
+        privacy_update: 5000,
+        enable_scene: true,
+        scene_update: 5000,
         discovery: Default::default(),
     }
 }
@@ -585,6 +618,10 @@ fn default_max_discovery_retries() -> usize {
 
 fn default_2000() -> u64 {
     2000
+}
+
+fn default_5000() -> u64 {
+    5000
 }
 
 fn default_splash() -> SplashPattern {

@@ -104,6 +104,24 @@ pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
 pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Get the floodlight task xml
 pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
+/// Get the list of available host-level scene / arming profiles
+///
+/// This is the Baichuan-only "Scenarios" feature: an enumerated set of
+/// host-side arming profiles (off / away / home / disarm in stock firmware)
+/// that drives which alarms fire, which lights enable, etc.
+pub const MSG_ID_GET_SCENE_LIST: u32 = 603;
+/// Get the details of an individual scene by id
+pub const MSG_ID_GET_SCENE_INFO: u32 = 604;
+/// Activate a scene by id (or disable scenes when sending the DisableScene
+/// payload — see [`crate::bc::xml::SceneModeCfg`])
+pub const MSG_ID_SET_SCENE: u32 = 605;
+/// Set the camera's privacy-mode (hard lens shutter / blackout) state
+///
+/// Baichuan-only. While privacy mode is active the HTTP and ONVIF APIs are
+/// unresponsive; only the Baichuan TCP socket stays live.
+pub const MSG_ID_SET_PRIVACY_MODE: u32 = 622;
+/// Get the camera's privacy-mode state (also pushed by the camera on change)
+pub const MSG_ID_GET_PRIVACY_MODE: u32 = 623;
 
 /// An empty password in legacy format
 pub const EMPTY_LEGACY_PASSWORD: &str =
