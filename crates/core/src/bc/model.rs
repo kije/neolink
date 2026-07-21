@@ -104,6 +104,30 @@ pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
 pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Get the floodlight task xml
 pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
+/// Quick-reply audio playback (play a pre-recorded clip to the doorbell speaker)
+pub const MSG_ID_QUICK_REPLY_PLAY: u32 = 349;
+/// Hardwired chime relay set (machineStateSet)
+pub const MSG_ID_SET_DING_DONG_CTRL: u32 = 482;
+/// Hardwired chime relay get/notify (machineStateGet) — also pushed by the camera
+pub const MSG_ID_DING_DONG_CTRL: u32 = 483;
+/// Wireless chime discovery (returns the paired DingDongList) — newer firmware
+pub const MSG_ID_GET_DING_DONG_LIST: u32 = 484;
+/// Wireless chime per-device operations: delete / getParam / setParam / ringWithMusic (sub-ops 1-4)
+pub const MSG_ID_DING_DONG_OPT: u32 = 485;
+/// Per-event ringtone mapping (per-chime config) — read, newer firmware
+pub const MSG_ID_GET_DING_DONG_CFG: u32 = 486;
+/// Per-event ringtone mapping (per-chime config) — write, newer firmware
+pub const MSG_ID_SET_DING_DONG_CFG: u32 = 487;
+/// Per-event ringtone mapping (per-chime config) — read, older firmware encoding
+pub const MSG_ID_GET_DING_DONG_CFG_ALT: u32 = 606;
+/// Per-event ringtone mapping (per-chime config) — write, older firmware encoding
+pub const MSG_ID_SET_DING_DONG_CFG_ALT: u32 = 607;
+/// Wireless chime discovery — older firmware encoding
+pub const MSG_ID_GET_DING_DONG_LIST_ALT: u32 = 608;
+/// Silent window get
+pub const MSG_ID_GET_DING_DONG_SILENT: u32 = 609;
+/// Silent window set
+pub const MSG_ID_SET_DING_DONG_SILENT: u32 = 610;
 
 /// An empty password in legacy format
 pub const EMPTY_LEGACY_PASSWORD: &str =

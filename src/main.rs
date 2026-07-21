@@ -37,6 +37,7 @@ use std::fs;
 use validator::Validate;
 
 mod battery;
+mod chime;
 mod cmdline;
 mod common;
 mod config;
@@ -151,6 +152,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Users(opts)) => {
             users::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Chime(opts)) => {
+            chime::main(opts, neo_reactor.clone()).await?;
         }
     }
 

@@ -14,6 +14,7 @@ use Md5Trunc::*;
 
 mod abilityinfo;
 mod battery;
+mod chime;
 mod connection;
 mod credentials;
 mod email;
@@ -43,6 +44,7 @@ mod uid;
 mod users;
 mod version;
 
+pub use chime::{ChimeParams, HardwiredChime, SilentWindow, ToneId};
 pub(crate) use connection::*;
 pub use credentials::*;
 pub use errors::Error;
