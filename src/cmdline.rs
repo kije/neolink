@@ -34,4 +34,5 @@ pub enum Command {
     Services(super::services::Opt),
     Users(super::users::Opt),
     Onvif(super::onvif::Opt),
+    Config(super::configcmd::Opt),
 }
