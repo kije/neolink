@@ -45,6 +45,7 @@ mod image;
 mod mqtt;
 mod onvif;
 mod pir;
+mod playback;
 mod ptz;
 mod reboot;
 #[cfg(feature = "gstreamer")]
@@ -145,6 +146,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Battery(opts)) => {
             battery::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Playback(opts)) => {
+            playback::main(opts, neo_reactor.clone()).await?;
         }
         Some(Command::Services(opts)) => {
             services::main(opts, neo_reactor.clone()).await?;

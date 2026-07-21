@@ -18,6 +18,52 @@ pub const MSG_ID_LOGOUT: u32 = 2;
 pub const MSG_ID_VIDEO: u32 = 3;
 /// ID used to stop the video stream
 pub const MSG_ID_VIDEO_STOP: u32 = 4;
+/// Begin recording playback (replay) session for a specific clip
+///
+/// Used together with the file-info-list pagination cmds (14/15/16). The
+/// payload is the `FileInfoList` XML with the previously-returned `handle`.
+pub const MSG_ID_FILE_INFO_LIST_REPLAY: u32 = 5;
+/// Stop an in-progress playback / download session
+pub const MSG_ID_FILE_INFO_LIST_STOP: u32 = 7;
+/// Binary payload carrying recording video bytes during a download
+///
+/// Frames arrive with `class = 0x6482` (`BC_CLASS_FILE_DOWNLOAD`) and contain
+/// BcMedia payloads identical to a live preview stream.
+pub const MSG_ID_FILE_INFO_LIST_DL_VIDEO: u32 = 8;
+/// Begin a video download for a previously-listed clip
+pub const MSG_ID_FILE_INFO_LIST_DOWNLOAD: u32 = 13;
+/// Open a paginated file-info-list session
+///
+/// The payload is the `FileInfoList` XML with the time range and the desired
+/// `streamType` / `recordType` filters. The reply contains the session
+/// `handle` plus the first page of `FileInfo` entries.
+pub const MSG_ID_FILE_INFO_LIST_OPEN: u32 = 14;
+/// Fetch the next page of a file-info-list session (uses `handle`)
+pub const MSG_ID_FILE_INFO_LIST_GET: u32 = 15;
+/// Close a file-info-list session
+pub const MSG_ID_FILE_INFO_LIST_CLOSE: u32 = 16;
+/// Camera-initiated reply that carries the cover-preview JPEG bytes
+///
+/// Mirrors the snap (cmd 109) framing: the XML reply with the file size is
+/// followed by one or more binary packets on this msg id with
+/// `binaryData = 1` until response_code transitions to `201`.
+pub const MSG_ID_COVER_RESPONSE: u32 = 138;
+/// Query which days in a given month have at least one recording
+pub const MSG_ID_GET_DAY_RECORDS: u32 = 142;
+/// Open a paginated alarm-video search session
+///
+/// Payload is the `FindAlarmVideo` XML with the time range plus AI/alarm
+/// type filter list (`md,pir,io,people,face,vehicle,dog_cat,...`).
+pub const MSG_ID_FIND_REC_VIDEO_OPEN: u32 = 272;
+/// Fetch the next page of an alarm-video search session
+pub const MSG_ID_FIND_REC_VIDEO_GET: u32 = 273;
+/// Close an alarm-video search session
+pub const MSG_ID_FIND_REC_VIDEO_CLOSE: u32 = 274;
+/// Request a JPEG preview frame at a given timestamp
+///
+/// The reply uses the multi-packet `MSG_ID_COVER_RESPONSE` framing
+/// (similar to snap, cmd 109).
+pub const MSG_ID_COVER_PREVIEW: u32 = 298;
 /// TalkAbility messages have this ID
 pub const MSG_ID_TALKABILITY: u32 = 10;
 /// TalkReset messages have this ID
@@ -104,6 +150,15 @@ pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
 pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Get the floodlight task xml
 pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
+
+/// Header class used by the camera for replay/download streams.
+///
+/// Frames carrying recording playback (cmds 5/7/8/13) arrive with this class
+/// instead of the more usual `0x6414` / `0x0000`. It still uses the 24-byte
+/// modern header (with `payload_offset`) so it can be parsed the same way.
+///
+/// Sourced from `apocaliss92/nodelink-js` (`BC_CLASS_FILE_DOWNLOAD`).
+pub const BC_CLASS_FILE_DOWNLOAD: u16 = 0x6482;
 
 /// An empty password in legacy format
 pub const EMPTY_LEGACY_PASSWORD: &str =
@@ -315,6 +370,7 @@ impl BcHeader {
         // 0x6514: legacy, no  bin offset (initial login message, encrypted or not)
         // 0x6614: modern, no  bin offset (reply to encrypted 0x6514 login)
         // 0x6414: modern, has bin offset, encrypted if supported (re-sent login message)
+        // 0x6482: modern, has bin offset, BC_CLASS_FILE_DOWNLOAD (recording playback/download)
         // 0x0000, modern, has bin offset (most modern messages)
         self.class != 0x6514
     }
@@ -364,5 +420,5 @@ impl BcHeader {
 
 pub(super) fn has_payload_offset(class: u16) -> bool {
     // See BcHeader::is_modern() for a description of which packets have the bin offset
-    class == 0x6414 || class == 0x0000
+    class == 0x6414 || class == 0x0000 || class == BC_CLASS_FILE_DOWNLOAD
 }

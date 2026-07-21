@@ -141,6 +141,18 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// Paginated SD-card recording listing session (open / get / replies)
+    #[serde(rename = "FileInfoList", skip_serializing_if = "Option::is_none")]
+    pub file_info_list: Option<FileInfoList>,
+    /// Paginated alarm-video search session (open / get / replies)
+    #[serde(rename = "FindAlarmVideo", skip_serializing_if = "Option::is_none")]
+    pub find_alarm_video: Option<FindAlarmVideo>,
+    /// Cover preview request and reply metadata (JPEG thumbnail at a time)
+    #[serde(rename = "CoverPreview", skip_serializing_if = "Option::is_none")]
+    pub cover_preview: Option<CoverPreview>,
+    /// Day-records query: list days in a month that contain a recording
+    #[serde(rename = "DayRecords", skip_serializing_if = "Option::is_none")]
+    pub day_records: Option<DayRecords>,
 }
 
 impl BcXml {
@@ -1618,6 +1630,261 @@ pub struct User {
     /// | modify | Indicates that the user should be modified. It seems like only the password can be changed.                        |
     #[serde(rename = "userSetState")]
     pub user_set_state: String,
+}
+
+/// A `YYYYMMDD` / `hhmmss` pair used by the recording-playback XMLs.
+///
+/// The camera serialises the timestamp components into two nested tags
+/// regardless of which root encloses them (`FileInfoList`, `FileInfo`,
+/// `FindAlarmVideo`, ...). Years are 4-digit decimal, the time field is
+/// "hhmmss" packed into the *integer* representation `Hh*10000 + Mm*100 + Ss`
+/// per `starkillerOG/reolink_aio`. We keep it as a plain `u32` here so the
+/// quick-xml serializer round-trips byte-for-byte.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone, Copy)]
+pub struct PlaybackTime {
+    /// Date in YYYYMMDD form, e.g. `20241126`.
+    #[serde(rename = "year")]
+    pub year: u32,
+    /// Time of day packed as `Hh*10000 + Mm*100 + Ss`, zero-padded to six
+    /// digits when serialised. E.g. midnight = `0` -> "000", and 12:34:56 = `123456`.
+    #[serde(rename = "hour")]
+    pub hour: u32,
+}
+
+impl PlaybackTime {
+    /// Build a `PlaybackTime` from individual components. Convenience helper
+    /// so callers do not have to remember the bit layout of `hour`.
+    pub fn from_components(
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) -> Self {
+        let date = (year as u32) * 10000 + (month as u32) * 100 + (day as u32);
+        let time = (hour as u32) * 10000 + (minute as u32) * 100 + (second as u32);
+        Self {
+            year: date,
+            hour: time,
+        }
+    }
+
+    /// Start-of-day convenience: zero out the hour component.
+    pub fn start_of_day(year: u16, month: u8, day: u8) -> Self {
+        Self::from_components(year, month, day, 0, 0, 0)
+    }
+
+    /// End-of-day convenience (23:59:59).
+    pub fn end_of_day(year: u16, month: u8, day: u8) -> Self {
+        Self::from_components(year, month, day, 23, 59, 59)
+    }
+}
+
+/// Paginated SD-card recording listing.
+///
+/// Used on both the `MSG_ID_FILE_INFO_LIST_OPEN` (cmd 14) request and the
+/// reply, as well as on subsequent `MSG_ID_FILE_INFO_LIST_GET` (cmd 15)
+/// pages. The session is identified by `handle`, which the camera assigns
+/// on the first reply; the client then re-sends the same handle to fetch
+/// further pages until `file_info` is empty, and finally closes via
+/// `MSG_ID_FILE_INFO_LIST_CLOSE` (cmd 16).
+///
+/// The `record_type` field is a comma-separated allow-list of recording
+/// categories: `manual,sched,io,md,people,face,vehicle,dog_cat,visitor,other,package`.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct FileInfoList {
+    /// XML version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel of the camera (always 0 on standalone cameras).
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Session handle. Zero on the initial OPEN request, non-zero on the
+    /// reply and on subsequent GET requests.
+    #[serde(default)]
+    pub handle: u32,
+    /// Max entries per page. Cameras observed honour values up to 255.
+    #[serde(rename = "pageSize", default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    /// `mainStream` / `subStream`.
+    #[serde(rename = "streamType", skip_serializing_if = "Option::is_none")]
+    pub stream_type: Option<String>,
+    /// Cmd version. Observed value `1`.
+    #[serde(
+        rename = "cmdVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cmd_version: Option<u32>,
+    /// Comma-separated allow-list of recording categories. See struct docs.
+    #[serde(rename = "recordType", skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
+    /// Inclusive start of the time range to search.
+    #[serde(rename = "StartTime", skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<PlaybackTime>,
+    /// Inclusive end of the time range to search.
+    #[serde(rename = "EndTime", skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<PlaybackTime>,
+    /// Returned page of files. Empty on OPEN requests, populated on replies
+    /// and on GET requests/replies. An empty `file_info` on a GET reply
+    /// signals that pagination is exhausted.
+    #[serde(default, rename = "FileInfo")]
+    pub file_info: Vec<FileInfo>,
+}
+
+/// A single SD-card recording entry returned by the FileInfoList session.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct FileInfo {
+    /// File name as stored on the SD card. Used as the `handle` for download
+    /// and replay commands.
+    #[serde(rename = "fileName", default)]
+    pub file_name: String,
+    /// Size in bytes of the recording.
+    #[serde(rename = "fileSize", default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+    /// `mainStream` / `subStream`.
+    #[serde(
+        rename = "streamType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stream_type: Option<String>,
+    /// The recording category (see `FileInfoList::record_type`).
+    #[serde(
+        rename = "recordType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub record_type: Option<String>,
+    /// Recording start timestamp.
+    #[serde(rename = "StartTime", default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<PlaybackTime>,
+    /// Recording end timestamp.
+    #[serde(rename = "EndTime", default, skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<PlaybackTime>,
+}
+
+/// Paginated alarm-video search session.
+///
+/// Same pagination pattern as [`FileInfoList`] but filtered by AI/alarm
+/// type instead of recording category. The `alarm_type` field is a
+/// comma-separated allow-list:
+/// `md,pir,io,people,face,vehicle,dog_cat,visitor,other,package,cry,crossline,intrusion,loitering,legacy,loss`.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct FindAlarmVideo {
+    /// XML version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel of the camera (always 0 on standalone cameras).
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// Session handle. Zero on OPEN, non-zero on reply / GET.
+    #[serde(default)]
+    pub handle: u32,
+    /// Max entries per page.
+    #[serde(rename = "pageSize", default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    /// `mainStream` / `subStream`.
+    #[serde(rename = "streamType", skip_serializing_if = "Option::is_none")]
+    pub stream_type: Option<String>,
+    /// Cmd version. Observed value `0`.
+    #[serde(
+        rename = "cmdVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cmd_version: Option<u32>,
+    /// Comma-separated allow-list of alarm types.
+    #[serde(rename = "alarmType", skip_serializing_if = "Option::is_none")]
+    pub alarm_type: Option<String>,
+    /// Inclusive start of the time range to search.
+    #[serde(rename = "StartTime", skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<PlaybackTime>,
+    /// Inclusive end of the time range to search.
+    #[serde(rename = "EndTime", skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<PlaybackTime>,
+    /// Returned page of alarm videos. An empty list on a GET reply signals
+    /// that pagination is exhausted.
+    #[serde(default, rename = "FileInfo")]
+    pub file_info: Vec<FileInfo>,
+}
+
+/// Request a JPEG thumbnail (cover) at a specific timestamp.
+///
+/// The reply is delivered as multi-packet binary using the
+/// `MSG_ID_COVER_RESPONSE` (138) framing — the same pattern as the snap
+/// (cmd 109) command.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct CoverPreview {
+    /// XML version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel of the camera.
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// `mainStream` / `subStream`.
+    #[serde(
+        rename = "streamType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stream_type: Option<String>,
+    /// Unix timestamp in seconds of the desired preview frame. Replies
+    /// echo this back so clients can correlate.
+    #[serde(default)]
+    pub time: u64,
+    /// File name of the preview, populated on the reply.
+    #[serde(rename = "fileName", default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// JPEG size in bytes, populated on the reply.
+    #[serde(
+        rename = "pictureSize",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub picture_size: Option<u32>,
+}
+
+/// Query / reply listing the days in a given month that contain
+/// at least one SD-card recording.
+///
+/// Cameras observed reply with the set of days encoded inside a list of
+/// per-day entries; we expose the raw `Day` children so callers can pick
+/// the fields they care about and we do not silently drop unknown ones.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DayRecords {
+    /// XML version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel of the camera.
+    #[serde(rename = "channelId")]
+    pub channel_id: u8,
+    /// 4-digit year.
+    pub year: u16,
+    /// Month, `1..=12`.
+    pub month: u8,
+    /// `mainStream` / `subStream`. Optional on the request, echoed on reply.
+    #[serde(
+        rename = "streamType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stream_type: Option<String>,
+    /// The set of populated days. Empty on the request.
+    #[serde(default, rename = "Day")]
+    pub days: Vec<DayRecord>,
+}
+
+/// One populated day within a [`DayRecords`] reply.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct DayRecord {
+    /// Day of month, `1..=31`.
+    pub day: u8,
+    /// Optional bitmask of recording categories that are present on this
+    /// day. Observed values are firmware-specific; we keep the raw u32.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<u32>,
 }
 
 /// Convience function to return the xml version used throughout the library
