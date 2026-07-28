@@ -1,9 +1,10 @@
 use super::*;
 
 use crate::common::UseCounter;
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::FutureExt;
 use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
+use tokio::task::JoinSet;
 
 #[cfg(feature = "pushnoti")]
 use crate::common::PushNoti;
@@ -22,7 +23,15 @@ impl NeoInstance {
             let counter = UseCounter::new().await;
 
             let mut md = self.motion().await?;
-            let mut tasks = FuturesUnordered::new();
+            // A JoinSet (rather than a FuturesUnordered of JoinHandles) so that
+            // when the stream-pump task below finishes (the client disconnects
+            // and `media_rx` is dropped) and this set is dropped, the motion /
+            // push-notification listener tasks are *aborted*. Dropping bare
+            // JoinHandles only detaches them, which previously left one motion
+            // listener (and one PN listener) — plus their permits and the
+            // backing UseCounter task — running forever for every client that
+            // ever connected while `pause.on_motion` was enabled.
+            let mut tasks = JoinSet::new();
             // Stream for 5s on a new client always
             // This lets us negotiate the camera stream type
             let init_permit = counter.create_activated().await?;
@@ -53,7 +62,7 @@ impl NeoInstance {
             };
             // Now listen to the motion
             let thread_name = name.clone();
-            tasks.push(tokio::spawn(
+            tasks.spawn(
                 async move {
                     loop {
                         match md.changed().await {
@@ -83,7 +92,7 @@ impl NeoInstance {
                     log::debug!("Motion thread stopped {e:?}");
                     e
                 }),
-            ));
+            );
 
             #[cfg(feature = "pushnoti")]
             {
@@ -92,7 +101,7 @@ impl NeoInstance {
                 let mut pn = self.push_notifications().await?;
                 pn.borrow_and_update(); // Ignore any PNs that have already been sent before this
                 let thread_name = name.clone();
-                tasks.push(tokio::spawn(
+                tasks.spawn(
                     async move {
                         loop {
                             let noti: Option<PushNoti> = pn.borrow_and_update().clone();
@@ -120,17 +129,28 @@ impl NeoInstance {
                         log::debug!("PN thread stopped {e:?}");
                         e
                     }),
-                ));
+                );
             }
 
-            // Send the camera when the pemit is active
+            // Send the camera when the permit is active
             let camera_permit = counter.create_deactivated().await?;
             let thread_camera = self.clone();
             tokio::spawn(
                 async move {
                     loop {
-                        if let Err(e) = camera_permit.aquired_users().await {
-                            break AnyResult::Err(e);
+                        tokio::select! {
+                            biased;
+                            // The RTSP consumer dropped its receiver (the client
+                            // disconnected): tear the whole motion-watching
+                            // apparatus down now — including the listener tasks in
+                            // `tasks` — instead of lingering here, parked on the
+                            // permit, until the next motion event.
+                            _ = media_tx.closed() => break AnyResult::Ok(()),
+                            r = camera_permit.aquired_users() => {
+                                if let Err(e) = r {
+                                    break AnyResult::Err(e);
+                                }
+                            }
                         }
                         log::debug!("Starting stream");
                         tokio::select! {
@@ -150,9 +170,9 @@ impl NeoInstance {
                                 log::debug!("Stopped stream: {v:?}");
                                 v
                             },
-                            v = tasks.next() => {
+                            v = tasks.join_next() => {
                                 log::debug!("Task failed: {v:?}");
-                                Err(anyhow!("Task ended prematurly: {v:?}"))
+                                Err(anyhow!("Task ended prematurely: {v:?}"))
                             }
                         }?;
                         log::debug!("Pausing stream");
@@ -180,27 +200,35 @@ impl NeoInstance {
         let config = self.config().await?.borrow().clone();
         let strict = config.strict;
         let thread_camera = self.clone();
-        tokio::task::spawn(
-            tokio::task::spawn(async move {
-                thread_camera
-                    .run_task(move |cam| {
-                        let media_tx = media_tx.clone();
-                        Box::pin(async move {
-                            let mut media_stream = cam.start_video(stream, 0, strict).await?;
-                            log::trace!("Camera started");
-                            while let Ok(media) = media_stream.get_data().await? {
-                                media_tx.send(media).await?;
+        tokio::task::spawn(async move {
+            let res = thread_camera
+                .run_task(move |cam| {
+                    let media_tx = media_tx.clone();
+                    Box::pin(async move {
+                        let mut media_stream = cam.start_video(stream, 0, strict).await?;
+                        log::trace!("Camera started");
+                        loop {
+                            let media = tokio::select! {
+                                biased;
+                                // The RTSP consumer dropped its receiver: stop pulling
+                                // from the camera so `StreamData::drop` sends the Stop
+                                // command instead of parking on `get_data()` forever
+                                // when the camera is idle.
+                                _ = media_tx.closed() => break,
+                                media = media_stream.get_data() => media?,
+                            };
+                            match media {
+                                Ok(media) => media_tx.send(media).await?,
+                                // Stream finished / inner error: stop pulling.
+                                Err(_) => break,
                             }
-                            AnyResult::Ok(())
-                        })
+                        }
+                        AnyResult::Ok(())
                     })
-                    .await
-            })
-            .and_then(|res| async move {
-                log::debug!("Camera finished streaming: {res:?}");
-                Ok(())
-            }),
-        );
+                })
+                .await;
+            log::debug!("Camera finished streaming: {res:?}");
+        });
 
         Ok(media_rx)
     }

@@ -109,6 +109,28 @@ address = "192.168.1.187:9000"
 #
 # print_format = "None"
 
+# How the camera's audio is delivered over RTSP.
+#
+# "latm" (the default) passes AAC through untouched as MP4A-LATM (RFC 6416).
+#        No decoding happens, so there is no codec latency and the audio uses
+#        the camera's own bitrate rather than ~256kbps of raw samples.
+#        Understood by ffmpeg, VLC, go2rtc (Home Assistant, Frigate) and
+#        Blue Iris.
+# "pcm"  decodes the audio and sends raw L16 samples. Slower and much larger,
+#        but understood by everything. Use this if your client cannot play
+#        MP4A-LATM.
+#
+# ADPCM cameras are always decoded to L16 and ignore this setting.
+#
+# audio_format = "latm"
+
+# How much media the server side queues may hold, in milliseconds.
+# This bounds how far behind live a client can drift when it stops keeping
+# up. Lower drops frames sooner but stays closer to live; higher rides out
+# congestion at the cost of latency. Minimum effective value is 50.
+#
+# buffer_duration = 3000
+
 # Per-camera ONVIF settings (only meaningful when the global [onvif] block is
 # enabled). Each camera can opt out by setting `enabled = false`.
 # [cameras.onvif]

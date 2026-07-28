@@ -279,6 +279,13 @@ pub(crate) struct CameraConfig {
     #[serde(default = "default_splash", alias = "pattern")]
     pub(crate) splash_pattern: SplashPattern,
 
+    /// How AAC audio is delivered over RTSP. See [`AudioFormat`].
+    ///
+    /// Ignored for ADPCM cameras, which have no RTP passthrough format and
+    /// are always decoded to L16.
+    #[serde(default, alias = "audio", alias = "aud_format")]
+    pub(crate) audio_format: AudioFormat,
+
     #[serde(
         default = "default_max_discovery_retries",
         alias = "retries",
@@ -522,6 +529,44 @@ impl std::fmt::Display for SplashPattern {
     }
 }
 
+/// How the camera's audio is delivered over RTSP.
+///
+/// Reolink cameras emit either AAC (in ADTS framing) or DVI4 ADPCM. ADPCM
+/// always has to be decoded, since there is no standard RTP payload format
+/// for it, but AAC can be forwarded to the client untouched.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq, Default)]
+pub(crate) enum AudioFormat {
+    /// Pass AAC through untouched, payloaded as `MP4A-LATM` (RFC 6416).
+    ///
+    /// This is the low latency option: no decode, no resample and no
+    /// re-encode, so the only work done on the audio is RTP framing.
+    /// It also cuts the audio bandwidth from ~256kbps (16kHz mono L16) to
+    /// whatever the camera encoded at (typically 16-32kbps).
+    ///
+    /// Understood by ffmpeg/ffprobe, VLC, go2rtc (and therefore Home
+    /// Assistant and Frigate) and Blue Iris.
+    #[default]
+    #[serde(alias = "latm", alias = "aac", alias = "passthrough")]
+    Latm,
+    /// Decode the audio to raw samples and send it as `L16` (RFC 3551).
+    ///
+    /// Maximum client compatibility at the cost of decode latency and a
+    /// much larger RTP bitrate. This is what neolink did unconditionally
+    /// before `audio_format` existed. ADPCM always uses this path.
+    #[serde(alias = "pcm", alias = "l16", alias = "raw")]
+    Pcm,
+}
+
+impl std::fmt::Display for AudioFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let s = match self {
+            AudioFormat::Latm => "latm",
+            AudioFormat::Pcm => "pcm",
+        };
+        write!(f, "{}", s)
+    }
+}
+
 fn default_bind_addr() -> String {
     "0.0.0.0".to_string()
 }
@@ -616,5 +661,74 @@ fn validate_camera_config(camera_config: &CameraConfig) -> Result<(), Validation
             "Either camera address or uid must be given",
         )),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn camera(extra: &str) -> CameraConfig {
+        let toml = format!(
+            r#"
+            name = "Camera01"
+            username = "admin"
+            password = "password"
+            uid = "ABCDEF0123456789"
+            {extra}
+            "#
+        );
+        toml::from_str(&toml).expect("camera config should parse")
+    }
+
+    #[test]
+    fn audio_format_defaults_to_latm() {
+        assert_eq!(camera("").audio_format, AudioFormat::Latm);
+    }
+
+    #[test]
+    fn audio_format_accepts_its_spellings() {
+        for spelling in ["latm", "Latm", "aac", "passthrough"] {
+            assert_eq!(
+                camera(&format!("audio_format = \"{spelling}\"")).audio_format,
+                AudioFormat::Latm,
+                "{spelling} should select LATM"
+            );
+        }
+        for spelling in ["pcm", "Pcm", "l16", "raw"] {
+            assert_eq!(
+                camera(&format!("audio_format = \"{spelling}\"")).audio_format,
+                AudioFormat::Pcm,
+                "{spelling} should select PCM"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_format_has_the_documented_aliases() {
+        // Documented in sample_config.toml / README.
+        assert_eq!(camera("audio = \"pcm\"").audio_format, AudioFormat::Pcm);
+        assert_eq!(
+            camera("aud_format = \"pcm\"").audio_format,
+            AudioFormat::Pcm
+        );
+    }
+
+    #[test]
+    fn buffer_duration_defaults_to_three_seconds() {
+        assert_eq!(camera("").buffer_duration, 3000);
+        assert_eq!(camera("buffer_duration = 250").buffer_duration, 250);
+    }
+
+    #[test]
+    fn an_unknown_audio_format_is_rejected() {
+        let toml = r#"
+            name = "Camera01"
+            username = "admin"
+            password = "password"
+            uid = "ABCDEF0123456789"
+            audio_format = "opus"
+        "#;
+        assert!(toml::from_str::<CameraConfig>(toml).is_err());
     }
 }

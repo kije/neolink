@@ -1,9 +1,9 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
-use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_app::{AppLeakyType, AppSrc, AppSrcCallbacks, AppStreamType};
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
@@ -12,12 +12,36 @@ use neolink_core::{
 };
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
-use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+use crate::{
+    common::NeoInstance,
+    config::AudioFormat,
+    rtsp::{gst::NeoMediaFactory, timestamps::TimestampTracker},
+    AnyResult,
+};
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
-    Aac,
+    /// AAC. `adts` records whether the frames the camera sent carry ADTS
+    /// framing, which every camera seen so far does. When it holds we can
+    /// tell the appsrc exactly what it is producing instead of making
+    /// `aacparse` typefind it, which matters for the LATM path: the
+    /// payloader can only be reached once the parser has agreed on an
+    /// input format.
+    Aac {
+        adts: bool,
+    },
     Adpcm(u32),
+}
+
+/// Lower bound applied to the per-queue time limit.
+///
+/// `buffer_duration` is validated to at least 1ms, but a queue that can
+/// hold less than a frame just stalls the pipeline, so we never configure
+/// one below this.
+const MIN_QUEUE_TIME: Duration = Duration::from_millis(50);
+
+fn clamp_queue_time(requested: Duration) -> Duration {
+    requested.max(MIN_QUEUE_TIME)
 }
 
 #[derive(Clone, Debug)]
@@ -30,9 +54,20 @@ struct StreamConfig {
     fps_table: Vec<u32>,
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
+    /// How much media the pipeline queues are allowed to hold. This is the
+    /// dominant contributor to the latency neolink itself adds, so it is
+    /// exposed as the per-camera `buffer_duration` option.
+    queue_time: Duration,
+    /// Whether AAC is passed through as LATM or decoded to L16.
+    audio_format: AudioFormat,
 }
 impl StreamConfig {
-    async fn new(instance: &NeoInstance, name: StreamKind) -> AnyResult<Self> {
+    async fn new(
+        instance: &NeoInstance,
+        name: StreamKind,
+        queue_time: Duration,
+        audio_format: AudioFormat,
+    ) -> AnyResult<Self> {
         let (resolution, bitrate, fps, fps_table, bitrate_table) = instance
             .run_passive_task(|cam| {
                 Box::pin(async move {
@@ -92,6 +127,8 @@ impl StreamConfig {
             bitrate_table,
             vid_type: None,
             aud_type: None,
+            queue_time: clamp_queue_time(queue_time),
+            audio_format,
         })
     }
 
@@ -113,8 +150,13 @@ impl StreamConfig {
         match media {
             BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })
             | BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }) => self.update_fps(*fps as u32),
-            BcMedia::Aac(_) => {
-                self.aud_type = Some(AudioType::Aac);
+            BcMedia::Aac(aac) => {
+                // `duration()` parses the ADTS header and returns `None`
+                // when the syncword is not there, so it doubles as an
+                // ADTS probe.
+                self.aud_type = Some(AudioType::Aac {
+                    adts: aac.duration().is_some(),
+                });
             }
             BcMedia::Adpcm(adpcm) => {
                 self.aud_type = Some(AudioType::Adpcm(adpcm.block_size()));
@@ -178,18 +220,33 @@ pub(super) async fn make_factory(
                         let mut buffer = vec![];
                         let mut frame_count = 0usize;
 
-                        let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
-                            stream_config.update_from_media(&media);
-                            buffer.push(media);
-                            if frame_count > 10
-                                || (stream_config.vid_type.is_some()
-                                    && stream_config.aud_type.is_some())
-                            {
-                                break;
+                        let mut stream_config = StreamConfig::new(
+                            &camera,
+                            stream,
+                            Duration::from_millis(config.buffer_duration),
+                            config.audio_format,
+                        )
+                        .await?;
+                        // Bound stream-type negotiation. A slow or flaky camera that
+                        // never delivers frames must not hang this per-client task
+                        // forever holding `media_rx` / `element`; on timeout we build
+                        // with whatever we have learned so far (falling back to the
+                        // "Stream not Ready" splash when the video type is still
+                        // unknown).
+                        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                            while let Some(media) = media_rx.recv().await {
+                                stream_config.update_from_media(&media);
+                                buffer.push(media);
+                                if frame_count > 10
+                                    || (stream_config.vid_type.is_some()
+                                        && stream_config.aud_type.is_some())
+                                {
+                                    break;
+                                }
+                                frame_count += 1;
                             }
-                            frame_count += 1;
-                        }
+                        })
+                        .await;
 
                         log::trace!("{name}::{stream}: Building the pipeline");
                         // Build the right video pipeline
@@ -210,8 +267,8 @@ pub(super) async fn make_factory(
 
                         // Build the right audio pipeline
                         let aud_src = match stream_config.aud_type.as_ref() {
-                            Some(AudioType::Aac) => {
-                                let src = build_aac(&element, &stream_config)?;
+                            Some(AudioType::Aac { adts }) => {
+                                let src = build_aac(&element, *adts, &stream_config)?;
                                 AnyResult::Ok(Some(src))
                             }
                             Some(AudioType::Adpcm(block_size)) => {
@@ -240,43 +297,56 @@ pub(super) async fn make_factory(
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
-                        // Run blocking code on a seperate thread
+                        // Run blocking code on a separate thread
                         // This is not an async thread
+                        let pump_handle = tokio::runtime::Handle::current();
                         std::thread::spawn(move || {
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
-                            let mut pools = Default::default();
+                            let mut tracker = TimestampTracker::new();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
-                                send_to_sources(
-                                    buffered,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                )?;
+                                send_to_sources(buffered, &vid_src, &aud_src, &mut tracker)?;
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
-                                    data,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                );
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                            loop {
+                                // Wait for the next frame, but wake periodically so we
+                                // notice the client disconnecting even when the camera
+                                // has stopped sending frames (e.g. motion paused).
+                                // Without this bound the thread parks on recv() forever
+                                // after the client leaves, pinning the AppSrcs and the
+                                // upstream camera session.
+                                match pump_handle.block_on(async {
+                                    tokio::time::timeout(Duration::from_secs(2), media_rx.recv())
+                                        .await
+                                }) {
+                                    Ok(Some(data)) => {
+                                        let r =
+                                            send_to_sources(data, &vid_src, &aud_src, &mut tracker);
+                                        if let Err(r) = &r {
+                                            log::info!("Failed to send to source: {r:?}");
+                                        }
+                                        r?;
+                                    }
+                                    // Channel closed: nothing more will arrive.
+                                    Ok(None) => break,
+                                    // No frame for a while: stop if the media has been
+                                    // torn down (i.e. the client disconnected). Log and
+                                    // break gracefully rather than `?`-ing the error
+                                    // away, since this thread's JoinHandle is discarded.
+                                    Err(_) => {
+                                        if let Some(src) = vid_src.as_ref().or(aud_src.as_ref()) {
+                                            if let Err(e) = check_live(src) {
+                                                log::debug!(
+                                                    "{name}::{stream}: Stopping frame pump: {e:?}"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
-                                r?;
                             }
-                            log::trace!("All media recieved");
+                            log::trace!("All media received");
                             AnyResult::Ok(())
                         });
                         AnyResult::Ok(())
@@ -301,51 +371,66 @@ pub(super) async fn make_factory(
 
 fn send_to_sources(
     data: BcMedia,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
-    stream_config: &StreamConfig,
+    tracker: &mut TimestampTracker,
 ) -> AnyResult<()> {
-    // Update TS
     match data {
         BcMedia::Aac(aac) => {
             let duration = aac.duration().expect("Could not calculate AAC duration");
+            let ts_us = tracker.next_audio_us(duration);
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    aac.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                log::debug!("Sending AAC: {:?}", Duration::from_micros(ts_us));
+                send_to_appsrc(aud_src, aac.data, Duration::from_micros(ts_us), false)?;
             }
-            *aud_ts += duration;
         }
         BcMedia::Adpcm(adpcm) => {
             let duration = adpcm
                 .duration()
                 .expect("Could not calculate ADPCM duration");
+            let ts_us = tracker.next_audio_us(duration);
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(ts_us));
+                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(ts_us), false)?;
             }
-            *aud_ts += duration;
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
-            if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+        BcMedia::Iframe(BcMediaIframe {
+            data,
+            microseconds,
+            time,
+            ..
+        }) => {
+            let ts_us = tracker.next_video_us(microseconds);
+            if let Some(posix) = time {
+                log::trace!(
+                    "IFrame: pts={:?} camera_us={} posix={}",
+                    Duration::from_micros(ts_us),
+                    microseconds,
+                    posix
+                );
+            } else {
+                log::trace!(
+                    "IFrame: pts={:?} camera_us={}",
+                    Duration::from_micros(ts_us),
+                    microseconds
+                );
             }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
+            if let Some(vid_src) = vid_src.as_ref() {
+                send_to_appsrc(vid_src, data, Duration::from_micros(ts_us), false)?;
+            }
+        }
+        BcMedia::Pframe(BcMediaPframe {
+            data, microseconds, ..
+        }) => {
+            let ts_us = tracker.next_video_us(microseconds);
+            log::trace!(
+                "PFrame: pts={:?} camera_us={}",
+                Duration::from_micros(ts_us),
+                microseconds
+            );
+            if let Some(vid_src) = vid_src.as_ref() {
+                send_to_appsrc(vid_src, data, Duration::from_micros(ts_us), true)?;
+            }
         }
         _ => {}
     }
@@ -356,7 +441,7 @@ fn send_to_appsrc(
     appsrc: &AppSrc,
     data: Vec<u8>,
     mut ts: Duration,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
+    is_delta: bool,
 ) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
@@ -380,69 +465,48 @@ fn send_to_appsrc(
             return Ok(());
         }
     }
-    let buf = {
-        let msg_size = data.len();
 
-        // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
-
-        // Get a buffer from the pool and then copy in the data
-        let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
-            let time = ClockTime::from_useconds(ts.as_micros() as u64);
-            gst_buf_mut.set_dts(time);
-            gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-            gst_buf_data.copy_from_slice(data.as_slice());
-            drop(gst_buf_data);
-            new_buf
-        };
-
-        // Return the new buffer with the data
-        gst_buf
-    };
-
-    // Push buffer into the appsrc
-    match appsrc.push_buffer(buf) {
-        Ok(_) => {
-            // log::info!(
-            //     "Send {}{} on {}",
-            //     data.data.len(),
-            //     if data.keyframe { " (keyframe)" } else { "" },
-            //     appsrc.name()
-            // );
-            Ok(())
+    // Wrap the frame bytes directly into a gstreamer buffer (zero-copy).
+    //
+    // This previously used a `HashMap<usize, BufferPool>` keyed by the frame
+    // length. Compressed video frame sizes vary continuously, so that map
+    // accumulated a separate, permanently-active `BufferPool` (each one
+    // preallocating several buffers of that exact size) for every unique
+    // frame size ever observed. Over a long-running stream that grows without
+    // bound and is the source of the reported memory leak. `from_mut_slice`
+    // hands the `Vec` straight to gstreamer with no pool and no extra copy.
+    let mut buf = gstreamer::Buffer::from_mut_slice(data);
+    {
+        let buf_mut = buf
+            .get_mut()
+            .expect("freshly created buffer is uniquely owned");
+        let time = ClockTime::from_useconds(ts.as_micros() as u64);
+        buf_mut.set_dts(time);
+        buf_mut.set_pts(time);
+        // A buffer without DELTA_UNIT is a sync point. Every buffer we
+        // pushed used to look like a keyframe, so downstream could not
+        // tell an I-frame from a P-frame and had to treat mid-GOP data as
+        // a valid place to start a client.
+        if is_delta {
+            buf_mut.set_flags(gstreamer::BufferFlags::DELTA_UNIT);
         }
+    }
+
+    // Push buffer into the appsrc. Back-pressure is handled by the appsrc
+    // itself: it is configured with `leaky-type=downstream` and a bounded
+    // `max-bytes` (see the appsrc setup in the `pipe_*` builders), so when a
+    // slow client cannot keep up the oldest queued frames are dropped rather
+    // than the queue (and our memory) growing without bound.
+    match appsrc.push_buffer(buf) {
+        Ok(_) => Ok(()),
         Err(FlowError::Flushing) => {
-            // Buffer is full just skip
-            log::info!(
-                "Buffer full on {} pausing stream until client consumes frames",
-                appsrc.name()
-            );
+            // The pad is flushing (the media is being reconfigured or torn
+            // down); drop this frame.
+            log::debug!("{}: dropping frame while appsrc is flushing", appsrc.name());
             Ok(())
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
-    }?;
-    // Check if we need to pause
-    if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Paused)
-    {
-        appsrc.set_state(gstreamer::State::Playing).unwrap();
-    } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Playing)
-    {
-        appsrc.set_state(gstreamer::State::Paused).unwrap();
     }
-    Ok(())
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
@@ -475,7 +539,7 @@ fn build_unknown(bin: &Element, pattern: &str) -> Result<()> {
     let source = make_element("videotestsrc", "testvidsrc")?;
     source.set_property_from_str("pattern", pattern);
     source.set_property("num-buffers", 500i32); // Send buffers then EOS
-    let queue = make_queue("queue0", 1024 * 1024 * 4)?;
+    let queue = make_queue("queue0", 1024 * 1024 * 4, Duration::from_secs(1))?;
 
     let overlay = make_element("textoverlay", "overlay")?;
     overlay.set_property("text", "Stream not Ready");
@@ -505,6 +569,60 @@ struct Linked {
     output: Element,
 }
 
+/// Create an `appsrc` configured the way every neolink source wants it.
+fn make_appsrc(name: &str, buffer_size: u32) -> Result<AppSrc> {
+    let source = make_element("appsrc", name)?
+        .dynamic_cast::<AppSrc>()
+        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
+
+    source.set_is_live(false);
+    source.set_block(false);
+    // Report no source latency. `min-latency` is in nanoseconds and was
+    // previously set to `1000 / fps` — 40ns for a 25fps stream — which was
+    // an accidental no-op rather than the one frame it reads as. Zero is
+    // both what that actually did and what we want: whatever we declare
+    // here is added to the delay before a client starts playing, and this
+    // appsrc introduces no latency of its own. Jitter is absorbed by the
+    // downstream queue instead.
+    source.set_min_latency(0);
+    source.set_property("emit-signals", false);
+    source.set_max_bytes(buffer_size as u64);
+    source.set_do_timestamp(false);
+    source.set_stream_type(AppStreamType::Stream);
+    // Bound memory use under a slow/stalled client: once `max-bytes` is
+    // reached the appsrc drops the oldest queued frames instead of letting
+    // its internal queue grow without limit.
+    source.set_leaky_type(AppLeakyType::Downstream);
+
+    Ok(source)
+}
+
+/// Apply the low latency settings shared by the H264/H265 RTP payloaders.
+///
+/// * `config-interval=-1` multiplexes the parameter sets (SPS/PPS, plus VPS
+///   for H265) into the stream with every IDR frame. Without it they are
+///   only advertised in the SDP, so a client that joins between parameter
+///   set updates — or any client that ignores the SDP `sprop-` fields — has
+///   to wait for the camera to volunteer them again before it can decode.
+/// * `aggregate-mode=zero-latency` bundles the NAL units that make up one
+///   access unit into STAP-A packets but still forwards them as soon as the
+///   VCL unit arrives, so it saves packets without holding a frame back
+///   (unlike `max-stap`, which costs a full frame of latency).
+///
+/// `aggregate-mode` only exists from GStreamer 1.18, so it is set
+/// defensively; setting a property an element does not have would panic.
+fn tune_video_payloader(payload: &Element) {
+    payload.set_property("config-interval", -1i32);
+    if payload.has_property("aggregate-mode", None) {
+        payload.set_property_from_str("aggregate-mode", "zero-latency");
+    } else {
+        log::debug!(
+            "{}: no `aggregate-mode`, leaving NAL aggregation at the default",
+            payload.name()
+        );
+    }
+}
+
 fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     let buffer_size = buffer_size(stream_config.bitrate);
     log::debug!(
@@ -516,22 +634,10 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
     log::debug!("Building H264 Pipeline");
-    let source = make_element("appsrc", "vidsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-
-    source.set_is_live(false);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
-
-    let source = source
+    let source = make_appsrc("vidsrc", buffer_size)?
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
-    let queue = make_queue("source_queue", buffer_size)?;
+    let queue = make_queue("source_queue", buffer_size, stream_config.queue_time)?;
     let parser = make_element("h264parse", "parser")?;
     // let stamper = make_element("h264timestamper", "stamper")?;
 
@@ -556,6 +662,7 @@ fn build_h264(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
     let payload = make_element("rtph264pay", "pay0")?;
+    tune_video_payloader(&payload);
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
@@ -568,21 +675,10 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
     log::debug!("Building H265 Pipeline");
-    let source = make_element("appsrc", "vidsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
-
-    let source = source
+    let source = make_appsrc("vidsrc", buffer_size)?
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
-    let queue = make_queue("source_queue", buffer_size)?;
+    let queue = make_queue("source_queue", buffer_size, stream_config.queue_time)?;
     let parser = make_element("h265parse", "parser")?;
     // let stamper = make_element("h265timestamper", "stamper")?;
 
@@ -607,36 +703,86 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
     let payload = make_element("rtph265pay", "pay0")?;
+    tune_video_payloader(&payload);
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
 }
 
-fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    // Audio seems to run at about 800kbs
-    let buffer_size = 512 * 1416;
+/// Audio buffer budget. Audio seems to run at about 800kbs.
+const AUD_BUFFER_SIZE: u32 = 512 * 1416;
+
+/// Build the AAC passthrough (LATM) pipeline.
+///
+/// ```text
+/// appsrc ! queue ! aacparse ! audio/mpeg,stream-format=raw ! rtpmp4apay name=pay1
+/// ```
+///
+/// The camera hands us AAC in ADTS framing. `aacparse` strips the ADTS
+/// headers and derives the `AudioSpecificConfig`, which `rtpmp4apay` then
+/// advertises in the SDP as the `config=` parameter of an `MP4A-LATM`
+/// (RFC 6416) media description. The compressed frames themselves are
+/// forwarded to the client bit for bit.
+///
+/// Compared to the L16 path this removes an AAC decode, a format
+/// conversion and a ~10x bitrate increase from the serving path, and it
+/// drops the `fallbackswitch` (which cannot sit in a compressed stream)
+/// along with the buffering it needs to do its silence substitution.
+fn pipe_aac_latm(bin: &Element, adts: bool, stream_config: &StreamConfig) -> Result<Linked> {
+    let bin = bin
+        .clone()
+        .dynamic_cast::<Bin>()
+        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
+    log::debug!("Building Aac LATM passthrough pipeline");
+
+    let source = make_appsrc("audsrc", AUD_BUFFER_SIZE)?;
+    set_adts_caps(&source, adts);
+    let source = source
+        .dynamic_cast::<Element>()
+        .map_err(|_| anyhow!("Cannot cast back"))?;
+
+    let queue = make_queue("audqueue", AUD_BUFFER_SIZE, stream_config.queue_time)?;
+    let parser = make_element("aacparse", "audparser")?;
+    // `rtpmp4apay` only accepts unframed AAC, so ask `aacparse` to convert
+    // the camera's ADTS framing to `raw` rather than passing it through.
+    let raw_aac = make_element("capsfilter", "audrawcaps")?;
+    raw_aac.set_property(
+        "caps",
+        Caps::builder("audio/mpeg")
+            .field("mpegversion", 4i32)
+            .field("stream-format", "raw")
+            .build(),
+    );
+
+    bin.add_many([&source, &queue, &parser, &raw_aac])?;
+    Element::link_many([&source, &queue, &parser, &raw_aac])?;
+
+    let source = source
+        .dynamic_cast::<AppSrc>()
+        .map_err(|_| anyhow!("Cannot convert appsrc"))?;
+    Ok(Linked {
+        appsrc: source,
+        output: raw_aac,
+    })
+}
+
+/// Build the AAC -> raw -> L16 pipeline.
+///
+/// Kept for `audio_format = "pcm"`, and used automatically when the
+/// `rtpmp4apay` payloader is not available in the local GStreamer install.
+fn pipe_aac_pcm(bin: &Element, adts: bool, stream_config: &StreamConfig) -> Result<Linked> {
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
     log::debug!("Building Aac pipeline");
-    let source = make_element("appsrc", "audsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-
-    source.set_is_live(false);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
-
+    let source = make_appsrc("audsrc", AUD_BUFFER_SIZE)?;
+    set_adts_caps(&source, adts);
     let source = source
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
 
-    let queue = make_queue("audqueue", buffer_size)?;
+    let queue = make_queue("audqueue", AUD_BUFFER_SIZE, stream_config.queue_time)?;
     let parser = make_element("aacparse", "audparser")?;
     let decoder = match make_element("faad", "auddecoder_faad") {
         Ok(ele) => Ok(ele),
@@ -679,22 +825,73 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     })
 }
 
-fn build_aac(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
-    let linked = pipe_aac(bin, stream_config)?;
+/// Tell the audio appsrc it is producing ADTS-framed AAC.
+///
+/// Only done when we actually saw an ADTS syncword on the wire; otherwise
+/// the caps are left unset and `aacparse` typefinds the framing as before,
+/// so a camera with some other AAC framing is no worse off than it was.
+fn set_adts_caps(source: &AppSrc, adts: bool) {
+    if adts {
+        source.set_caps(Some(
+            &Caps::builder("audio/mpeg")
+                .field("mpegversion", 4i32)
+                .field("stream-format", "adts")
+                .build(),
+        ));
+    }
+}
+
+/// Whether the LATM payloader is present in this GStreamer install.
+///
+/// `rtpmp4apay` lives in the same `rtp` plugin as the `rtpL16pay` we
+/// already require, so this should always be true; we check anyway so a
+/// stripped-down install degrades to L16 instead of failing to serve
+/// audio at all.
+fn has_latm_payloader() -> bool {
+    ElementFactory::find("rtpmp4apay").is_some()
+}
+
+fn build_aac(bin: &Element, adts: bool, stream_config: &StreamConfig) -> Result<AppSrc> {
+    // Decide before touching the bin: a half-built pipeline cannot be
+    // unwound cleanly, so we must not start on LATM and then discover the
+    // payloader is missing.
+    let use_latm = match stream_config.audio_format {
+        AudioFormat::Latm if has_latm_payloader() => true,
+        AudioFormat::Latm => {
+            log::warn!(
+                "audio_format is \"latm\" but the `rtpmp4apay` element is missing \
+                 (install the rtp plugin from gst-plugins-good); \
+                 falling back to decoding the audio to L16"
+            );
+            false
+        }
+        AudioFormat::Pcm => false,
+    };
+
+    let (linked, payload) = if use_latm {
+        (
+            pipe_aac_latm(bin, adts, stream_config)?,
+            make_element("rtpmp4apay", "pay1")?,
+        )
+    } else {
+        (
+            pipe_aac_pcm(bin, adts, stream_config)?,
+            make_element("rtpL16pay", "pay1")?,
+        )
+    };
 
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
-    let payload = make_element("rtpL16pay", "pay1")?;
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
 }
 
 fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> Result<Linked> {
-    let buffer_size = 512 * 1416;
+    let buffer_size = AUD_BUFFER_SIZE;
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -707,16 +904,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     // ! audioconvert
     // ! rtpL16pay name=pay1
 
-    let source = make_element("appsrc", "audsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
+    let source = make_appsrc("audsrc", buffer_size)?;
 
     source.set_caps(Some(
         &Caps::builder("audio/x-adpcm")
@@ -731,7 +919,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
 
-    let queue = make_queue("audqueue", buffer_size)?;
+    let queue = make_queue("audqueue", buffer_size, stream_config.queue_time)?;
     let decoder = make_element("decodebin", "auddecoder")?;
     let encoder = make_element("audioconvert", "audencoder")?;
     let encoder_out = encoder.clone();
@@ -771,35 +959,22 @@ fn build_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> 
 
 #[allow(dead_code)]
 fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    // Audio seems to run at about 800kbs
-    let buffer_size = 512 * 1416;
+    let buffer_size = AUD_BUFFER_SIZE;
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
     log::debug!("Building Silence pipeline");
-    let source = make_element("appsrc", "audsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-
-    source.set_is_live(false);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
-
-    let source = source
+    let source = make_appsrc("audsrc", buffer_size)?
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
 
-    let sink_queue = make_queue("audsinkqueue", buffer_size)?;
+    let sink_queue = make_queue("audsinkqueue", buffer_size, stream_config.queue_time)?;
     let sink = make_element("fakesink", "silence_sink")?;
 
     let silence = make_element("audiotestsrc", "audsilence")?;
     silence.set_property_from_str("wave", "silence");
-    let src_queue = make_queue("audsinkqueue", buffer_size)?;
+    let src_queue = make_queue("audsrcqueue", buffer_size, stream_config.queue_time)?;
     let encoder = make_element("audioconvert", "audencoder")?;
 
     bin.add_many([&source, &sink_queue, &sink, &silence, &src_queue, &encoder])?;
@@ -841,7 +1016,7 @@ struct AppSrcPair {
 
 //     // AUD
 //     let aud_link = match stream_config.aud_format {
-//         AudFormat::Aac => pipe_aac(bin, stream_config)?,
+//         AudFormat::Aac => pipe_aac_latm(bin, adts, stream_config)?,
 //         AudFormat::Adpcm(block) => pipe_adpcm(bin, block, stream_config)?,
 //         AudFormat::None => pipe_silence(bin, stream_config)?,
 //     };
@@ -880,6 +1055,8 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
             "rtpjitterbuffer" => "rtp (gst-plugins-good)",
             "aacparse" => "audioparsers (gst-plugins-good)",
             "rtpL16pay" => "rtp (gst-plugins-good)",
+            "rtpmp4apay" => "rtp (gst-plugins-good)",
+            "capsfilter" => "coreelements (gstreamer)",
             "x264enc" => "x264 (gst-plugins-ugly)",
             "x265enc" => "x265 (gst-plugins-bad)",
             "avdec_h264" => "libav (gst-libav)",
@@ -944,20 +1121,277 @@ fn make_dbl_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
     Ok(bin)
 }
 
-fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
+/// Build a `queue` bounded by both bytes and time.
+///
+/// `max_time` is the ceiling on how much media the queue may hold, and so
+/// on how much latency it can add once the client stops keeping up. It
+/// comes from the camera's `buffer_duration` option; it used to be
+/// hard-coded to 5 seconds, which meant a stalling client could push
+/// neolink's own contribution to the glass-to-glass delay up to that.
+fn make_queue(name: &str, buffer_size: u32, max_time: Duration) -> AnyResult<Element> {
     let queue = make_element("queue", &format!("queue1_{}", name))?;
     queue.set_property("max-size-bytes", buffer_size);
     queue.set_property("max-size-buffers", 0u32);
-    queue.set_property("max-size-time", 0u64);
-    queue.set_property(
-        "max-size-time",
-        std::convert::TryInto::<u64>::try_into(tokio::time::Duration::from_secs(5).as_nanos())
-            .unwrap_or(0),
-    );
+    queue.set_property("max-size-time", max_time.as_nanos() as u64);
     Ok(queue)
 }
 
 fn buffer_size(bitrate: u32) -> u32 {
     // 0.1 seconds (according to bitrate) or 4kb what ever is larger
     std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gstreamer::{Pipeline, State};
+
+    fn test_stream_config(audio_format: AudioFormat) -> StreamConfig {
+        StreamConfig {
+            resolution: [1920, 1080],
+            bitrate: 2048 * 1024,
+            fps: 25,
+            bitrate_table: vec![],
+            fps_table: vec![],
+            vid_type: None,
+            aud_type: None,
+            queue_time: Duration::from_millis(500),
+            audio_format,
+        }
+    }
+
+    /// Build one ADTS-framed AAC-LC frame: 16kHz, mono, 1024 samples.
+    ///
+    /// The payload is filler. `aacparse` derives the `AudioSpecificConfig`
+    /// that `rtpmp4apay` advertises purely from the ADTS header fields, so
+    /// framing and payloading can be exercised without a real encoder.
+    fn adts_frame(payload_len: usize) -> Vec<u8> {
+        const HEADER_LEN: usize = 7;
+        const PROFILE_AAC_LC: u8 = 1;
+        const FREQ_IDX_16K: u8 = 8;
+        const CHANNELS_MONO: u8 = 1;
+
+        let len = HEADER_LEN + payload_len;
+        let mut frame = vec![
+            0xFF,
+            // MPEG-4, layer 00, no CRC.
+            0xF1,
+            (PROFILE_AAC_LC << 6) | (FREQ_IDX_16K << 2) | (CHANNELS_MONO >> 2),
+            ((CHANNELS_MONO & 0b11) << 6) | ((len >> 11) & 0b11) as u8,
+            ((len >> 3) & 0xFF) as u8,
+            // Low 3 bits of the length, then buffer fullness = VBR.
+            (((len & 0b111) << 5) | 0b1_1111) as u8,
+            // Rest of buffer fullness, and one raw data block.
+            0xFC,
+        ];
+        frame.resize(len, 0xAA);
+        frame
+    }
+
+    /// The elements a test needs, or `None` if this GStreamer install is
+    /// missing one (CI installs the dev headers but not every plugin).
+    fn require(elements: &[&str]) -> bool {
+        gstreamer::init().expect("gstreamer should initialise");
+        for element in elements {
+            if ElementFactory::find(element).is_none() {
+                eprintln!("skipping: `{element}` is not available");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Anything we declare here is added to the delay before a client
+    /// starts playing, and the appsrc adds no latency of its own.
+    #[test]
+    fn appsrc_declares_no_latency() {
+        if !require(&["appsrc"]) {
+            return;
+        }
+        let source = make_appsrc("testsrc", 4096).unwrap();
+        assert_eq!(source.property::<i64>("min-latency"), 0);
+    }
+
+    #[test]
+    fn queue_time_is_clamped_to_something_usable() {
+        // `buffer_duration` validates down to 1ms; a queue that small
+        // cannot hold a single frame and would just stall the pipeline.
+        assert_eq!(clamp_queue_time(Duration::from_millis(1)), MIN_QUEUE_TIME);
+        assert_eq!(
+            clamp_queue_time(Duration::from_millis(3000)),
+            Duration::from_millis(3000)
+        );
+    }
+
+    /// Push synthetic ADTS through the real `build_aac` pipeline and check
+    /// the RTP caps the client would be offered in the SDP.
+    #[test]
+    fn aac_latm_pipeline_negotiates_mp4a_latm() {
+        if !require(&["appsrc", "queue", "aacparse", "capsfilter", "rtpmp4apay"]) {
+            return;
+        }
+
+        let pipeline = Pipeline::new();
+        let bin = pipeline.clone().upcast::<Element>();
+        let config = test_stream_config(AudioFormat::Latm);
+
+        let appsrc = build_aac(&bin, true, &config).expect("LATM pipeline should build");
+
+        let payloader = pipeline.by_name("pay1").expect("pay1 should exist");
+        assert_eq!(
+            payloader.factory().map(|f| f.name().to_string()).as_deref(),
+            Some("rtpmp4apay"),
+            "LATM should be payloaded by rtpmp4apay"
+        );
+
+        let sink = ElementFactory::make_with_name("fakesink", Some("testsink")).unwrap();
+        pipeline.add(&sink).unwrap();
+        payloader.link(&sink).unwrap();
+
+        pipeline.set_state(State::Playing).unwrap();
+
+        for i in 0..20u64 {
+            let mut buf = gstreamer::Buffer::from_mut_slice(adts_frame(64));
+            let time = ClockTime::from_mseconds(i * 64);
+            let buf_mut = buf.get_mut().unwrap();
+            buf_mut.set_pts(time);
+            buf_mut.set_dts(time);
+            appsrc.push_buffer(buf).expect("appsrc should accept ADTS");
+        }
+        appsrc.end_of_stream().unwrap();
+
+        let msg = pipeline
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                ClockTime::from_seconds(10),
+                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+            )
+            .expect("pipeline should reach EOS");
+        if let gstreamer::MessageView::Error(err) = msg.view() {
+            pipeline.set_state(State::Null).unwrap();
+            panic!("LATM pipeline errored: {:?}", err.error());
+        }
+
+        let caps = payloader
+            .static_pad("src")
+            .unwrap()
+            .current_caps()
+            .expect("payloader should have negotiated caps");
+        let s = caps.structure(0).unwrap();
+
+        assert_eq!(s.name(), "application/x-rtp");
+        assert_eq!(s.get::<String>("media").unwrap(), "audio");
+        assert_eq!(s.get::<String>("encoding-name").unwrap(), "MP4A-LATM");
+        // The clock rate and `config` are what let a client decode the
+        // passed-through frames; without them the SDP is unusable.
+        assert_eq!(s.get::<i32>("clock-rate").unwrap(), 16_000);
+        assert!(
+            !s.get::<String>("config").unwrap().is_empty(),
+            "SDP needs the AudioSpecificConfig"
+        );
+
+        pipeline.set_state(State::Null).unwrap();
+    }
+
+    /// `audio_format = "pcm"` must still produce the decode-to-L16 shape.
+    #[test]
+    fn aac_pcm_pipeline_uses_the_l16_payloader() {
+        if !require(&["appsrc", "queue", "aacparse", "audioconvert", "rtpL16pay"]) {
+            return;
+        }
+        if ElementFactory::find("faad").is_none() && ElementFactory::find("avdec_aac").is_none() {
+            eprintln!("skipping: no AAC decoder available");
+            return;
+        }
+
+        let pipeline = Pipeline::new();
+        let bin = pipeline.clone().upcast::<Element>();
+        let config = test_stream_config(AudioFormat::Pcm);
+
+        build_aac(&bin, true, &config).expect("PCM pipeline should build");
+
+        let payloader = pipeline.by_name("pay1").expect("pay1 should exist");
+        assert_eq!(
+            payloader.factory().map(|f| f.name().to_string()).as_deref(),
+            Some("rtpL16pay"),
+        );
+        // The decoder is the thing LATM exists to avoid; assert the PCM
+        // path really does still have one.
+        assert!(
+            pipeline.by_name("auddecoder_faad").is_some()
+                || pipeline.by_name("auddecoder_avdec_aac").is_some(),
+            "PCM path should decode the AAC"
+        );
+
+        pipeline.set_state(State::Null).unwrap();
+    }
+
+    /// The H264/H265 payloaders must carry parameter sets in-band and must
+    /// not hold a frame back to aggregate NAL units.
+    #[test]
+    fn video_payloaders_are_tuned_for_low_latency() {
+        for (parser, payloader_name, build) in [
+            (
+                "h264parse",
+                "rtph264pay",
+                build_h264 as fn(&Element, &StreamConfig) -> Result<AppSrc>,
+            ),
+            ("h265parse", "rtph265pay", build_h265),
+        ] {
+            if !require(&["appsrc", "queue", parser, payloader_name]) {
+                continue;
+            }
+
+            let pipeline = Pipeline::new();
+            let bin = pipeline.clone().upcast::<Element>();
+            let config = test_stream_config(AudioFormat::Latm);
+
+            build(&bin, &config).expect("video pipeline should build");
+
+            let payloader = pipeline.by_name("pay0").expect("pay0 should exist");
+            assert_eq!(
+                payloader.property::<i32>("config-interval"),
+                -1,
+                "{payloader_name}: parameter sets should ride with every IDR"
+            );
+            assert_eq!(
+                payloader
+                    .property_value("aggregate-mode")
+                    .serialize()
+                    .unwrap()
+                    .as_str(),
+                "zero-latency",
+                "{payloader_name}: NAL aggregation must not delay packets"
+            );
+
+            pipeline.set_state(State::Null).unwrap();
+        }
+    }
+
+    /// The queues must honour `buffer_duration` rather than the old
+    /// hard-coded 5s ceiling.
+    #[test]
+    fn queues_use_the_configured_buffer_duration() {
+        if !require(&["appsrc", "queue", "h264parse", "rtph264pay"]) {
+            return;
+        }
+
+        let pipeline = Pipeline::new();
+        let bin = pipeline.clone().upcast::<Element>();
+        let mut config = test_stream_config(AudioFormat::Latm);
+        config.queue_time = Duration::from_millis(250);
+
+        build_h264(&bin, &config).expect("H264 pipeline should build");
+
+        let queue = pipeline
+            .by_name("queue1_source_queue")
+            .expect("source queue should exist");
+        assert_eq!(
+            queue.property::<u64>("max-size-time"),
+            Duration::from_millis(250).as_nanos() as u64
+        );
+
+        pipeline.set_state(State::Null).unwrap();
+    }
 }
