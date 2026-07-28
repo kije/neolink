@@ -1,10 +1,21 @@
 //! Per-camera ONVIF events manager.
 //!
-//! Implements a single motion topic (`tns1:VideoSource/MotionAlarm`) translated
-//! from the existing `NeoInstance::motion()` watch. Notifications are delivered
-//! through ONVIF PullPoint subscriptions: clients call
-//! `CreatePullPointSubscription`, then poll the returned subscription URI with
-//! `PullMessages`. The subscription endpoint also serves `Renew` and
+//! Translates the camera's alarm stream into ONVIF notifications:
+//!
+//! * `tns1:VideoSource/MotionAlarm` from the `NeoInstance::motion()` watch
+//! * `tns1:RuleEngine/MyRuleDetector/*` (people, vehicle, dog/cat, face,
+//!   visitor) and `tns1:AudioAnalytics/Audio/DetectedSound` (baby cry) from
+//!   the `NeoInstance::ai()` watch
+//! * `tns1:RuleEngine/FieldDetector/ObjectsInside` for the smart-AI zone
+//!   detectors (crossline, intrusion, loitering, legacy, loss), distinguished
+//!   by the `Rule` source item
+//!
+//! These are the topics Reolink cameras emit natively, so a bridged camera
+//! presents the same event surface to a VMS as a directly attached one.
+//!
+//! Notifications are delivered through ONVIF PullPoint subscriptions: clients
+//! call `CreatePullPointSubscription`, then poll the returned subscription URI
+//! with `PullMessages`. The subscription endpoint also serves `Renew` and
 //! `Unsubscribe`.
 //!
 //! Why PullPoint and not a push (NotificationConsumer) subscription? Pull is
@@ -48,14 +59,16 @@ const MAX_SUBSCRIPTIONS_PER_CAMERA: usize = 32;
 pub(crate) const MAX_PULL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A single notification message kept in a subscription's queue.
+///
+/// `source` and `data` are lists because some ONVIF topics carry more than one
+/// `SimpleItem`; `tns1:AudioAnalytics/Audio/DetectedSound` for instance is
+/// identified by an audio source token, an analytics token and a rule name.
 #[derive(Clone, Debug)]
 pub(crate) struct Notification {
     pub(crate) utc_time: DateTime<Utc>,
     pub(crate) topic: &'static str,
-    pub(crate) source_name: &'static str,
-    pub(crate) source_value: String,
-    pub(crate) data_name: &'static str,
-    pub(crate) data_value: String,
+    pub(crate) source: Vec<(&'static str, String)>,
+    pub(crate) data: Vec<(&'static str, String)>,
     pub(crate) property_op: &'static str,
 }
 
@@ -158,6 +171,9 @@ pub(crate) struct EventsManager {
     /// Last known motion state, used so that brand-new subscriptions get an
     /// initial event reflecting the current state on the first PullMessages.
     last_motion: Mutex<Option<bool>>,
+    /// Last published state per AI type / smart-AI zone detector, used both to
+    /// suppress duplicates and to seed new subscriptions.
+    last_ai: Mutex<HashMap<String, bool>>,
 }
 
 impl EventsManager {
@@ -169,6 +185,7 @@ impl EventsManager {
             subs: RwLock::new(HashMap::new()),
             listener_started: Mutex::new(false),
             last_motion: Mutex::new(None),
+            last_ai: Mutex::new(HashMap::new()),
         }
     }
 
@@ -193,19 +210,53 @@ impl EventsManager {
             id.clone(),
             ttl.unwrap_or(DEFAULT_SUBSCRIPTION_TTL),
         ));
+        // Seed the subscription with the current known state so a client that
+        // attaches mid-motion still gets a usable first PullMessages response.
+        //
+        // This happens *before* the subscription is published to `subs`: once
+        // it is visible, a listener can enqueue a "Changed" message, and a
+        // seed appended after that would leave the client latched to the older
+        // value.
+        self.resync(&sub).await;
         self.subs.write().await.insert(id, sub.clone());
 
         // Make sure the motion listener is running; first subscription on this
         // camera kicks it off.
         self.ensure_listener_running().await;
 
-        // Seed the subscription with the current known state so a client that
-        // attaches mid-motion still gets a usable first PullMessages response.
+        Ok(sub)
+    }
+
+    /// Re-send the current state of every property to one subscription.
+    ///
+    /// This is both the initial seeding and the answer to the client calling
+    /// `SetSynchronizationPoint`.
+    pub(crate) async fn resync(&self, sub: &Arc<Subscription>) {
         if let Some(state) = *self.last_motion.lock().await {
             let n = build_motion_notification(&self.cam_name, state, "Initialized");
             sub.enqueue(n).await;
         }
-        Ok(sub)
+        for (key, state) in self.last_ai.lock().await.iter() {
+            if let Some(n) = self.build_ai_key_notification(key, *state, "Initialized") {
+                sub.enqueue(n).await;
+            }
+        }
+    }
+
+    /// Build the notification for one entry of `last_ai`.
+    ///
+    /// Zone detectors are stored with a `zone:` prefix so they cannot collide
+    /// with an AI type of the same name.
+    fn build_ai_key_notification(
+        &self,
+        key: &str,
+        state: bool,
+        op: &'static str,
+    ) -> Option<Notification> {
+        match key.strip_prefix("zone:") {
+            Some(kind) => Some(build_zone_notification(&self.cam_name, kind, state, op)),
+            None => build_ai_notification(&self.cam_name, key, state, op),
+        }
     }
 
     pub(crate) async fn get(&self, id: &str) -> Option<Arc<Subscription>> {
@@ -236,6 +287,79 @@ impl EventsManager {
         *started = true;
         let this = self.clone();
         tokio::spawn(async move { this.run_motion_listener().await });
+        let this = self.clone();
+        tokio::spawn(async move { this.run_ai_listener().await });
+    }
+
+    /// Mirror the camera's AI detections onto the ONVIF topics a VMS expects.
+    async fn run_ai_listener(self: Arc<Self>) {
+        let cancel = self.cancel.clone();
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let result = async {
+                let mut ai = self.instance.ai().await?;
+                loop {
+                    let state = ai.borrow_and_update().clone();
+                    let mut current: HashMap<String, bool> = state
+                        .detections()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), *v))
+                        .collect();
+                    for (kind, locations) in state.zones().iter() {
+                        current.insert(format!("zone:{kind}"), !locations.is_empty());
+                    }
+                    // A detector that has stopped reporting is no longer
+                    // detecting anything.
+                    for key in self.last_ai.lock().await.keys() {
+                        current.entry(key.clone()).or_insert(false);
+                    }
+                    self.publish_ai(current).await;
+                    ai.changed().await?;
+                }
+                #[allow(unreachable_code)]
+                Result::<()>::Ok(())
+            }
+            .await;
+            log::debug!(
+                "ONVIF events: AI listener for {} restarting: {:?}",
+                self.cam_name,
+                result
+            );
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    }
+
+    async fn publish_ai(&self, current: HashMap<String, bool>) {
+        let mut changed = vec![];
+        {
+            let mut last = self.last_ai.lock().await;
+            for (key, state) in current.into_iter() {
+                if last.get(&key) == Some(&state) {
+                    continue;
+                }
+                last.insert(key.clone(), state);
+                changed.push((key, state));
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        let subs = self.subs.read().await.clone();
+        for (key, state) in changed.into_iter() {
+            let Some(n) = self.build_ai_key_notification(&key, state, "Changed") else {
+                // AI types without a standard ONVIF topic (package, ...) are
+                // MQTT only.
+                continue;
+            };
+            for s in subs.values() {
+                s.enqueue(n.clone()).await;
+            }
+        }
     }
 
     async fn run_motion_listener(self: Arc<Self>) {
@@ -304,10 +428,116 @@ fn build_motion_notification(cam_name: &str, state: bool, op: &'static str) -> N
     Notification {
         utc_time: Utc::now(),
         topic: "tns1:VideoSource/MotionAlarm",
-        source_name: "Source",
-        source_value: format!("vsrc_{cam_name}"),
-        data_name: "State",
-        data_value: if state { "true".into() } else { "false".into() },
+        source: vec![("Source", format!("vsrc_{cam_name}"))],
+        data: vec![("State", bool_value(state))],
+        property_op: op,
+    }
+}
+
+fn bool_value(state: bool) -> String {
+    if state {
+        "true".to_string()
+    } else {
+        "false".to_string()
+    }
+}
+
+/// How an AI type reported by the camera maps onto an ONVIF topic.
+///
+/// These are the topics a real Reolink camera emits. `reolink_aio` — what
+/// Home Assistant's Reolink integration uses to consume ONVIF events —
+/// accepts exactly the rules `Motion`, `MotionAlarm`, `FaceDetect`,
+/// `PeopleDetect`, `VehicleDetect`, `DogCatDetect`, `Package` and `Visitor`
+/// (`reolink_aio/api.py::ONVIF_event_callback`), and Home Assistant's generic
+/// ONVIF integration registers parsers for the same set. Note the package leaf
+/// is `Package`, not `PackageDetect`.
+///
+/// `non-motor vehicle` has no standard topic and stays MQTT only.
+const AI_TOPICS: &[(&str, &str)] = &[
+    ("people", "tns1:RuleEngine/MyRuleDetector/PeopleDetect"),
+    ("vehicle", "tns1:RuleEngine/MyRuleDetector/VehicleDetect"),
+    ("dog_cat", "tns1:RuleEngine/MyRuleDetector/DogCatDetect"),
+    ("face", "tns1:RuleEngine/MyRuleDetector/FaceDetect"),
+    ("visitor", "tns1:RuleEngine/MyRuleDetector/Visitor"),
+    ("package", "tns1:RuleEngine/MyRuleDetector/Package"),
+];
+
+/// The name of the data item on the rule-detector topics.
+///
+/// `reolink_aio` looks this up **by name**
+/// (`SimpleItem[@Name='State']`), so an invented name such as `IsPeople`
+/// would make it discard the event entirely. It also matches the data name
+/// the existing `MotionAlarm` notification already uses.
+const AI_DATA_NAME: &str = "State";
+
+/// The ONVIF topic for an audio detection (baby cry).
+const AUDIO_TOPIC: &str = "tns1:AudioAnalytics/Audio/DetectedSound";
+
+/// The ONVIF topic used for the smart-AI zone detectors.
+///
+/// All five (crossline / intrusion / loitering / legacy / loss) are reported
+/// as field detections distinguished by the `Rule` source item, which is what
+/// a VMS keys its entities on.
+const FIELD_TOPIC: &str = "tns1:RuleEngine/FieldDetector/ObjectsInside";
+
+/// Look up the ONVIF topic for a camera AI type.
+fn ai_topic(ai_type: &str) -> Option<&'static str> {
+    AI_TOPICS
+        .iter()
+        .find(|(name, _)| *name == ai_type)
+        .map(|(_, topic)| *topic)
+}
+
+fn build_ai_notification(
+    cam_name: &str,
+    ai_type: &str,
+    state: bool,
+    op: &'static str,
+) -> Option<Notification> {
+    if ai_type == "cry" {
+        return Some(Notification {
+            utc_time: Utc::now(),
+            topic: AUDIO_TOPIC,
+            source: vec![
+                ("AudioSourceConfigurationToken", format!("asrc_{cam_name}")),
+                (
+                    "AudioAnalyticsConfigurationToken",
+                    format!("aacfg_{cam_name}"),
+                ),
+                ("Rule", "CryDetect".to_string()),
+            ],
+            data: vec![("IsSoundDetected", bool_value(state))],
+            property_op: op,
+        });
+    }
+    let topic = ai_topic(ai_type)?;
+    Some(Notification {
+        utc_time: Utc::now(),
+        topic,
+        source: vec![("Source", format!("vsrc_{cam_name}"))],
+        data: vec![(AI_DATA_NAME, bool_value(state))],
+        property_op: op,
+    })
+}
+
+fn build_zone_notification(
+    cam_name: &str,
+    kind: &str,
+    state: bool,
+    op: &'static str,
+) -> Notification {
+    Notification {
+        utc_time: Utc::now(),
+        topic: FIELD_TOPIC,
+        source: vec![
+            ("VideoSourceConfigurationToken", format!("vsrc_{cam_name}")),
+            (
+                "VideoAnalyticsConfigurationToken",
+                format!("vacfg_{cam_name}"),
+            ),
+            ("Rule", kind.to_string()),
+        ],
+        data: vec![("IsInside", bool_value(state))],
         property_op: op,
     }
 }
@@ -329,6 +559,62 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn ai_types_map_to_the_topics_clients_expect() {
+        // These exact strings are the rules `reolink_aio` accepts and that
+        // Home Assistant's ONVIF integration registers parsers for; getting
+        // one wrong silently drops the event. Note `Package`, not
+        // `PackageDetect`.
+        for (ai_type, topic) in [
+            ("people", "tns1:RuleEngine/MyRuleDetector/PeopleDetect"),
+            ("vehicle", "tns1:RuleEngine/MyRuleDetector/VehicleDetect"),
+            ("dog_cat", "tns1:RuleEngine/MyRuleDetector/DogCatDetect"),
+            ("face", "tns1:RuleEngine/MyRuleDetector/FaceDetect"),
+            ("visitor", "tns1:RuleEngine/MyRuleDetector/Visitor"),
+            ("package", "tns1:RuleEngine/MyRuleDetector/Package"),
+        ] {
+            let n = build_ai_notification("cam", ai_type, true, "Changed")
+                .unwrap_or_else(|| panic!("{} should map to a topic", ai_type));
+            assert_eq!(n.topic, topic, "{}", ai_type);
+            // `reolink_aio` looks the data item up by name, so this must be
+            // `State` and not an invented `IsPeople`-style name.
+            assert_eq!(n.data[0].0, "State", "{}", ai_type);
+            assert_eq!(n.data[0].1, "true", "{}", ai_type);
+            // The parsers look the video source up by an item literally named
+            // "Source".
+            assert_eq!(n.source[0].0, "Source", "{}", ai_type);
+        }
+    }
+
+    #[test]
+    fn cry_maps_to_the_audio_topic() {
+        let n = build_ai_notification("cam", "cry", true, "Changed").expect("cry should map");
+        assert_eq!(n.topic, "tns1:AudioAnalytics/Audio/DetectedSound");
+        let names: Vec<_> = n.source.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "AudioSourceConfigurationToken",
+                "AudioAnalyticsConfigurationToken",
+                "Rule"
+            ]
+        );
+    }
+
+    #[test]
+    fn ai_types_without_a_standard_topic_are_skipped() {
+        // Published over MQTT, but there is no ONVIF topic a VMS would parse.
+        assert!(build_ai_notification("cam", "non-motor vehicle", true, "Changed").is_none());
+    }
+
+    #[test]
+    fn smart_ai_zones_map_to_field_detection_with_a_rule() {
+        let n = build_zone_notification("cam", "crossline", true, "Changed");
+        assert_eq!(n.topic, "tns1:RuleEngine/FieldDetector/ObjectsInside");
+        assert_eq!(n.source[2], ("Rule", "crossline".to_string()));
+        assert_eq!(n.data[0].1, "true");
+    }
+
     #[tokio::test]
     async fn subscription_enqueue_and_pull() {
         let sub = Subscription::new("x".into(), Duration::from_secs(60));
@@ -336,7 +622,7 @@ mod tests {
             .await;
         let msgs = sub.pull(10, Duration::from_millis(50)).await;
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].data_value, "true");
+        assert_eq!(msgs[0].data[0].1, "true");
     }
 
     #[tokio::test]
@@ -363,7 +649,7 @@ mod tests {
         let sub = Subscription::new("x".into(), Duration::from_secs(60));
         for i in 0..(MAX_PENDING_MESSAGES + 5) {
             let mut n = build_motion_notification("cam", i % 2 == 0, "Changed");
-            n.data_value = i.to_string();
+            n.data[0].1 = i.to_string();
             sub.enqueue(n).await;
         }
         let msgs = sub
@@ -371,6 +657,6 @@ mod tests {
             .await;
         assert_eq!(msgs.len(), MAX_PENDING_MESSAGES);
         // The oldest 5 should have been dropped.
-        assert_eq!(msgs[0].data_value, "5");
+        assert_eq!(msgs[0].data[0].1, "5");
     }
 }

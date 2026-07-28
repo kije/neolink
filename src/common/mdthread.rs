@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::NeoInstance;
 use crate::{AnyResult, Result};
-use neolink_core::bc_protocol::MotionStatus;
+use neolink_core::bc_protocol::{AiState, MotionStatus};
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -27,6 +27,7 @@ pub(crate) enum MdState {
 
 pub(crate) struct NeoCamMdThread {
     md_watcher: Arc<WatchSender<MdState>>,
+    ai_watcher: Arc<WatchSender<AiState>>,
     md_request_rx: MpscReceiver<MdRequest>,
     cancel: CancellationToken,
     instance: NeoInstance,
@@ -39,8 +40,11 @@ impl NeoCamMdThread {
     ) -> Result<Self> {
         let (md_watcher, _) = watch(MdState::Unknown);
         let md_watcher = Arc::new(md_watcher);
+        let (ai_watcher, _) = watch(AiState::default());
+        let ai_watcher = Arc::new(ai_watcher);
         Ok(Self {
             md_watcher,
+            ai_watcher,
             md_request_rx,
             cancel: CancellationToken::new(),
             instance,
@@ -50,6 +54,7 @@ impl NeoCamMdThread {
     pub(crate) async fn run(&mut self) -> Result<()> {
         let thread_cancel = self.cancel.clone();
         let watcher = self.md_watcher.clone();
+        let ai_watcher = self.ai_watcher.clone();
         let md_instance = self.instance.clone();
         tokio::select! {
             _ = thread_cancel.cancelled() => {
@@ -63,6 +68,11 @@ impl NeoCamMdThread {
                         } => {
                           let _ = sender.send(self.md_watcher.subscribe());
                         },
+                        MdRequest::GetAi {
+                            sender
+                        } => {
+                          let _ = sender.send(self.ai_watcher.subscribe());
+                        },
                     }
                 }
                 Ok(())
@@ -71,23 +81,43 @@ impl NeoCamMdThread {
                 loop {
                     let r: AnyResult<()> = md_instance.run_passive_task(|cam| {
                         let watcher = watcher.clone();
+                        let ai_watcher = ai_watcher.clone();
                         Box::pin(
                         async move {
                             let mut md = cam.listen_on_motion().await.with_context(|| "Error in getting MD listen_on_motion")?;
+                            // The AI detections ride along on the same alarm
+                            // messages as motion; mirror them onto our own
+                            // watch so consumers survive a camera reconnect.
+                            let mut ai = md.ai_state();
                             loop {
-                                let event = md.next_motion().await.with_context(|| "Error in getting MD next_motion")?;
-                                match event {
-                                    MotionStatus::Start(at) => {
-                                        watcher.send_replace(
-                                            MdState::Start(at.into())
-                                        );
-                                    }
-                                    MotionStatus::Stop(at) => {
-                                        watcher.send_replace(
-                                            MdState::Stop(at.into())
-                                        );
-                                    }
-                                    MotionStatus::NoChange(_) => {},
+                                tokio::select! {
+                                    v = ai.changed() => {
+                                        v.with_context(|| "Error in getting AI state")?;
+                                        let state = ai.borrow_and_update().clone();
+                                        ai_watcher.send_if_modified(|current| {
+                                            if *current == state {
+                                                false
+                                            } else {
+                                                *current = state;
+                                                true
+                                            }
+                                        });
+                                    },
+                                    event = md.next_motion() => {
+                                        match event.with_context(|| "Error in getting MD next_motion")? {
+                                            MotionStatus::Start(at) => {
+                                                watcher.send_replace(
+                                                    MdState::Start(at.into())
+                                                );
+                                            }
+                                            MotionStatus::Stop(at) => {
+                                                watcher.send_replace(
+                                                    MdState::Stop(at.into())
+                                                );
+                                            }
+                                            MotionStatus::NoChange(_) => {},
+                                        }
+                                    },
                                 }
                             }
                         }
@@ -112,5 +142,8 @@ impl Drop for NeoCamMdThread {
 pub(crate) enum MdRequest {
     Get {
         sender: OneshotSender<WatchReceiver<MdState>>,
+    },
+    GetAi {
+        sender: OneshotSender<WatchReceiver<AiState>>,
     },
 }
