@@ -44,7 +44,7 @@ bind = "0.0.0.0"
 # (PullPoint subscriptions). The standard topics
 #     tns1:VideoSource/MotionAlarm
 #     tns1:RuleEngine/MyRuleDetector/{PeopleDetect,VehicleDetect,DogCatDetect,
-#                                     FaceDetect,Visitor}
+#                                     FaceDetect,Visitor,Package}
 #     tns1:RuleEngine/FieldDetector/ObjectsInside   (smart-AI zones)
 #     tns1:AudioAnalytics/Audio/DetectedSound       (baby cry)
 # are published as the camera reports them, so VMS clients that record on

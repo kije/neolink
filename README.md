@@ -635,6 +635,7 @@ natively, so a VMS sees the bridge as it would see the camera:
 | `tns1:RuleEngine/MyRuleDetector/DogCatDetect` | Pet detected |
 | `tns1:RuleEngine/MyRuleDetector/FaceDetect` | Face detected |
 | `tns1:RuleEngine/MyRuleDetector/Visitor` | Doorbell press |
+| `tns1:RuleEngine/MyRuleDetector/Package` | Package detected |
 | `tns1:RuleEngine/FieldDetector/ObjectsInside` | A smart-AI zone triggered; the `Rule` item names the detector (`crossline`, `intrusion`, `loitering`, `legacy`, `loss`) |
 | `tns1:AudioAnalytics/Audio/DetectedSound` | Baby cry detected |
 
