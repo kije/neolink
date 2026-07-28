@@ -113,6 +113,48 @@ using the terminal in the same folder the neolink binary is in.
 ./neolink rtsp --config=neolink.toml
 ```
 
+### Audio and Latency
+
+Reolink cameras send audio either as AAC or as DVI4 ADPCM.
+
+For AAC cameras neolink passes the compressed audio straight through to the
+RTSP client as `MP4A-LATM` (RFC 6416). Nothing is decoded, resampled or
+re-encoded, so the audio adds no codec latency and costs the camera's own
+bitrate (typically 16-32kbps) instead of the ~256kbps that raw 16kHz mono
+samples need.
+
+If you have a client that cannot handle `MP4A-LATM` you can ask neolink to
+decode the audio and send raw `L16` samples instead, which is what it always
+used to do:
+
+```toml
+[[cameras]]
+name = "Camera01"
+username = "admin"
+password = "password"
+uid = "ABCDEF0123456789"
+audio_format = "pcm"   # "latm" (default) or "pcm"
+```
+
+ADPCM cameras have no RTP passthrough format available and are always decoded
+to `L16`; `audio_format` has no effect on them.
+
+The other latency control is `buffer_duration`, which caps how much media the
+server-side queues may hold, in milliseconds:
+
+```toml
+[[cameras]]
+name = "Camera01"
+username = "admin"
+password = "password"
+uid = "ABCDEF0123456789"
+buffer_duration = 3000   # default
+```
+
+Lowering it reduces how far behind live a client can drift when it briefly
+stops keeping up, at the cost of dropping frames sooner on a congested
+network. Raising it does the opposite. Values below 50ms are treated as 50ms.
+
 ### Discovery
 
 To connect to a camera using a UID we need to find the IP address of the camera
