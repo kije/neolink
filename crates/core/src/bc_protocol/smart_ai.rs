@@ -1,8 +1,9 @@
 //! Second-generation Reolink AI / smart-detect surface over Baichuan.
 //!
-//! Wraps cmd ids 527-552 (smart-AI zones), 342/343 (per-AI alarm config),
-//! 299/300 (`AiCfg`, which carries baby-cry detection and auto-tracking) and
-//! 600/696 (YOLO push events).
+//! Wraps cmd ids 527/529/531/549/551 (smart-AI zones, read-only — see
+//! below; the matching write ids 528/530/532/550/552 are deliberately not
+//! issued), 342/343 (per-AI alarm config), 299/300 (`AiCfg`, which carries
+//! baby-cry detection and auto-tracking) and 600/696 (YOLO push events).
 //!
 //! The five smart-AI kinds share a common shape, so they are dispatched via
 //! the [`SmartAiKind`] enum. They also share the per-zone item type
@@ -28,7 +29,8 @@
 //! with the motion listener: see [`crate::bc_protocol::MotionData::ai_state`]
 //! and [`AiState`].
 //!
-//! See kije/neolink#6 for the full spec.
+//! Element names come from `dissector/messages.md` (which documents cmd 299
+//! as `<AiCfg>`) and from the `reolink_aio` symbols cited on each struct.
 
 use super::{BcCamera, BcConnection, Error, Result};
 use crate::bc::{model::*, xml::*};
@@ -319,12 +321,36 @@ impl SmartAiEvent {
     }
 }
 
+/// Releases the listener slot if `listen_on_smart_ai` bails out part way
+/// through, so a failed call does not lock the camera out of ever listening.
+struct ListenGuard {
+    listening: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl ListenGuard {
+    /// Hand the slot over to the [`SmartAiPush`] that will own it from now on
+    fn release(mut self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.listening.take().expect("guard released twice")
+    }
+}
+
+impl Drop for ListenGuard {
+    fn drop(&mut self) {
+        if let Some(listening) = self.listening.take() {
+            listening.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 /// Handle on a running YOLO push subscription.
 ///
 /// Push events arrive via [`SmartAiPush::next_event`]; dropping the handle
 /// deregisters the message handlers.
 pub struct SmartAiPush {
     connection: Arc<BcConnection>,
+    /// Cleared once the handlers are actually gone, so the next listener
+    /// cannot register while ours are still installed.
+    listening: Arc<std::sync::atomic::AtomicBool>,
     rx: Receiver<SmartAiEvent>,
 }
 
@@ -339,10 +365,13 @@ impl Drop for SmartAiPush {
     fn drop(&mut self) {
         log::trace!("Drop SmartAiPush");
         let connection = self.connection.clone();
+        let listening = self.listening.clone();
         let _gt = tokio::runtime::Handle::current().enter();
         tokio::task::spawn(async move {
             let _ = connection.unhandle_msg(MSG_ID_YOLO_DETECT).await;
             let _ = connection.unhandle_msg(MSG_ID_YOLO_DETECT_DETAIL).await;
+            // Only now is it safe for another listener to register.
+            listening.store(false, std::sync::atomic::Ordering::Release);
             log::trace!("Dropped SmartAiPush");
         });
     }
@@ -470,9 +499,13 @@ impl BcCamera {
     }
 
     /// Set the per-AI-type alarm configuration (cmd 343).
+    ///
+    /// `cfg.ai_type` is sent verbatim: it should be a type the camera itself
+    /// reported, which normally means passing back what
+    /// [`BcCamera::get_ai_alarm`] returned. [`canonical_ai_type`] is for
+    /// classifying inbound events, and normalizing here could rewrite a name
+    /// the camera actually uses.
     pub async fn set_ai_alarm(&self, mut cfg: AiDetectCfg) -> Result<()> {
-        // Normalize the AI type so callers using `person` / `pet` work.
-        cfg.ai_type = canonical_ai_type(&cfg.ai_type).to_string();
         cfg.channel_id = self.channel_id;
         let connection = self.get_connection();
         let msg_num = self.new_message_num();
@@ -640,14 +673,42 @@ impl BcCamera {
     /// events, so this issues the same event-subscribe request
     /// [`BcCamera::listen_on_motion`] does.
     ///
-    /// Only one listener per connection is possible: the message handlers are
-    /// registered per message id. Registering a second time returns
-    /// [`Error::SimultaneousSubscriptionId`].
+    /// Only one listener per camera is possible: the message handlers are
+    /// registered per message id. A second call returns
+    /// [`Error::SimultaneousSubscriptionId`] and registers nothing.
     ///
     /// The wrapper element names of the 600/696 payload could not be confirmed
     /// against a camera trace, so a push that cannot be decoded is logged once
     /// at debug level rather than silently dropped.
     pub async fn listen_on_smart_ai(&self) -> Result<SmartAiPush> {
+        // Claim the listener slot before touching the connection.
+        //
+        // `BcConnection::handle_msg` only queues the registration and returns
+        // Ok; the poller notices a duplicate asynchronously and answers by
+        // returning an error out of its run loop, which tears down the whole
+        // connection — streams, motion and all. So a second listener has to be
+        // turned away here, before it can register anything.
+        if self
+            .smart_ai_listening
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(Error::SimultaneousSubscriptionId {
+                msg_id: MSG_ID_YOLO_DETECT,
+            });
+        }
+        let listening = self.smart_ai_listening.clone();
+        // From here on every early return must release the slot, so the guard
+        // owns it until the SmartAiPush takes over.
+        let guard = ListenGuard {
+            listening: Some(listening),
+        };
+
         // Ask the camera to start sending us events at all. Without this the
         // handlers below would sit idle forever.
         self.start_motion_query().await?;
@@ -695,7 +756,11 @@ impl BcCamera {
             }
         }
 
-        Ok(SmartAiPush { connection, rx })
+        Ok(SmartAiPush {
+            connection,
+            listening: guard.release(),
+            rx,
+        })
     }
 }
 
@@ -1023,6 +1088,85 @@ mod tests {
         assert!(!cfg.supports_cry_detection());
         assert_eq!(cfg.cry_detect_level, None);
         assert!(cfg.detect_types().is_empty());
+    }
+
+    #[test]
+    fn yolo_push_nesting() {
+        // Pins the arity that *is* confirmed: repeated <YoloWorldType>
+        // siblings under one event, and a repeated <subTypeList> wrapper each
+        // holding a single <subType>. The two outer wrapper names are
+        // inferred, so this test is about the shape, not about them.
+        let parsed = parse(
+            r#"<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<YoloWorldEventList version="1.1">
+<YoloWorldEvent>
+<channel>2</channel>
+<YoloWorldType>
+<type>dog_cat</type>
+<subTypeList><subType>dog</subType></subTypeList>
+<subTypeList><subType>cat</subType></subTypeList>
+</YoloWorldType>
+<YoloWorldType>
+<type>people</type>
+</YoloWorldType>
+</YoloWorldEvent>
+</YoloWorldEventList>
+</body>"#,
+        );
+        let list = parsed.yolo_world_event_list.expect("YoloWorldEventList");
+        assert_eq!(list.events.len(), 1);
+        let event = &list.events[0];
+        assert_eq!(event.channel, 2);
+        assert_eq!(event.types.len(), 2);
+        assert_eq!(event.types[0].sub_types(), vec!["dog", "cat"]);
+        assert!(event.types[1].sub_types().is_empty());
+    }
+
+    #[test]
+    fn partial_zone_item_still_parses() {
+        // A camera that omits fields must not fail the parse: an unparsable
+        // payload is a hard error in `bc::de`, which drops the connection.
+        let parsed = parse(
+            r#"<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<CrosslineDetect version="1.1">
+<channelId>0</channelId>
+<crosslineDetectItem>
+<location>1</location>
+</crosslineDetectItem>
+</CrosslineDetect>
+</body>"#,
+        );
+        let detect = parsed.crossline_detect.expect("CrosslineDetect");
+        let item = &detect.items[0];
+        assert_eq!(item.location, Some(1));
+        assert_eq!(item.enable, 0);
+        assert_eq!(item.sesensitivity, 0);
+        assert!(item.ai_types().is_empty());
+    }
+
+    #[test]
+    fn unmodelled_elements_are_ignored_not_fatal() {
+        // Zone geometry is deliberately not modelled. quick-xml must skip it,
+        // including when it is nested — that is the whole reason for leaving
+        // those fields out.
+        let parsed = parse(
+            r#"<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<CrosslineDetect version="1.1">
+<channelId>0</channelId>
+<crosslineDetectItem>
+<location>0</location>
+<sesensitivity>50</sesensitivity>
+<line><point><x>1</x><y>2</y></point></line>
+<someFutureField>whatever</someFutureField>
+</crosslineDetectItem>
+</CrosslineDetect>
+</body>"#,
+        );
+        let detect = parsed.crossline_detect.expect("CrosslineDetect");
+        assert_eq!(detect.items[0].sesensitivity, 50);
     }
 
     #[test]

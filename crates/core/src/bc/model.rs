@@ -115,7 +115,11 @@ pub const MSG_ID_GET_AI_ALARM: u32 = 342;
 pub const MSG_ID_SET_AI_ALARM: u32 = 343;
 /// Get the line-cross detection zones
 pub const MSG_ID_GET_CROSSLINE_DETECT: u32 = 527;
-/// Set the line-cross detection zones
+/// Set the line-cross detection zones.
+///
+/// This and the other four smart-AI write ids are defined but not currently
+/// issued — see the "Why the zone detectors are read-only" section of
+/// [`crate::bc_protocol`]'s smart-AI module.
 pub const MSG_ID_SET_CROSSLINE_DETECT: u32 = 528;
 /// Get the intrusion detection zones
 pub const MSG_ID_GET_INTRUSION_DETECT: u32 = 529;

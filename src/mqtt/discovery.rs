@@ -186,8 +186,31 @@ pub(super) const AI_DISCOVERY_TYPES: &[(&str, &str, &str)] = &[
     ("face", "motion", "mdi:face-recognition"),
     ("visitor", "occupancy", "mdi:doorbell-video"),
     ("package", "occupancy", "mdi:package-variant-closed"),
+    ("non-motor vehicle", "motion", "mdi:bike"),
     ("cry", "sound", "mdi:baby-face-outline"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::AI_DISCOVERY_TYPES;
+    use neolink_core::bc::xml::AI_CANONICAL_TYPES;
+
+    #[test]
+    fn every_canonical_ai_type_is_discoverable() {
+        // The publisher emits a topic for whatever the camera reports, so a
+        // canonical type with no discovery row would be published but never
+        // show up in Home Assistant.
+        for ai_type in AI_CANONICAL_TYPES {
+            assert!(
+                AI_DISCOVERY_TYPES
+                    .iter()
+                    .any(|(name, _, _)| name == ai_type),
+                "{}",
+                ai_type
+            );
+        }
+    }
+}
 
 #[derive(Serialize, Debug)]
 struct DiscoveryButton {
