@@ -3474,6 +3474,101 @@ Message have zero to two payloads.
     </body>
     ```
 
+- 342: `<AiDetectCfg>` (read) / 343 (write)
+
+  Per-AI-type alarm settings. Note the channel element is `<chn>`, not
+  `<channelId>`, and the sensitivity element is `<sensitivity>` — the
+  `sesensitivity` misspelling belongs to the smart-AI zone items below.
+
+  - Client
+
+    ```xml
+    <?xml version="1.0" encoding="UTF-8" ?>
+    <body>
+    <AiDetectCfg version="1.1">
+    <chn>0</chn>
+    <type>people</type>
+    </AiDetectCfg>
+    </body>
+    ```
+
+  - Camera
+
+    ```xml
+    <?xml version="1.0" encoding="UTF-8" ?>
+    <body>
+    <AiDetectCfg version="1.1">
+    <chn>0</chn>
+    <type>people</type>
+    <sensitivity>43</sensitivity>
+    <stayTime>5</stayTime>
+    </AiDetectCfg>
+    </body>
+    ```
+
+- 527/528: `<CrosslineDetect>`, 529/530: `<IntrusionDetect>`,
+  531/532: `<LoiteringDetect>`, 549/550: `<LegacyDetect>`,
+  551/552: `<LossDetect>` (read / write)
+
+  The five smart-AI detection zone containers. All share the same per-zone
+  item shape; only the item element name changes (`<crosslineDetectItem>`,
+  `<intrusionDetectItem>`, ...). `<aiType>` is a comma separated list, and
+  `<location>` is the identifier a zone is addressed by. Some firmwares send
+  `<timeThresh>` in place of `<stayTime>`.
+
+  Zone geometry (a `<line>` or `<region>` element) has not been captured, so
+  its content model is unknown — this is why neolink reads these but does not
+  write them.
+
+  - Camera
+
+    ```xml
+    <?xml version="1.0" encoding="UTF-8" ?>
+    <body>
+    <CrosslineDetect version="1.1">
+    <channelId>0</channelId>
+    <crosslineDetectItem>
+    <location>0</location>
+    <enable>1</enable>
+    <aiType>people,vehicle</aiType>
+    <sesensitivity>50</sesensitivity>
+    <stayTime>2</stayTime>
+    <index>0</index>
+    <name>line1</name>
+    </crosslineDetectItem>
+    </CrosslineDetect>
+    </body>
+    ```
+
+  On write the container also carries an `<op>` element with `add`, `delete`
+  or `modify`, and the client is expected to send back the container it read.
+
+- 600 / 696: YOLO detections (push only) **— unverified**
+
+  Both carry `<YoloWorldType>` elements, each with a `<type>` and, on 696,
+  repeated `<subTypeList>` wrappers holding one `<subType>` each. The channel
+  comes from a `<channel>` element on the surrounding event, not `<channelId>`.
+
+  The names of the two wrapper elements between `<body>` and the event are
+  **inferred**, not captured: `reolink_aio` walks this payload positionally
+  (`for event_list in root: for event in event_list:`), so they cannot be
+  recovered from it. The shape below is what neolink assumes.
+
+    ```xml
+    <?xml version="1.0" encoding="UTF-8" ?>
+    <body>
+    <YoloWorldEventList version="1.1">
+    <YoloWorldEvent>
+    <channel>0</channel>
+    <YoloWorldType>
+    <type>dog_cat</type>
+    <subTypeList><subType>dog</subType></subTypeList>
+    </YoloWorldType>
+    </YoloWorldEvent>
+    </YoloWorldEventList>
+    </body>
+    ```
+
 - 438: `<FloodlightTask>` (read)
 
   - Camera

@@ -318,6 +318,13 @@ pub(crate) struct UserConfig {
 pub(crate) struct MqttConfig {
     #[serde(default = "default_true")]
     pub(crate) enable_motion: bool,
+    /// Publish the per-AI-type detections (people, vehicle, dog_cat, ...).
+    ///
+    /// These arrive on the same camera subscription as motion, so this costs
+    /// no extra traffic; it only controls whether the `status/ai` topics are
+    /// published. Has no effect when `enable_motion` is off.
+    #[serde(default = "default_true", alias = "enable_ai_detection")]
+    pub(crate) enable_ai: bool,
     #[serde(default = "default_true")]
     pub(crate) enable_light: bool,
     #[serde(default = "default_true")]
@@ -387,6 +394,7 @@ const fn default_false() -> bool {
 fn default_mqtt() -> MqttConfig {
     MqttConfig {
         enable_motion: true,
+        enable_ai: true,
         enable_light: true,
         enable_battery: true,
         battery_update: 2000,

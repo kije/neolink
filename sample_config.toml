@@ -40,11 +40,16 @@ bind = "0.0.0.0"
 #     http://<host>:<bind_port>/onvif/<camera-name>/device_service
 # VMS clients (Home Assistant, Frigate, BlueIris, ...) can then discover the
 # camera over WS-Discovery, fetch the RTSP URL automatically, control PTZ,
-# and subscribe to motion-detection events via the ONVIF Events service
-# (PullPoint subscriptions). The standard topic
+# and subscribe to motion and AI events via the ONVIF Events service
+# (PullPoint subscriptions). The standard topics
 #     tns1:VideoSource/MotionAlarm
-# is published whenever the camera reports motion start/stop, so VMS clients
-# that record on motion (Frigate, BlueIris, ...) work out of the box.
+#     tns1:RuleEngine/MyRuleDetector/{PeopleDetect,VehicleDetect,DogCatDetect,
+#                                     FaceDetect,Visitor,Package}
+#     tns1:RuleEngine/FieldDetector/ObjectsInside   (smart-AI zones)
+#     tns1:AudioAnalytics/Audio/DetectedSound       (baby cry)
+# are published as the camera reports them, so VMS clients that record on
+# motion or on a person/vehicle detection (Frigate, BlueIris, ...) work out of
+# the box.
 # [onvif]
 # enabled = true
 # bind = "0.0.0.0"
@@ -62,6 +67,9 @@ address = "192.168.1.187:9000"
 # mqtt.discovery.topic = "homeassistant" # Uncomment to enable
 # If using discovery, _ characters are replaced with spaces in the name and title case is applied
 # mqtt.discovery.features = ["floodlight"] # Uncomment if this camera has a spotlight/floodlight
+# Add "ai" to features for one binary sensor per AI type (person, vehicle, pet,
+# face, visitor, package, baby cry) on cameras that support AI detection.
+# mqtt.enable_ai = false                 # Uncomment to stop publishing /status/ai/*
 
 # If you use a battery camera: **Instead** of an `address` supply the uid
 # as follows

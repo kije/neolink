@@ -33,6 +33,7 @@ mod reboot;
 mod resolution;
 mod services;
 mod siren;
+mod smart_ai;
 mod snap;
 mod stream;
 mod stream_info;
@@ -53,6 +54,9 @@ pub use pirstate::PirState;
 pub use ptz::Direction;
 pub use pushinfo::PhoneType;
 pub use resolution::*;
+pub use smart_ai::{
+    AiState, SmartAiEvent, SmartAiKind, SmartAiPayload, SmartAiPush, SMART_AI_KINDS,
+};
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind};
 
@@ -76,6 +80,13 @@ pub struct BcCamera {
     // Certain commands such as logout require the username/pass in plain text.... why....???
     credentials: Credentials,
     abilities: RwLock<HashMap<String, ReadKind>>,
+    /// Set while a [`SmartAiPush`] holds the YOLO message handlers.
+    ///
+    /// `BcConnection::handle_msg` cannot report a duplicate registration back
+    /// to its caller — the poller detects it asynchronously and tears the
+    /// whole connection down — so the second listener has to be refused
+    /// before it registers anything.
+    smart_ai_listening: Arc<AtomicBool>,
     #[allow(dead_code)]
     cancel: CancellationToken,
 }
@@ -362,6 +373,7 @@ impl BcCamera {
             logged_in: AtomicBool::new(false),
             credentials: Credentials::new(username, passwd),
             abilities: Default::default(),
+            smart_ai_listening: Arc::new(AtomicBool::new(false)),
             cancel: CancellationToken::new(),
         };
         me.keepalive().await?;
