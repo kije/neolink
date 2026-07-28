@@ -105,10 +105,10 @@ pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Get the floodlight task xml
 pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
 
-/// Get baby-cry detection config
-pub const MSG_ID_GET_CRY_DETECTION: u32 = 299;
-/// Set baby-cry detection config
-pub const MSG_ID_SET_CRY_DETECTION: u32 = 300;
+/// Get the AI config block: auto-tracking plus baby-cry detection
+pub const MSG_ID_GET_AI_CFG: u32 = 299;
+/// Set the AI config block: auto-tracking plus baby-cry detection
+pub const MSG_ID_SET_AI_CFG: u32 = 300;
 /// Get the per-AI detection config (sensitivity / stay-time / area mask)
 pub const MSG_ID_GET_AI_ALARM: u32 = 342;
 /// Set the per-AI detection config (sensitivity / stay-time / area mask)

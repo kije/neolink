@@ -141,33 +141,35 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
-    /// Crossline detection (cmd 527/528) per channel; one or more zones
-    #[serde(rename = "CrosslineDetection", skip_serializing_if = "Option::is_none")]
-    pub crossline_detection: Option<CrosslineDetection>,
-    /// Intrusion detection (cmd 529/530) per channel; one or more zones
-    #[serde(rename = "IntrusionDetection", skip_serializing_if = "Option::is_none")]
-    pub intrusion_detection: Option<IntrusionDetection>,
-    /// Loitering detection (cmd 531/532) per channel; one or more zones
-    #[serde(rename = "LoiteringDetection", skip_serializing_if = "Option::is_none")]
-    pub loitering_detection: Option<LoiteringDetection>,
-    /// Forgotten-item ("legacy") detection (cmd 549/550) per channel; one or more zones
-    #[serde(rename = "LegacyDetection", skip_serializing_if = "Option::is_none")]
-    pub legacy_detection: Option<LegacyDetection>,
-    /// Taken-item ("loss") detection (cmd 551/552) per channel; one or more zones
-    #[serde(rename = "LossDetection", skip_serializing_if = "Option::is_none")]
-    pub loss_detection: Option<LossDetection>,
-    /// YOLO basic push (cmd 600) carries the detected AI type per channel
-    #[serde(rename = "YoloDetectInfo", skip_serializing_if = "Option::is_none")]
-    pub yolo_detect_info: Option<YoloDetectInfo>,
-    /// YOLO detailed push (cmd 696) carries the detected AI type and sub-type
-    #[serde(rename = "YoloWorldType", skip_serializing_if = "Option::is_none")]
-    pub yolo_world_type: Option<YoloWorldType>,
+    /// Crossline detection zones (cmd 527/528)
+    #[serde(rename = "CrosslineDetect", skip_serializing_if = "Option::is_none")]
+    pub crossline_detect: Option<CrosslineDetect>,
+    /// Intrusion detection zones (cmd 529/530)
+    #[serde(rename = "IntrusionDetect", skip_serializing_if = "Option::is_none")]
+    pub intrusion_detect: Option<IntrusionDetect>,
+    /// Loitering detection zones (cmd 531/532)
+    #[serde(rename = "LoiteringDetect", skip_serializing_if = "Option::is_none")]
+    pub loitering_detect: Option<LoiteringDetect>,
+    /// Forgotten-item ("legacy") detection zones (cmd 549/550)
+    #[serde(rename = "LegacyDetect", skip_serializing_if = "Option::is_none")]
+    pub legacy_detect: Option<LegacyDetect>,
+    /// Taken-item ("loss") detection zones (cmd 551/552)
+    #[serde(rename = "LossDetect", skip_serializing_if = "Option::is_none")]
+    pub loss_detect: Option<LossDetect>,
+    /// YOLO push events (cmd 600 basic / 696 detailed)
+    #[serde(
+        rename = "YoloWorldEventList",
+        alias = "yoloWorldEventList",
+        alias = "yoloEventList",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub yolo_world_event_list: Option<YoloWorldEventList>,
     /// Per-AI alarm config (cmd 342/343): sensitivity, stay time, area mask
     #[serde(rename = "AiDetectCfg", skip_serializing_if = "Option::is_none")]
     pub ai_detect_cfg: Option<AiDetectCfg>,
-    /// Baby-cry detection (cmd 299/300)
-    #[serde(rename = "CryDetection", skip_serializing_if = "Option::is_none")]
-    pub cry_detection: Option<CryDetection>,
+    /// AI config (cmd 299/300): auto-track settings plus baby-cry detection
+    #[serde(rename = "AiCfg", skip_serializing_if = "Option::is_none")]
+    pub ai_cfg: Option<AiCfg>,
 }
 
 impl BcXml {
@@ -665,7 +667,11 @@ pub struct AlarmEvent {
     pub channel_id: u8,
     /// Motion status. Known values are `"MD"` or `"none"`
     pub status: String,
-    /// AI status. Known values are `"people"` or `"none"`
+    /// AI status.
+    ///
+    /// This is a **comma separated list** of the AI types currently detected,
+    /// e.g. `people,vehicle`, or `none` when nothing is detected. `other` is
+    /// used for plain motion. Use [`AlarmEvent::ai_types`] to iterate it.
     #[serde(rename = "AItype", skip_serializing_if = "Option::is_none")]
     pub ai_type: Option<String>,
     /// The recording status. Known values `0` or `1`
@@ -673,6 +679,82 @@ pub struct AlarmEvent {
     /// The timestamp associated with the recording. `0` if not recording
     #[serde(rename = "timeStamp")]
     pub timeStamp: i32,
+    /// Smart-AI (crossline / intrusion / loitering / legacy / loss) triggers.
+    ///
+    /// Only sent by cameras that support the second generation AI detectors.
+    #[serde(
+        rename = "smartAiTypeList",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub smart_ai_type_list: Option<SmartAiTypeList>,
+}
+
+impl AlarmEvent {
+    /// The AI types currently detected, split out of the comma separated
+    /// `AItype` field and normalized with [`canonical_ai_type`].
+    ///
+    /// `none` is filtered out; `other` is kept because it is how the camera
+    /// signals plain (non-AI) motion.
+    pub fn ai_types(&self) -> Vec<&str> {
+        self.ai_type
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(|part| canonical_ai_type(part.trim()))
+            .filter(|part| !part.is_empty() && *part != "none")
+            .collect()
+    }
+}
+
+/// The smart-AI trigger list carried by an [`AlarmEvent`] (cmd 33).
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SmartAiTypeList {
+    /// One entry per triggered smart-AI detector
+    #[serde(default, rename = "smartAiType")]
+    pub types: Vec<SmartAiType>,
+}
+
+/// One triggered smart-AI detector inside a [`SmartAiTypeList`].
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SmartAiType {
+    /// Which detector fired: `crossline`, `intrusion`, `loitering`,
+    /// `legacy` or `loss`
+    #[serde(rename = "type", default)]
+    pub smart_type: String,
+    /// Bitmask of the zone locations that are currently triggered: bit 0 is
+    /// location 0, bit 1 is location 1, and so on. Use
+    /// [`SmartAiType::locations`] rather than decoding it by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    /// Per-zone detail, when the camera reports which AI type triggered which
+    /// zone
+    #[serde(default, rename = "subList")]
+    pub sub_list: Vec<SmartAiSubItem>,
+}
+
+impl SmartAiType {
+    /// The zone locations currently triggered.
+    ///
+    /// Decodes the `index` bitmask, and falls back to the `subList` entries
+    /// when no bitmask is present.
+    pub fn locations(&self) -> Vec<u32> {
+        if let Some(bits) = self.index {
+            return (0..u32::BITS).filter(|b| bits & (1 << b) != 0).collect();
+        }
+        self.sub_list.iter().filter_map(|sub| sub.index).collect()
+    }
+}
+
+/// A per-zone entry of a [`SmartAiType`].
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct SmartAiSubItem {
+    /// The zone location this entry refers to
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    /// The AI type that triggered the zone
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub ai_type: Option<String>,
 }
 
 /// The Ptz messages used to move the camera
@@ -1647,367 +1729,396 @@ pub struct User {
     pub user_set_state: String,
 }
 
-/// Crossline (line-crossing) detection container for cmd 527/528.
+/// A single smart-AI detection zone.
 ///
-/// Holds one or more [`CrosslineDetectItem`] zones per channel.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct CrosslineDetection {
-    /// XML Version
-    #[serde(rename = "@version", default = "xml_ver")]
-    pub version: String,
-    /// Channel ID
-    #[serde(rename = "channelId")]
-    pub channel_id: u8,
-    /// List of detect zones. Wire name is `<crosslineDetectItem>`,
-    /// confirmed against `reolink_aio/baichuan/baichuan.py::_parse_smart_ai_settings`.
-    #[serde(default, rename = "crosslineDetectItem")]
-    pub items: Vec<CrosslineDetectItem>,
-}
-
-/// A single zone entry for line-crossing detection (cmd 527/528).
+/// The five smart-AI detectors (crossline / intrusion / loitering / legacy /
+/// loss, cmds 527-552) all use the same per-zone shape; only the element name
+/// of the zone differs, and that is expressed by the `rename` on the `items`
+/// field of each container. Line-crossing zones carry a `line`, the area based
+/// ones carry a `region`; both are kept optional and opaque so a round-trip
+/// never drops them.
 ///
-/// Note Reolink's `sesensitivity` spelling is preserved exactly.
+/// Field names are taken from
+/// `reolink_aio/baichuan/baichuan.py::_parse_smart_ai_settings` and
+/// `::set_smart_ai`. Note Reolink's `sesensitivity` misspelling is preserved
+/// exactly — that is what the camera emits and accepts.
+///
+/// Every field is `default`ed: a camera that omits one must not fail the parse
+/// of the whole message (see [`crate::bc::de`], where an XML payload that
+/// cannot be deserialized is a hard error on the connection).
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct CrosslineDetectItem {
+pub struct SmartDetectItem {
     /// Whether this zone is enabled (0 disabled, 1 enabled)
+    #[serde(default)]
     pub enable: u32,
-    /// Sub-type AI category (`people`, `vehicle`, `dog_cat`, ...).
-    /// Wire name is `<aiType>`, confirmed against
-    /// `reolink_aio/baichuan/baichuan.py::_parse_smart_ai_settings`.
-    /// Use [`canonical_ai_type`] to normalize incoming names.
-    #[serde(rename = "aiType")]
+    /// The AI categories this zone triggers on.
+    ///
+    /// This is a **comma separated list** on the wire (e.g. `people,vehicle`),
+    /// not a single value. Use [`SmartDetectItem::ai_types`] to iterate it.
+    #[serde(rename = "aiType", default)]
     pub ai_type: String,
     /// Sensitivity from 0-100. The misspelling matches what the
     /// camera actually emits and accepts on the wire.
-    #[serde(rename = "sesensitivity")]
+    #[serde(rename = "sesensitivity", default)]
     pub sesensitivity: u32,
     /// Stay-time threshold in seconds
-    #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "stayTime", default, skip_serializing_if = "Option::is_none")]
     pub stay_time: Option<u32>,
     /// Alternative wire field for the stay/trigger threshold seen on some
     /// firmwares; some cameras emit this instead of (or alongside) `stayTime`.
-    #[serde(rename = "timeThresh", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "timeThresh",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub time_thresh: Option<u32>,
-    /// Zone location (camera-specific positional id).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Zone location. This is the identifier `reolink_aio` keys zones by, and
+    /// identifies a zone when modifying one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<u32>,
-    /// Direction the line must be crossed in.
-    /// Observed values: 0 = both ways, 1 = A->B, 2 = B->A.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub direction: Option<u32>,
     /// Index of this zone (e.g. 0 for `line1`)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
     /// User-visible zone name (e.g. `line1`)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Region coordinates (camera-specific encoded polygon).
-    /// Carried opaquely so we don't lose the data on round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<String>,
+    pub name: Option<String>,
+}
+
+impl SmartDetectItem {
+    /// The AI categories this zone triggers on, split out of the comma
+    /// separated `aiType` field and normalized with [`canonical_ai_type`].
+    ///
+    /// Empty entries are skipped, so an absent or empty `aiType` yields an
+    /// empty vector.
+    pub fn ai_types(&self) -> Vec<&str> {
+        self.ai_type
+            .split(',')
+            .map(|part| canonical_ai_type(part.trim()))
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+}
+
+/// Crossline (line-crossing) detection container for cmd 527/528.
+///
+/// The wire element is `<CrosslineDetect>` directly under `<body>`; confirmed
+/// against `reolink_aio/baichuan/baichuan.py::set_smart_ai`, which resolves
+/// the container with `root.find("CrosslineDetect")` on the parsed body.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct CrosslineDetect {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Operation to apply when writing this container back to the camera.
+    /// Known values are `add`, `delete` and `modify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// The detection zones. Wire name is `<crosslineDetectItem>`.
+    #[serde(default, rename = "crosslineDetectItem")]
+    pub items: Vec<SmartDetectItem>,
 }
 
 /// Intrusion detection container for cmd 529/530.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct IntrusionDetection {
-    /// XML Version
-    #[serde(rename = "@version", default = "xml_ver")]
-    pub version: String,
-    /// Channel ID
-    #[serde(rename = "channelId")]
-    pub channel_id: u8,
-    /// List of detect zones. Wire name is `<intrusionDetectItem>`,
-    /// confirmed against `reolink_aio/baichuan/baichuan.py::_parse_smart_ai_settings`.
-    #[serde(default, rename = "intrusionDetectItem")]
-    pub items: Vec<IntrusionDetectItem>,
-}
-
-/// A single zone entry for intrusion detection (cmd 529/530).
 ///
-/// The `sesensitivity` spelling is preserved.
+/// Wire element is `<IntrusionDetect>`; see [`CrosslineDetect`].
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct IntrusionDetectItem {
-    /// Whether this zone is enabled (0/1)
-    pub enable: u32,
-    /// AI category for this zone. Wire name is `<aiType>`.
-    #[serde(rename = "aiType")]
-    pub ai_type: String,
-    /// Sensitivity 0-100 (Reolink misspelling preserved)
-    #[serde(rename = "sesensitivity")]
-    pub sesensitivity: u32,
-    /// Required stay-time in seconds before an alarm fires
-    #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
-    pub stay_time: Option<u32>,
-    /// Alternative wire field for the stay/trigger threshold seen on some firmwares.
-    #[serde(rename = "timeThresh", skip_serializing_if = "Option::is_none")]
-    pub time_thresh: Option<u32>,
-    /// Zone location (camera-specific positional id).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<u32>,
-    /// Zone index
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index: Option<u32>,
-    /// User-visible zone name (e.g. `area1`)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Region coordinates, carried opaquely on round-trip.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-}
-
-/// Loitering detection container for cmd 531/532.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct LoiteringDetection {
+pub struct IntrusionDetect {
     /// XML Version
     #[serde(rename = "@version", default = "xml_ver")]
     pub version: String,
     /// Channel ID
-    #[serde(rename = "channelId")]
-    pub channel_id: u8,
-    /// List of detect zones. Wire name is `<loiteringDetectItem>`.
-    #[serde(default, rename = "loiteringDetectItem")]
-    pub items: Vec<LoiteringDetectItem>,
-}
-
-/// A single zone entry for loitering detection (cmd 531/532).
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct LoiteringDetectItem {
-    /// Whether this zone is enabled (0/1)
-    pub enable: u32,
-    /// AI category for this zone. Wire name is `<aiType>`.
-    #[serde(rename = "aiType")]
-    pub ai_type: String,
-    /// Sensitivity 0-100 (Reolink misspelling preserved)
-    #[serde(rename = "sesensitivity")]
-    pub sesensitivity: u32,
-    /// Required loitering time in seconds before alarming
-    #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
-    pub stay_time: Option<u32>,
-    /// Alternative wire field for the stay/trigger threshold seen on some firmwares.
-    #[serde(rename = "timeThresh", skip_serializing_if = "Option::is_none")]
-    pub time_thresh: Option<u32>,
-    /// Zone location (camera-specific positional id).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<u32>,
-    /// Zone index
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index: Option<u32>,
-    /// User-visible zone name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Region coordinates, carried opaquely on round-trip.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-}
-
-/// Legacy/forgotten-object detection container for cmd 549/550.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct LegacyDetection {
-    /// XML Version
-    #[serde(rename = "@version", default = "xml_ver")]
-    pub version: String,
-    /// Channel ID
-    #[serde(rename = "channelId")]
-    pub channel_id: u8,
-    /// List of detect zones. Wire name is `<legacyDetectItem>`.
-    #[serde(default, rename = "legacyDetectItem")]
-    pub items: Vec<LegacyDetectItem>,
-}
-
-/// A single zone entry for "legacy" (forgotten-object) detection (cmd 549/550).
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct LegacyDetectItem {
-    /// Whether this zone is enabled (0/1)
-    pub enable: u32,
-    /// AI category for this zone (often left as a generic class for object detection).
-    /// Wire name is `<aiType>`.
-    #[serde(rename = "aiType")]
-    pub ai_type: String,
-    /// Sensitivity 0-100 (Reolink misspelling preserved)
-    #[serde(rename = "sesensitivity")]
-    pub sesensitivity: u32,
-    /// How long an object must be present before flagging "forgotten"
-    #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
-    pub stay_time: Option<u32>,
-    /// Alternative wire field for the stay/trigger threshold seen on some firmwares.
-    #[serde(rename = "timeThresh", skip_serializing_if = "Option::is_none")]
-    pub time_thresh: Option<u32>,
-    /// Zone location (camera-specific positional id).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<u32>,
-    /// Zone index
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index: Option<u32>,
-    /// User-visible zone name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Region coordinates, carried opaquely on round-trip.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-}
-
-/// Loss/taken-object detection container for cmd 551/552.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct LossDetection {
-    /// XML Version
-    #[serde(rename = "@version", default = "xml_ver")]
-    pub version: String,
-    /// Channel ID
-    #[serde(rename = "channelId")]
-    pub channel_id: u8,
-    /// List of detect zones. Wire name is `<lossDetectItem>`.
-    #[serde(default, rename = "lossDetectItem")]
-    pub items: Vec<LossDetectItem>,
-}
-
-/// A single zone entry for "loss" (taken-object) detection (cmd 551/552).
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct LossDetectItem {
-    /// Whether this zone is enabled (0/1)
-    pub enable: u32,
-    /// AI category for this zone. Wire name is `<aiType>`.
-    #[serde(rename = "aiType")]
-    pub ai_type: String,
-    /// Sensitivity 0-100 (Reolink misspelling preserved)
-    #[serde(rename = "sesensitivity")]
-    pub sesensitivity: u32,
-    /// How long an object must be missing before flagging "taken"
-    #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
-    pub stay_time: Option<u32>,
-    /// Alternative wire field for the stay/trigger threshold seen on some firmwares.
-    #[serde(rename = "timeThresh", skip_serializing_if = "Option::is_none")]
-    pub time_thresh: Option<u32>,
-    /// Zone location (camera-specific positional id).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<u32>,
-    /// Zone index
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index: Option<u32>,
-    /// User-visible zone name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Region coordinates, carried opaquely on round-trip.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-}
-
-/// Push payload for cmd 600 (YOLO basic event).
-///
-/// The camera sends `channelId` plus the detected AI `type`. The `type`
-/// values use Reolink's wire names (e.g. `people`, `vehicle`, `dog_cat`,
-/// `non-motor vehicle`, `package`). Use [`canonical_ai_type`] to map
-/// other variants like `person` or `pet` onto these canonical strings.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct YoloDetectInfo {
-    /// XML Version
-    #[serde(rename = "@version", default = "xml_ver")]
-    pub version: String,
-    /// Channel ID the event occurred on.
-    ///
-    /// NOTE: cmd 600 push payloads do NOT carry `<channelId>` on the wire —
-    /// `reolink_aio` extracts the channel from the surrounding event element.
-    /// The field is kept here so that we can populate it from
-    /// [`crate::bc::model::BcMeta::channel_id`] at the listener layer, but
-    /// it is marked `#[serde(default)]` so missing-on-wire is accepted and
-    /// never the basis for filtering decisions.
     #[serde(rename = "channelId", default)]
     pub channel_id: u8,
-    /// Detected AI category
-    #[serde(rename = "type")]
-    pub ai_type: String,
+    /// Operation to apply when writing. `add`, `delete` or `modify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// The detection zones. Wire name is `<intrusionDetectItem>`.
+    #[serde(default, rename = "intrusionDetectItem")]
+    pub items: Vec<SmartDetectItem>,
 }
 
-/// Push payload for cmd 696 (YOLO detailed event) with sub-class.
+/// Loitering ("linger") detection container for cmd 531/532.
 ///
-/// In addition to the top-level `type` the camera may include a list of
-/// finer-grained sub-types (e.g. `dog` vs `cat` under `dog_cat`). The
-/// sub-type table is enumerated by [`yolo_sub_types`].
+/// Wire element is `<LoiteringDetect>`; see [`CrosslineDetect`].
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct LoiteringDetect {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Operation to apply when writing. `add`, `delete` or `modify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// The detection zones. Wire name is `<loiteringDetectItem>`.
+    #[serde(default, rename = "loiteringDetectItem")]
+    pub items: Vec<SmartDetectItem>,
+}
+
+/// Forgotten-item ("legacy") detection container for cmd 549/550.
+///
+/// Wire element is `<LegacyDetect>`; see [`CrosslineDetect`].
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct LegacyDetect {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Operation to apply when writing. `add`, `delete` or `modify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// The detection zones. Wire name is `<legacyDetectItem>`.
+    #[serde(default, rename = "legacyDetectItem")]
+    pub items: Vec<SmartDetectItem>,
+}
+
+/// Taken-item ("loss") detection container for cmd 551/552.
+///
+/// Wire element is `<LossDetect>`; see [`CrosslineDetect`].
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct LossDetect {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// Channel ID
+    #[serde(rename = "channelId", default)]
+    pub channel_id: u8,
+    /// Operation to apply when writing. `add`, `delete` or `modify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// The detection zones. Wire name is `<lossDetectItem>`.
+    #[serde(default, rename = "lossDetectItem")]
+    pub items: Vec<SmartDetectItem>,
+}
+
+/// A YOLO detection reported in a cmd 600 / 696 push.
+///
+/// Both the basic (600) and the detailed (696) push carry `<YoloWorldType>`
+/// elements; the detailed one additionally repeats `<subTypeList>`, each
+/// holding a single `<subType>`. Confirmed against
+/// `reolink_aio/baichuan/baichuan.py` cmd 600 / 696 branches.
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct YoloWorldType {
     /// XML Version
     #[serde(rename = "@version", default = "xml_ver")]
     pub version: String,
-    /// Channel ID the event occurred on.
-    ///
-    /// NOTE: cmd 696 push payloads do NOT carry `<channelId>` on the wire —
-    /// `reolink_aio` extracts the channel from the surrounding event element.
-    /// The field is kept here so that we can populate it from
-    /// [`crate::bc::model::BcMeta::channel_id`] at the listener layer, but
-    /// it is marked `#[serde(default)]` so missing-on-wire is accepted and
-    /// never the basis for filtering decisions.
-    #[serde(rename = "channelId", default)]
-    pub channel_id: u8,
-    /// Top-level AI category (e.g. `people`, `vehicle`, `dog_cat`)
-    #[serde(rename = "type")]
+    /// Detected AI category. Use [`canonical_ai_type`] to normalize it.
+    #[serde(rename = "type", default)]
     pub ai_type: String,
-    /// Optional single sub-type when the camera reports just one
-    #[serde(rename = "subType", skip_serializing_if = "Option::is_none")]
-    pub sub_type: Option<String>,
-    /// Optional list of sub-types when the camera reports multiple
-    #[serde(rename = "subTypeList", skip_serializing_if = "Option::is_none")]
-    pub sub_type_list: Option<YoloSubTypeList>,
+    /// Reported sub-classes, e.g. `dog` under `dog_cat`. Each `<subTypeList>`
+    /// on the wire holds one `<subType>`, and the element repeats.
+    #[serde(default, rename = "subTypeList")]
+    pub sub_type_lists: Vec<YoloSubTypeList>,
 }
 
-/// Wrapper for a list of YOLO sub-type strings.
+impl YoloWorldType {
+    /// The reported sub-types, flattened out of the repeated `<subTypeList>`
+    /// elements and with spaces normalized to underscores (matching
+    /// `reolink_aio`, which does the same before looking them up in the
+    /// sub-type table).
+    pub fn sub_types(&self) -> Vec<String> {
+        self.sub_type_lists
+            .iter()
+            .filter_map(|list| list.sub_type.as_ref())
+            .map(|sub| sub.replace(' ', "_"))
+            .collect()
+    }
+}
+
+/// One `<subTypeList>` entry of a [`YoloWorldType`].
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct YoloSubTypeList {
-    /// Each `<subType>x</subType>` child
-    #[serde(default, rename = "subType")]
-    pub sub_types: Vec<String>,
+    /// The sub-type, e.g. `dog`, `sedan`, `man`
+    #[serde(rename = "subType", default, skip_serializing_if = "Option::is_none")]
+    pub sub_type: Option<String>,
+}
+
+/// A single YOLO push event: one channel plus the types detected on it.
+///
+/// **Unverified wire names.** `reolink_aio` walks the cmd 600 / 696 payload
+/// generically (`for event_list in root: for event in event_list:`) so the
+/// names of the two wrapper elements are not recoverable from it. The
+/// `<channel>` child and the `<YoloWorldType>` children *are* confirmed.
+/// Aliases cover the plausible spellings; if a camera trace shows different
+/// wrappers only the `rename`/`alias` lists here need to change.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct YoloWorldEvent {
+    /// The channel the detection happened on. Note this is `<channel>`, not
+    /// the `<channelId>` used almost everywhere else in the protocol.
+    #[serde(default)]
+    pub channel: u8,
+    /// The detections reported for this channel
+    #[serde(default, rename = "YoloWorldType")]
+    pub types: Vec<YoloWorldType>,
+}
+
+/// The list wrapper of a cmd 600 / 696 push.
+///
+/// See [`YoloWorldEvent`] for why the element names are best-effort.
+#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
+pub struct YoloWorldEventList {
+    /// XML Version
+    #[serde(rename = "@version", default = "xml_ver")]
+    pub version: String,
+    /// The per-channel events
+    #[serde(
+        default,
+        rename = "YoloWorldEvent",
+        alias = "yoloWorldEvent",
+        alias = "yoloEvent"
+    )]
+    pub events: Vec<YoloWorldEvent>,
 }
 
 /// AI alarm config for cmd 342/343 — per-channel and per-AI type.
 ///
-/// Carries sensitivity, stay-time, and an opaque area-mask string. The
-/// camera identifies which AI type these settings apply to via `aiType`.
+/// The request template is
+/// `<AiDetectCfg version="1.1"><chn>N</chn><type>people</type></AiDetectCfg>`
+/// (`reolink_aio/baichuan/xmls.py::GetAiAlarm`) and the reply adds
+/// `<sensitivity>` and `<stayTime>`
+/// (`reolink_aio/baichuan/baichuan.py`, cmd 342 branch).
+///
+/// Note this is `<sensitivity>` — the `sesensitivity` misspelling applies to
+/// the smart-AI zone items (cmds 527-552), not here.
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct AiDetectCfg {
     /// XML Version
     #[serde(rename = "@version", default = "xml_ver")]
     pub version: String,
-    /// Channel ID. Wire name is `<chn>` (not `<channelId>`); confirmed
-    /// against `reolink_aio/baichuan/xmls.py::GetAiAlarm`.
-    #[serde(rename = "chn")]
+    /// Channel ID. Wire name is `<chn>`, not `<channelId>`.
+    #[serde(rename = "chn", default)]
     pub channel_id: u8,
-    /// AI category this config applies to. Wire name is `<type>` (not
-    /// `<aiType>`); confirmed against `reolink_aio/baichuan/xmls.py::GetAiAlarm`.
-    #[serde(rename = "type")]
+    /// AI category this config applies to. Wire name is `<type>`.
+    #[serde(rename = "type", default)]
     pub ai_type: String,
-    /// Sensitivity 0-100 (Reolink misspelling preserved)
-    #[serde(rename = "sesensitivity")]
-    pub sesensitivity: u32,
+    /// Sensitivity 0-100. Absent in the request, present in the reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<u32>,
     /// Stay-time in seconds before alarming
-    #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "stayTime", default, skip_serializing_if = "Option::is_none")]
     pub stay_time: Option<u32>,
-    /// Opaque area-mask payload (rectangle / polygon string). Carried
-    /// through so we don't lose it on round-trip.
-    #[serde(default, rename = "areaMask", skip_serializing_if = "Option::is_none")]
-    pub area_mask: Option<String>,
 }
 
-/// Baby-cry detection config (cmd 299/300).
+/// The AI configuration block, cmd 299 (read) / 300 (write).
+///
+/// This is the `<AiCfg>` element documented in `dissector/messages.md`. It
+/// carries both the auto-tracking settings and — on cameras that support it —
+/// the baby-cry detection ability and level. There is no separate
+/// "cry detection" message: `cryDetectLevel` is the cry sensitivity, and cry
+/// alarms themselves arrive through the normal alarm path, not as a cmd 299
+/// push.
+///
+/// Everything except the channel is optional because the set of fields varies
+/// a lot between models.
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
-pub struct CryDetection {
+pub struct AiCfg {
     /// XML Version
     #[serde(rename = "@version", default = "xml_ver")]
     pub version: String,
     /// Channel ID
-    #[serde(rename = "channelId")]
+    #[serde(rename = "channelId", default)]
     pub channel_id: u8,
-    /// Whether cry detection is enabled (0/1)
-    pub enable: u32,
-    /// Sensitivity 0-100 (Reolink misspelling preserved)
-    #[serde(rename = "sesensitivity", skip_serializing_if = "Option::is_none")]
-    pub sesensitivity: Option<u32>,
-    /// Optional stay-time threshold in seconds
-    #[serde(rename = "stayTime", skip_serializing_if = "Option::is_none")]
-    pub stay_time: Option<u32>,
+    /// Whether the camera can do baby-cry detection (`1` when supported)
+    #[serde(
+        rename = "cryDetectAbility",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cry_detect_ability: Option<u32>,
+    /// Baby-cry detection sensitivity. This *is* the cry detection setting.
+    #[serde(
+        rename = "cryDetectLevel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cry_detect_level: Option<u32>,
+    /// Whether auto-tracking is enabled
+    #[serde(
+        rename = "smartTrack",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub smart_track: Option<u32>,
+    /// The auto-tracking mode
+    #[serde(
+        rename = "smartTrackMode",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub smart_track_mode: Option<u32>,
+    /// Bitmask of the auto-tracking modes this camera supports
+    #[serde(
+        rename = "smartTrackModeAbility",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub smart_track_mode_ability: Option<u32>,
+    /// Comma separated list of AI types this camera can detect,
+    /// e.g. `people,vehicle,dog_cat`
+    #[serde(
+        rename = "detectType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub detect_type: Option<String>,
+    /// Which AI type auto-tracking follows
+    #[serde(
+        rename = "smartTrackType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub smart_track_type: Option<String>,
+    /// Whether auto-tracking may pan/tilt
+    #[serde(
+        rename = "smartTrackPt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub smart_track_pt: Option<u32>,
+    /// Seconds to keep tracking after the object stops
+    #[serde(
+        rename = "smartTrackObjectStopDelay",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub smart_track_object_stop_delay: Option<u32>,
+    /// Seconds to keep tracking after the object disappears
+    #[serde(
+        rename = "smartTrackObjectDisappearDelay",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub smart_track_object_disappear_delay: Option<u32>,
+}
+
+impl AiCfg {
+    /// The AI types this camera reports it can detect, split out of the comma
+    /// separated `detectType` field and normalized.
+    pub fn detect_types(&self) -> Vec<&str> {
+        self.detect_type
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(|part| canonical_ai_type(part.trim()))
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+
+    /// Whether this camera advertises baby-cry detection
+    pub fn supports_cry_detection(&self) -> bool {
+        self.cry_detect_ability.unwrap_or(0) == 1
+    }
 }
 
 /// Canonical AI categories used by Reolink for YOLO/smart-AI events.
 ///
-/// See the issue spec sub-type table for the full mapping; this is the
-/// top-level set used by cmds 600/696/342/343/527-552.
+/// Mirrors `reolink_aio/const.py::YOLO_DETECTS`.
 pub const AI_CANONICAL_TYPES: &[&str] = &[
     "people",
     "vehicle",
@@ -2016,28 +2127,51 @@ pub const AI_CANONICAL_TYPES: &[&str] = &[
     "package",
 ];
 
+/// AI categories that can appear in the `AItype` field of an
+/// [`AlarmEvent`] (cmd 33), beyond the [`AI_CANONICAL_TYPES`] above.
+///
+/// These are the alarm-level types; `reolink_aio` uses the same set when
+/// decoding recording triggers.
+pub const AI_ALARM_TYPES: &[&str] = &[
+    "people",
+    "face",
+    "vehicle",
+    "dog_cat",
+    "visitor",
+    "package",
+    "cry",
+    "crossline",
+    "intrusion",
+    "loitering",
+    "legacy",
+    "loss",
+    "other",
+];
+
 /// Map an incoming AI type string onto a canonical name.
 ///
-/// Reolink and downstream apps emit several aliases for the same
-/// category. We normalize so the public API only sees canonical strings.
+/// Reolink emits several aliases for the same category depending on the
+/// message. This merges `reolink_aio`'s `AI_DETECT_CONVERSION`
+/// (`person` -> `people`, `pet` -> `dog_cat`) and `YOLO_CONVERSION`
+/// (`person` -> `people`, `motor vehicle` -> `vehicle`, `animal` -> `dog_cat`)
+/// so the public API only sees canonical strings.
 ///
-/// - `person` -> `people`
-/// - `pet` -> `dog_cat`
-/// - `motor` / `motor vehicle` -> `vehicle`
-/// - everything else is returned untouched
+/// Anything unrecognized is returned untouched — this is a normalizer, not a
+/// validator, so a firmware that invents a new type still reaches the caller.
 pub fn canonical_ai_type(raw: &str) -> &str {
     match raw {
         "person" => "people",
-        "pet" => "dog_cat",
-        "motor" | "motor vehicle" => "vehicle",
+        "pet" | "animal" => "dog_cat",
+        "motor vehicle" => "vehicle",
         other => other,
     }
 }
 
 /// Sub-type list table for YOLO detailed events (cmd 696).
 ///
-/// Returns the recognized sub-classes for a top-level AI category.
-/// `package` has no sub-types, so an empty slice is returned for it.
+/// Returns the recognized sub-classes for a top-level AI category, mirroring
+/// `reolink_aio/const.py::YOLO_DETECT_TYPES`. Unknown categories yield an
+/// empty slice.
 pub fn yolo_sub_types(ai_type: &str) -> &'static [&'static str] {
     match canonical_ai_type(ai_type) {
         "people" => &["man", "woman", "child"],
@@ -2052,6 +2186,7 @@ pub fn yolo_sub_types(ai_type: &str) -> &'static [&'static str] {
         ],
         "dog_cat" => &["dog", "cat", "squirrel", "fox", "bear", "cow"],
         "non-motor vehicle" => &["bicycle"],
+        "package" => &["package"],
         _ => &[],
     }
 }

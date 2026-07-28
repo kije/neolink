@@ -54,7 +54,9 @@ pub use pirstate::PirState;
 pub use ptz::Direction;
 pub use pushinfo::PhoneType;
 pub use resolution::*;
-pub use smart_ai::{SmartAiEvent, SmartAiKind, SmartAiPayload, SmartAiPush};
+pub use smart_ai::{
+    AiState, SmartAiEvent, SmartAiKind, SmartAiPayload, SmartAiPush, SMART_AI_KINDS,
+};
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind};
 
