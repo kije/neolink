@@ -6,7 +6,12 @@ on:
   workflow_dispatch:
 
 env:
-  rust_version: "1.82.0"
+  # Keep in sync with `rust-version` in every Cargo.toml of the workspace.
+  # 1.88 is the floor imposed by the current lockfile: `time` 0.3.54 and
+  # `home` 0.5.12 declare `rust-version = "1.88"`, and 25 transitive crates
+  # (clap 4.6, toml 1.1, cpufeatures 0.3, getrandom 0.4, ...) are edition 2024,
+  # which needs Cargo >= 1.85 just to parse their manifests.
+  rust_version: "1.88.0"
 
 jobs:
   pre_job:
