@@ -297,36 +297,57 @@ Notes on the rest of axum 0.8, all verified as not applying:
 
 ### `rand`: 0.8.7 → 0.10.2
 
-**Effort: two import lines, plus the call sites they feed.**
+**Effort: ~6 sites. Go straight to 0.10.2 — 0.9 is a dead end.**
 
-Measured, `crates/core`:
+This upgrade *shrinks* the tree. `rand` 0.10.2 is **already in `Cargo.lock`**,
+pulled by `uuid` 1.24.0, and `rand` 0.8.7's only reverse dependency is
+`neolink_core` itself. So moving `crates/core` to 0.10.2 deletes `rand` 0.8.7,
+`rand_chacha` 0.3.1, `rand_core` 0.6.4 and `ppv-lite86` 0.2.21 from the lockfile
+and adds nothing. Stopping at 0.9 would instead *add* `rand_core` 0.9 and
+`getrandom` 0.3 as extra majors and still leave `rand` duplicated.
 
-- **rand 0.9** compiles with **zero errors** but emits deprecation warnings —
-  the old names still exist as deprecated aliases. Landing 0.9 alone would be
-  green-but-indebted, and CI's nightly clippy would start reporting it.
-- **rand 0.10** gives exactly **two errors**, both the same thing:
-  `error[E0432]: unresolved import `rand::thread_rng`` at
-  `crates/core/src/bc_protocol/connection/discovery.rs:18` and
-  `crates/core/src/bc_protocol/connection/udpsource.rs:13`.
+**Version safety.** RUSTSEC-2026-0097 ("Rand is unsound with a custom logger
+using `rand::rng()`") affects 0.7.0–0.8.5, 0.9.0–0.9.2 and 0.10.0. Our current
+0.8.7 is **not** affected, and neither is 0.10.2 — but do not land on 0.9.0–0.9.2
+or 0.10.0.
 
-Because the whole delta is two imports and their dependent calls, go straight to
-**0.10.2** in one step rather than staging through 0.9 and living with
-deprecations. The renames to apply:
+**The measured error count understates the work, and this is worth
+understanding.** A probe of `crates/core` on rand 0.10 reports exactly two
+errors, both `error[E0432]: unresolved import `rand::thread_rng`` at
+`crates/core/src/bc_protocol/connection/discovery.rs:18` and
+`crates/core/src/bc_protocol/connection/udpsource.rs:13`. That is misleading:
+with the import unresolved, every `let mut rng = thread_rng();` binds `rng` to
+the error type and rustc suppresses all downstream method-resolution
+diagnostics. Fix the two imports and a second wave of four
+`error[E0599]: no method named 'gen' found` appears at `discovery.rs:1268`,
+`discovery.rs:1273`, `udpsource.rs:385` and `udpsource.rs:446`.
+
+A third subtlety compounds it: **`use rand::Rng` keeps resolving under 0.10**,
+so nothing flags it — but `rand::Rng` is now a re-export of `rand_core::Rng`
+(the trait formerly called `RngCore`, `rand-0.10.2/src/lib.rs:59`), while the
+trait carrying `.random()` and `.random_range()` is now `rand::RngExt`
+(`rand-0.10.2/src/rng.rs:56`, methods at `:93` and `:163`). The breakage
+surfaces as missing methods, not as a failed import.
+
+Renames to apply:
 
 | rand 0.8 | rand 0.10 |
 |---|---|
 | `rand::thread_rng()` | `rand::rng()` |
-| `Rng::gen()` | `Rng::random()` |
-| `Rng::gen_range(a..b)` | `Rng::random_range(a..b)` |
+| `use rand::Rng` (for `gen`/`gen_range`) | `use rand::RngExt` |
+| `Rng::gen()` | `RngExt::random()` |
+| `Rng::gen_range(a..b)` | `RngExt::random_range(a..b)` |
 | `rand::seq::SliceRandom` (for `choose`) | `rand::seq::IndexedRandom` |
 
-Affected sites: `discovery.rs:18` (import), `:1267`, `:1272-1273`, `:1279`;
-`udpsource.rs:13` (import), `:384`, `:445`, `:766`, `:783`. These pick protocol
-client IDs and UDP ports/sequence numbers, so **confirm the value ranges are
-unchanged** while editing — a silently different range would break camera
-discovery in a way no current test would catch.
+Affected sites: `discovery.rs:18` (import), `:1268`, `:1273`, `:1279`;
+`udpsource.rs:13` (import), `:385`, `:446`, `:766`, `:783`.
 
-rand 0.10 is edition 2024 with MSRV 1.85, under our 1.88.
+**Value ranges are unchanged**, which matters because these pick protocol client
+IDs and UDP ports. `gen::<u8>()` → `random::<u8>()` resolves to the same
+`rng.next_u32() as u8` in both versions (`rand-0.8.7/src/distributions/integer.rs:16-21`
+vs `rand-0.10.2/src/distr/integer.rs:28-33`), so no behavioural drift.
+
+rand 0.10.2 is edition 2024 with MSRV 1.85, under our 1.88.
 
 ### `quick-xml`: 0.36.2 → 0.41.0
 
@@ -442,51 +463,79 @@ Three distinct causes:
 Neither crate has a RUSTSEC advisory; both are actively maintained by
 RustCrypto.
 
-### `nom`: 7.1.3 → 8.0.0 — the largest single migration
+### `nom`: 7.1.3 → 8.0.0 — recommended to DEFER
 
-**Effort: 42 errors across three files. Large, but the measurement shows it is
-overwhelmingly mechanical.**
+**Effort: 42 errors across three files, ~95% mechanical by volume — but the
+mechanical fix is also where the semantic landmine is. Recommend staying on
+7.1.3 for now.**
 
 Measured error distribution in `neolink_core`:
 `crates/core/src/bcudp/de.rs` 34, `crates/core/src/bc/de.rs` 21,
 `crates/core/src/bcmedia/de.rs` 13, `crates/core/src/lib.rs` 1.
 
-The useful finding is the *shape* of those errors, not the count. Roughly 50 of
-them are one pattern:
+**The reason to defer is not the volume — it is this.** In nom 8,
+streaming-versus-complete stopped being a module choice (`nom::bytes::streaming`
+vs `nom::bytes::complete`) and became **a mode selected per call**:
 
+```rust
+// nom-8.0.0/src/internal.rs:412-421
+fn parse(&mut self, input: Input) -> IResult<..> {
+    self.process::<OutputM<Emit, Emit, Streaming>>(input)
+}
+fn parse_complete(&mut self, input: Input) -> IResult<..> {
+    self.process::<OutputM<Emit, Emit, Complete>>(input)
+}
 ```
-error[E0618]: expected function, found `Context<fn(_) -> Result<(_, u32), Err<_>> {le_u32::<_, _>}>`
-```
 
-In nom 8 the combinators return `impl Parser` rather than a callable closure, so
-every `parser(input)` call site becomes `parser.parse(input)`. That is a
-find-and-adjust job, not a redesign. The remainder:
+Which method you write decides whether a short buffer yields `Err::Incomplete` or
+`Err::Error`. This codebase drives `tokio_util` codecs off exactly that
+distinction (`crates/core/src/bc/codex.rs`,
+`crates/core/src/bcmedia/codex.rs`, `crates/core/src/bcudp/codex.rs`). So the
+"mechanical" work of inserting `.parse(` at ~34 sites is simultaneously ~34
+semantic decisions about frame boundaries — and getting one wrong produces a
+stalled or mis-framed camera stream, not a compile error. That combination
+(bulk edit + invisible failure mode) is what makes it a bad fit for a batch.
 
-- `error[E0425]: cannot find type `VerboseError` in module `nom::error`` ×5 —
-  `VerboseError` was removed; `NomErrorType` in `crates/core/src/lib.rs` and
-  the error plumbing in `crates/core/src/bc_protocol/errors.rs` need a
-  replacement error type.
-- `error[E0282]: type annotations needed` ×7 — fallout from the `Parser` trait
-  change; resolves as the call sites are fixed.
-- one `error[E0107]: trait takes 1 generic argument but 3 generic arguments were
-  supplied` — the `Parser` trait's generics were reduced to the input type with
-  `Output`/`Error` as associated types.
+For when it is attempted, the 42 errors reduce to five root causes:
 
-The genuinely risky part is not the renames: this codebase drives
-`tokio_util` codecs off `Err::Incomplete` from **streaming** parsers
-(`crates/core/src/bc/codex.rs`, `crates/core/src/bcmedia/codex.rs`,
-`crates/core/src/bcudp/codex.rs`). Any change in incomplete-input semantics
-would show up as a stalled or mis-framed camera stream rather than a compile
-error. Budget time for that specifically.
+1. **`VerboseError` is gone** — it moved to a separate `nom-language` crate. In
+   nom 8 it survives in `nom-8.0.0/src/error.rs` only inside a `/*` block
+   starting at line 592. Four sites reference it: `crates/core/src/lib.rs:76`
+   (`NomErrorType`) and the `type IResult<..., E = VerboseError<I>>` aliases at
+   `bc/de.rs:10`, `bcmedia/de.rs:6`, `bcudp/de.rs:12`. Because every signature in
+   the three `de.rs` files is written in terms of those aliases, **fixing four
+   lines collapses a large share of the 70 error lines at once.**
+2. **~34 call sites need `.parse(` inserted** (combinators now return
+   `impl Parser`, not closures): 29 `context`/`error_context`, 3 `consumed`,
+   2 `hex32()`.
+3. **Two return-type changes**, `hex32` (`bc/de.rs:62`) and `take4`
+   (`bcmedia/de.rs:159`), from `impl FnMut(..) -> IResult<..>` to
+   `impl Parser<..>`.
+4. **One deprecation**: `tuple((le_u16, le_u16))` → `(le_u16, le_u16)` at
+   `bc/de.rs:235`.
+5. **The one genuinely non-mechanical edit**: the hand-written
+   `impl Parser for BcParser` at `bc/de.rs:27-35` cannot be ported
+   field-for-field. nom 8's trait moved from `Parser<I, O, E>` with `fn parse`
+   to `Parser<Input>` with associated `Output`/`Error` and a required generic
+   `fn process<OM: OutputMode>`.
 
-The safety net here is good: 64 tests in `neolink_core`, many of them
-round-tripping captured protocol samples via `include_bytes!`. Run them
-obsessively during this migration.
+**Why deferring is safe:** nom 7.1.3 is not yanked, has no RUSTSEC advisory,
+declares MSRV 1.48 (so it can never block a future toolchain bump), and pulls
+only `memchr`. nom 8.0.0 shipped 2025-01-25 and is still the only 8.x release
+eighteen months later, with upstream quiet since 2025-08-26. The upgrade buys
+code-size and monomorphisation wins this project does not need, adds a
+`nom-language` dependency, and concentrates its residual risk exactly where the
+tests are thinnest. Blast radius is one crate — nom is a direct dependency of
+`crates/core` only.
 
-**This is the one upgrade where "do nothing" is a legitimate answer.** nom 7 has
-no advisory and still works. If it is deferred, the cost is being one major
-behind on a dependency that is otherwise invisible to users. Do it when there is
-appetite for a focused session, not as part of a batch.
+The safety net if it is attempted: 64 tests in `neolink_core`, many
+round-tripping captured protocol samples via `include_bytes!`. Note the gap
+though — **`crates/core/src/bcmedia/ser.rs` has zero tests**, while
+`bcudp/ser.rs` has 6 and `bc/ser.rs` has 2.
+
+`cookie-factory` needs no action: it is already at the latest 0.3.3, and its
+manifest has no `nom` dependency edge at all (only an optional `futures`), so
+the two are fully independent.
 
 ## Phase 3 — compiles clean, but the behaviour needs checking
 
@@ -699,11 +748,11 @@ configured-but-unrun `deny.toml` gets no benefit from it.
 | log | 0.4.33 | 0.4.33 | current | — |
 | mailin-embedded | 0.8.3 | 0.8.3 | current; see async-std | — |
 | md5 | 0.8.1 | 0.8.1 | landed | — |
-| nom | 7.1.3 | 8.0.0 | Phase 2 — or defer | 42 errors |
+| nom | 7.1.3 | 8.0.0 | Phase 2 — recommend defer | 42 errors |
 | once_cell | 1.21.4 | 1.21.4 | Phase 5 — drop for std | low |
 | percent-encoding | 2.3.2 | 2.3.2 | current | — |
 | quick-xml | 0.36.2 | 0.41.0 | Phase 1, after P2 | 9 sites |
-| rand | 0.8.7 | 0.10.2 | Phase 1 | 2 imports |
+| rand | 0.8.7 | 0.10.2 | Phase 1 — also dedupes | ~6 sites |
 | regex | 1.13.1 | 1.13.1 | current | — |
 | requestty | 0.6.3 | 0.6.3 | landed | — |
 | rumqttc | 0.24.0 | 0.25.1 | Phase 3 | behavioural |
@@ -736,6 +785,8 @@ configured-but-unrun `deny.toml` gets no benefit from it.
    then `get_if_addrs`, then `hex-string`.
 9. **Phase 3 behavioural trio** — `toml`, `validator`, `rumqttc`, one at a time
    with a manual check each.
-10. **nom → 8** — its own focused session.
-11. Leave `fcm-push-listener`, `gstreamer` 0.25 and `tikv-jemallocator` until
-    there is a reason.
+10. Leave **`nom` 8**, **`fcm-push-listener` 4**, **`gstreamer` 0.25** and
+    **`tikv-jemallocator` 0.7** alone until there is a reason. All four are
+    currently safe to stay on, and each carries a failure mode the compiler will
+    not catch. If nom 8 is eventually attempted, give it a dedicated session and
+    treat every `.parse(` insertion as a frame-boundary decision, not a rename.
