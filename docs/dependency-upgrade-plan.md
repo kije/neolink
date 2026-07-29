@@ -617,8 +617,10 @@ four have since been investigated and cleared; two have not.
 
 - `toml` and `validator` — **investigated and verified safe.** Effectively
   trivial; promote them to Phase 1 whenever convenient.
-- `rumqttc` and `tikv-jemallocator` — **still unverified.** Treat the checks
-  below as required work, not optional diligence.
+- `rumqttc` — **still unverified.** Treat the checks below as required work.
+- `tikv-jemallocator` — investigated: the upgrade is a net *improvement* for
+  aarch64, and it surfaced a latent Docker bug that should be fixed today,
+  independent of any version change.
 
 ### `toml` 0.8.23 → 1.1.4 and `validator` 0.18.1 → 0.21.0 — both verified safe
 
@@ -680,24 +682,68 @@ aws-lc-rs, and possibly a cmake/nasm build requirement).
 
 Relevant code: `src/mqtt/mqttc.rs`, `src/mqtt/mod.rs`, `src/mqtt/discovery.rs`.
 
-### `tikv-jemallocator`: 0.5.4 → 0.7.0
+### `tikv-jemallocator`: 0.5.4 → 0.7.0 — and a latent Docker bug to fix first
 
-Compiles clean with no new warnings — **but only for the host target**, and that
-is the whole problem. jemalloc is a C library built by a build script and is
-historically the most fragile thing in a cross build. CI cross-compiles four
-Linux targets (`x86_64`, `armv7-gnueabihf`, `aarch64`, `i686`), and neolink is
-commonly run on Raspberry Pi and similar boards.
+Compiles clean with no new warnings, but only for the host target — jemalloc is a
+C library built by a build script and is the most fragile thing in a cross build.
+CI cross-compiles four Linux targets and neolink commonly runs on Raspberry Pi.
 
-Before landing, confirm: that jemalloc-sys as vendored by 0.6/0.7 still builds
-for armv7/aarch64/i686; the aarch64 **page-size** issue (jemalloc built on a
-4K-page host can fail at runtime on a 16K/64K-page aarch64 kernel, controlled by
-`--with-lg-page`); and whether 0.7 needs a newer C toolchain than the cross
-containers provide. Smoke-test the resulting binary on real ARM hardware, not
-just in the cross container.
+**Fix this regardless of whether you take the upgrade.** `Dockerfile:44`'s
+from-scratch branch runs a bare `cargo build --release` with no `JEMALLOC_*`
+environment. CI's cross artifacts *are* protected — `build.yml:127` and `:201`
+both set `JEMALLOC_SYS_WITH_LG_PAGE=16` — but the Docker path is not. So an
+arm64 image built from scratch (buildx/QEMU on a 4K-page host) compiles jemalloc
+with `LG_PAGE=12`, and jemalloc's page size must be at least the system's, so
+that binary **aborts at startup on a 16K-page arm64 kernel — a Raspberry Pi 5.**
+This is a live bug in the current tree; it has gone unnoticed because the
+released artifacts come from the protected CI path. Add
+`JEMALLOC_SYS_WITH_LG_PAGE=16` to that Dockerfile branch.
 
-Given that the only benefit is being current on an allocator, this is a
-reasonable one to defer — or to reconsider whether the dependency is needed at
-all.
+**The 0.7 upgrade is a net improvement on exactly this point**, which reverses
+the obvious assumption that it is pure risk. jemalloc 5.3.1's configure adds:
+
+```
+aarch64-unknown-linux-*)  if test "x$LG_PAGE" = "xdetect"; then LG_PAGE=16 ; fi
+```
+
+5.3.0 has no such case and falls back to `lg_page=12` for cross builds. So 0.7
+makes the safe value the *default* for aarch64-linux rather than something the
+build environment has to remember to set.
+
+**Pin carefully: `tikv-jemalloc-sys` 0.7.0 is yanked** (published 2026-05-25
+17:11, yanked, and 0.7.1 published 13 minutes later). `tikv-jemallocator` 0.7.0
+requires `^0.7.0` so a fresh resolve picks 0.7.1+5.3.1 on its own — but assert it
+in the lockfile rather than trusting a stale one. MSRV is 1.71.0, well under our
+1.88.
+
+No Rust source change: `tikv_jemallocator::Jemalloc` is unchanged, so
+`src/main.rs` is untouched.
+
+**The verification that substitutes for hardware you may not have:** 0.7's build
+script prints `CC=`, `CFLAGS=`, `LDFLAGS=`, `CPPFLAGS=`, and dumps the full
+`config.log` on failure when `CI` is set. Run the cross job and read the log for
+each of the four targets, confirming (a) `CC` is the prefixed cross compiler
+(`arm-linux-gnueabihf-gcc`, `aarch64-linux-gnu-gcc`, `i686-linux-gnu-gcc`) and
+not the host `cc`, and (b) configure reports `LG_PAGE : 16`. Those two lines
+retire most of the residual risk.
+
+Then, before any release: run the CI arm64 artifact on a 16K-page Pi 5 (check
+with `getconf PAGESIZE` → 16384). `neolink --version` alone proves the allocator
+initialised, since that happens before `main`. Follow with a soak test sampling
+RSS against a 0.5.4 baseline on the same hardware — this is a memory-behaviour
+change, and a startup check cannot detect RSS creep.
+
+Land it as its own PR, not batched.
+
+### `heck` — already current, but never bump it casually
+
+`heck` 0.5.0 is the latest, so there is nothing to do. Recording it here because
+it is **on a wire-visible path** and that is not obvious: `to_title_case()`
+builds Home Assistant MQTT discovery payloads at `src/mqtt/discovery.rs:274`
+(the device `friendly_name`) and `:501`. A future change to heck's title-casing
+would compile cleanly and silently **rename entities in users' Home Assistant
+installs**, breaking their dashboards and automations. If heck ever does move,
+diff the generated discovery JSON before and after.
 
 ## Phase 4 — recommended against, for now
 
@@ -814,7 +860,7 @@ configured-but-unrun `deny.toml` gets no benefit from it.
 | futures | 0.3.33 | 0.3.33 | current | — |
 | get_if_addrs | 0.5.3 | 0.5.3 | Phase 5 — replace | low |
 | gstreamer\* (×4) | 0.23.5/0.23.7 | 0.25.x | Phase 1 → 0.24.5 | 1 line |
-| heck | 0.5.0 | 0.5.0 | current | — |
+| heck | 0.5.0 | 0.5.0 | current — wire-visible, never batch | — |
 | hex-string | 0.1.0 | 0.1.0 | Phase 5 — replace | low |
 | indoc | 2.0.7 | 2.0.7 | current | — |
 | lazy_static | 1.5.0 | 1.5.0 | Phase 5 — drop for std | low |
@@ -834,7 +880,7 @@ configured-but-unrun `deny.toml` gets no benefit from it.
 | sha1 | 0.11.0 | 0.11.0 | landed | — |
 | socket2 | 0.6.5 | 0.6.5 | landed | — |
 | thiserror | 2.0.19 | 2.0.19 | landed | — |
-| tikv-jemallocator | 0.5.4 | 0.7.0 | Phase 3 | cross risk |
+| tikv-jemallocator | 0.5.4 | 0.7.0 | Phase 3 — fixes a Pi 5 bug | medium |
 | time | 0.3.54 | 0.3.54 | current; sets MSRV 1.88 | — |
 | tokio | 1.53.1 | 1.53.1 | current | — |
 | tokio-stream | 0.1.19 | 0.1.19 | current | — |
