@@ -947,32 +947,184 @@ authentication. Leave it alone.
 
 ### CI repair (independent of any dependency)
 
-Found while validating this work: five CI jobs fail for reasons unrelated to
-dependencies, all in setup steps that run before `cargo`.
+#### Things that are simply wrong today
 
-1. **macOS GStreamer download is a dead URL.** `build.yml` hardcodes
-   `https://gstreamer.freedesktop.org/data/pkg/osx/1.20.4/gstreamer-1.0-devel-1.20.4-universal.pkg`,
-   which returns HTTP 404 with a 272-byte error page that `installer` rejects.
-   Upstream no longer has 1.20.4; **1.22.12 still returns 200** and satisfies
-   the `v1_20` feature.
-2. **`macos-12` is a retired runner image** — that job never starts. Move to
+**`libgtk2.0-dev` is installed on every Linux path and nothing needs it.**
+`build.yml:48` (native), `build.yml:180` (cross, ×4 architectures),
+`style_checks.yml:31` (clippy) and `Dockerfile:41` all install it. GTK2 is EOL,
+and nothing in the dependency graph wants it: `grep -iE '^name = "(gtk|gdk|atk|
+pango|gdk-pixbuf)' Cargo.lock` returns nothing, and no Rust source mentions
+`gtk`/`gdk`. Deleting it from all four places speeds up every Linux job and drops
+an EOL system dependency.
+
+**The clippy job is missing `libssl-dev`.** `style_checks.yml:28-31` installs the
+same list as the native job *minus* `libssl-dev`, yet it runs
+`clippy --all-features`, which pulls `openssl-sys` via `ece` → `openssl`. It
+passes only because the ubuntu-22.04 runner image happens to preinstall
+libssl-dev. That is an accident, not a configuration — add it explicitly.
+
+**The Dockerfile does not honour the MSRV.** It builds `FROM
+docker.io/rust:slim-bookworm`, an unpinned floating tag. The workspace declares
+`rust-version = "1.88"` and CI pins 1.88.0, but the Docker build path tracks
+whatever stable happens to be current. Pin it.
+
+**The cross container tag floats too.** `build.yml:138` uses
+`node:current-bookworm-slim`. `current` is a moving tag, so cross builds are not
+reproducible, and the image will lose `bookworm` entirely when Node's current
+line moves to trixie. Pin to a concrete tag.
+
+#### Runner images that are retired or on the clock
+
+| Label | Used at | Status |
+|---|---|---|
+| `macos-12` | `build.yml:39` | **Retired** — fully unsupported since 2024-12-03. This job never starts. |
+| `macos-14` | `build.yml:39` | Deprecated in the runner-images list |
+| `ubuntu-22.04` | `build.yml:39`, `style_checks.yml:24` | GA, but **deprecation starts 2026-09-17**, unsupported 2027-04-17 |
+| `windows-2022` | `build.yml:39` | GA |
+
+Worth noting when moving off ubuntu-22.04: it ships **GStreamer 1.20.3**, which
+is the tightest constraint in the fleet and only just satisfies the `v1_20`
+feature. The cross container (Debian bookworm) ships 1.22.0, Windows 1.24.2. So
+migrating the native job to ubuntu-24.04 relaxes the constraint rather than
+tightening it — but do not raise the gstreamer-rs feature to `v1_22`+ on the
+strength of that until *every* path is above 1.22.
+
+#### The five failing jobs
+
+Five CI jobs fail for reasons unrelated to dependencies, all in setup steps that
+run before `cargo`.
+
+**macOS and Windows share one root cause, and it is not what it looks like:
+upstream deleted the pinned GStreamer packages.** Upstream keeps only the final
+point release of each stable series, so every pin to a non-final patch eventually
+404s.
+
+1. **macOS GStreamer download is a dead URL.** `build.yml:94` fetches
+   `.../osx/1.20.4/gstreamer-1.0-devel-1.20.4-universal.pkg`, now HTTP 404 with a
+   272-byte error page. `curl -L` has no `-f`, so it happily writes the HTML to
+   `gstreamer-devel.pkg` and `installer` rejects it. **1.20.4 is gone entirely;
+   1.20.7 is the last surviving 1.20.x.** Add `curl -fL` so a future 404 fails at
+   download rather than three steps later.
+2. **A second macOS failure is currently masked behind the first.**
+   `build.yml:101-103` runs `brew install … openssl@1.1` and then
+   `brew --prefix openssl@1.1`. The `openssl@1.1` formula has been **removed from
+   homebrew-core** — so the moment the pkg URL is fixed, the very next line fails.
+   Move to `openssl@3` (which `openssl-sys` 0.9.117 supports) and derive
+   `OPENSSL_INCLUDE_DIR`/`OPENSSL_LIB_DIR` from `$(brew --prefix openssl@3)`.
+   These two must be fixed together or macOS stays red.
+3. **Windows is the same URL rot, not a drive-detection bug.** The Chocolatey
+   `gstreamer` package's `chocolateyInstall.ps1` downloads
+   `.../data/pkg/windows/${version}/msvc/gstreamer-1.0-msvc-x86_64-${version}.msi`
+   with a hardcoded checksum — and the entire `/data/pkg/windows/1.24.2/`
+   directory is now gone. So the choco install fails to place any files, and the
+   later `dir "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"` failure is the *symptom*.
+   Fixing the drive-detection logic would not help. (This corrects the earlier
+   diagnosis in the PR thread.)
+4. **A version that works on both platforms:** **1.26.9** is the newest present on
+   all four channels needed — macOS devel and runtime pkgs, choco `gstreamer` and
+   `gstreamer-devel`, and the upstream Windows MSVC MSIs — which would let Windows
+   and macOS finally share one version constant. **1.22.12** is the conservative
+   alternative, also confirmed live on all of them. Do **not** pick 1.24.13:
+   it exists on macOS and upstream Windows, but choco's `gstreamer-devel` 1.24
+   line stops at 1.24.11, so it cannot be shared. Either choice satisfies the
+   `v1_20` feature, which is a *minimum* — `gstreamer` 0.23.7 exposes v1_16
+   through v1_28, so no manifest change is needed.
+5. **`macos-12` is a retired runner image** — that job never starts. Move to
    `macos-13`/`macos-14`.
-3. **Windows GStreamer path detection** fails at
-   `dir "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"` with
-   `Cannot find path 'D:\gstreamer\1.0\msvc_x86_64\'`. Also `openssl` is pinned
-   to `1.1.1.2100`, EOL since 2023.
-4. **`dockerprune.yml`'s secret guard does not work.**
+6. **`dockerprune.yml`'s secret guard does not work.**
    `if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}` is truthy for the *string*
    `"false"`, so the step runs without a token and fails with
-   `jq: error … Cannot iterate over null`. It needs
-   `== 'true'`. Its job is also confusingly named `native`, colliding with
-   `build.yml`.
-5. **`Build Docker image`** fails at `docker/login-action@v3` with
+   `jq: error … Cannot iterate over null`. It needs `== 'true'`. Its job is also
+   confusingly named `native`, colliding with `build.yml`'s.
+7. **`Build Docker image`** fails at `docker/login-action@v3` with
    `Password required` — an unset fork secret.
 
-Also worth considering: `cargo deny` has a fully populated `deny.toml` but does
-not appear to run in any workflow. A dependency-heavy project with a
-configured-but-unrun `deny.toml` gets no benefit from it.
+#### `cargo deny` is configured, not run, and would not catch much anyway
+
+`deny.toml` is 279 lines, but only **two** things are actually set to `deny`:
+advisory vulnerabilities, and licenses outside a nine-entry allow list. Notably:
+
+- `[bans] multiple-versions = "allow"` and `wildcards = "allow"` — which is
+  exactly why the 51 duplicate crate majors and the `env_logger = "*"` wildcards
+  (now removed) were never flagged.
+- `[advisories] unmaintained = "warn"`, `yanked = "warn"` — so none of the
+  unmaintained crates in §"Security advisories" would have failed a build.
+- There is an `ignore = ["RUSTSEC-2022-0048"]` entry whose comment refers to
+  rust-xml being unmaintained.
+
+And it does not run in any workflow, so none of it is enforced today. Two things
+worth doing: add a `cargo deny check` job, and tighten `multiple-versions` to
+`warn` with an explicit `skip`/`skip-tree` list so new duplicates are visible
+rather than silent. Note the file is old enough that a current `cargo-deny` may
+reject some keys outright, so expect to migrate the schema as part of wiring it
+up.
+
+#### The MSRV pin is applied to the wrong jobs
+
+Worth knowing, because it changes what the green checks on this PR actually prove.
+`rust_version` is consumed in only three places — `build.yml:189` (the four
+**cross release builds**) and `:296`/`:356` (release plumbing). The `native` job
+has **no toolchain setup at all** and therefore builds with the runner's stable,
+as does the clippy job.
+
+So the pin governs release artifacts, not fast feedback. Two consequences:
+
+- The four cross jobs passing is precisely what validates the 1.88 bump
+  end-to-end — at 1.82.0 they would have failed on `cpufeatures` 0.3.0's
+  edition-2024 manifest. That is the real evidence, not the native jobs.
+- The four release binaries are built with a compiler six releases behind stable
+  for no benefit, while MSRV regressions surface last, in the slowest jobs.
+
+The better shape is to invert it: add one cheap dedicated job that is the *only*
+place `rust_version` appears —
+
+```yaml
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: rustup default "${{ env.rust_version }}"
+      - run: cargo check --workspace --all-targets --all-features --locked
+```
+
+— and let the cross/release jobs use stable. The `--locked` matters: it fails if
+the committed lockfile drifts from the manifests, which is exactly the failure
+mode that forced 1.82 → 1.88 in the first place and which nothing currently
+guards.
+
+#### `Cargo.lock binary` in `.gitattributes` — half right
+
+The single line `Cargo.lock binary` expands to `-diff -merge -text`, and the two
+halves have opposite value:
+
+- **Keep `-merge`.** Text-merging a lockfile yields a syntactically valid but
+  semantically incoherent file — a merged `checksum` line paired with the wrong
+  `version` is a supply-chain hazard. Forcing a conflict and regenerating is the
+  correct behaviour.
+- **Consider dropping `-diff`.** For a dependency PR the lockfile diff *is* the
+  primary evidence, and this PR is the demonstration: there is currently no way
+  for a reviewer to see which crates entered or left the tree except by trusting
+  this document. It also defeats `git log -p -- Cargo.lock` for archaeology.
+
+The counter-argument is real — lockfile diffs are large and dominate a PR view —
+so this is a judgement call, not a defect.
+
+#### 51 duplicate crate majors, and what collapses them
+
+The tree carries 51 crate names at more than one major version. The useful part is
+that they cluster behind a small number of upgrades — **`fcm-push-listener` alone
+collapses five**:
+
+| Crate | Versions | Who pulls the old one | Collapsed by |
+|---|---|---|---|
+| `socket2` | 0.5.10, 0.6.5 | `fcm` → `reqwest` 0.11 → `hyper` 0.14 | fcm alone |
+| `base64` | 0.13.1, 0.21.7, 0.23.0 | `fcm` → `serde_with` 2.3.3, and `fcm` directly | fcm alone, 3 → 1 |
+| `digest` | 0.10.7, 0.11.3 | `fcm` → `ece` → `sha2` 0.10 | fcm alone |
+| `heck` | 0.4.1, 0.5.0 | `fcm` → `prost-build` 0.11 | fcm alone |
+| `thiserror` | 1.0.69, 2.0.19 | `rumqttc` 0.24 **and** `fcm` → `ece` | needs **both** fcm and rumqttc |
+| `rand` / `rand_core` | 0.8.7 + 0.10.2 | `crates/core` (0.10.2 already present via `uuid`) | the rand bump |
+
+That is another argument for the `fcm-push-listener` move beyond fixing
+registration: it is the single biggest lever on tree duplication.
 
 ## Inventory: current state of every direct dependency
 
