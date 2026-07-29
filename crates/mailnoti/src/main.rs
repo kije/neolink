@@ -1,3 +1,4 @@
+#![warn(unused_crate_dependencies)]
 //! Main test app for mail
 
 use anyhow::{anyhow, Context, Result};

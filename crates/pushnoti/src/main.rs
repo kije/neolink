@@ -1,3 +1,5 @@
+#![warn(unused_crate_dependencies)]
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use fcm_push_listener::*;
