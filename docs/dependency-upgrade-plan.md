@@ -617,7 +617,8 @@ four have since been investigated and cleared; two have not.
 
 - `toml` and `validator` — **investigated and verified safe.** Effectively
   trivial; promote them to Phase 1 whenever convenient.
-- `rumqttc` — **still unverified.** Treat the checks below as required work.
+- `rumqttc` — investigated: no code changes, but it silently swaps the rustls
+  crypto provider from `ring` to `aws-lc-rs`, which is a CI/toolchain job.
 - `tikv-jemallocator` — investigated: the upgrade is a net *improvement* for
   aarch64, and it surfaced a latent Docker bug that should be fixed today,
   independent of any version change.
@@ -669,18 +670,73 @@ Steps: bump `toml` to `"1.1.4"` and `validator` to `"0.21.0"` (keeping
 `features = ["derive"]`) in all three manifests — root, `crates/mailnoti`,
 `crates/pushnoti` — then `cargo update -p toml -p validator`.
 
-### `rumqttc`: 0.24.0 → 0.25.1
+### `rumqttc`: 0.24.0 → 0.25.1 — zero code changes, but it swaps your TLS stack
 
-Compiles clean. The behavioural surface is larger than average: reconnect and
-backoff timing, whether `EventLoop::poll` returns different errors on
-disconnect, QoS/retain handling, and last-will behaviour. Any change shows up as
-flapping Home Assistant entities, not a build failure. The root manifest
-declares `rumqttc = "0.24.0"` with **no explicit features**, so also confirm
-0.25 did not change the default feature set — a changed TLS default could
-silently disable TLS MQTT or pull a much larger tree (rustls major, ring vs
-aws-lc-rs, and possibly a cmake/nasm build requirement).
+Compiles clean, and the API surface genuinely is unchanged: `rumqttc` appears in
+only three places (`src/mqtt/mqttc.rs:8`, `:222`, `:240`), and every type used —
+`AsyncClient`, `MqttOptions`, `Transport`, `TlsConfiguration::Simple`, `LastWill`,
+`QoS`, `Event`/`Incoming`, `ConnectReturnCode`, `Publish.topic`/`.payload`,
+`ClientError::{Request,TryRequest}` — is identical between 0.24.0 and 0.25.1.
 
-Relevant code: `src/mqtt/mqttc.rs`, `src/mqtt/mod.rs`, `src/mqtt/discovery.rs`.
+**The real change is invisible to the compiler: the rustls crypto provider
+silently moves from `ring` to `aws-lc-rs`.** Our manifest line is bare
+(`rumqttc = "0.24.0"`, no `features`, no `default-features = false`), so we take
+the default `use-rustls` feature — and that feature was redefined:
+
+| | 0.24.0 | 0.25.1 |
+|---|---|---|
+| `use-rustls` pulls | `tokio-rustls` 0.25 (default features) | `tokio-rustls` 0.26, `default-features = false` + `tokio-rustls/default` |
+| resolves to | rustls 0.22.4 | rustls 0.23.43 |
+| crypto provider | `ring` | **`aws-lc-rs`** |
+
+So the binary that ships to users gains `aws-lc-rs` + `aws-lc-sys` — a large
+C/asm build-from-source dependency — in place of `ring`. That is a supply-chain
+and build-toolchain change disguised as a patch-level MQTT bump, and it is
+exactly the kind of thing a green `cargo check` will not tell you.
+
+**Target 0.25.1, never 0.25.0** — 0.25.0 shipped a broken `websocket` feature,
+fixed in 0.25.1.
+
+**The work is in CI, not the code.** Neither release job has ever built
+`aws-lc-sys`: `native` (`build.yml:128`) and `cross` (`:195`) both build only the
+root package, whose TLS stack today is rustls 0.22.4 + ring. The `cross` job runs
+in `node:current-bookworm-slim` and installs only `build-essential` plus the
+cross gcc/g++ — **no cmake**. `aws-lc-sys` 0.43 prefers its cmake-free
+`CcBuilder` when pre-generated bindings exist, and they do for every target we
+build (`linux_x86_64`, `linux_arm`, `linux_aarch64`, `linux_x86`, `win_x86_64`),
+so it will most likely work — but if `CcBuilder` is rejected for any reason it
+falls through to `CmakeBuilder`, which hard-fails with
+`Missing dependency: cmake`. Cheap insurance: add `cmake` to the `cross` job's
+apt list before bumping.
+
+If you would rather not take `aws-lc-rs`, note that forcing `ring` back is not a
+simple feature flip — decide this deliberately rather than by default.
+
+MSRV 1.64, well under 1.88.
+
+### Drop `--cfg tokio_unstable` — it buys nothing and costs semver
+
+Not a version bump, but it belongs in this document because it directly affects
+the tokio 1.27 → 1.53 move already made.
+
+`.cargo/config.toml` sets `rustflags = ["--cfg", "tokio_unstable"]` for every
+build. **Nothing in the workspace needs it.** A grep for every unstable-gated API
+(`task::Builder`, `task::id`, `RuntimeMetrics`, `Handle::metrics`,
+`consume_budget`) returns nothing, and the workspace was verified to compile
+clean with the flag removed:
+
+```
+RUSTFLAGS="" cargo check --workspace --all-targets --all-features   # exit 0
+```
+
+The cost of keeping it is real: `tokio_unstable` opts the entire build out of
+tokio's semver guarantees. Tokio just moved eleven patch releases' worth of
+internals in this audit, and any future 1.x patch could change an unstable-gated
+internal with no semver signal — in exchange for functionality this project does
+not use. Removing the flag makes the tokio bump strictly safer.
+
+(The `tracing` features on `tokio` and `tokio-util` are ordinary stable features
+and are unaffected by this.)
 
 ### `tikv-jemallocator`: 0.5.4 → 0.7.0 — and a latent Docker bug to fix first
 
@@ -874,7 +930,7 @@ configured-but-unrun `deny.toml` gets no benefit from it.
 | rand | 0.8.7 | 0.10.2 | Phase 1 — also dedupes | ~6 sites |
 | regex | 1.13.1 | 1.13.1 | current | — |
 | requestty | 0.6.3 | 0.6.3 | landed | — |
-| rumqttc | 0.24.0 | 0.25.1 | Phase 3 | behavioural |
+| rumqttc | 0.24.0 | 0.25.1 | Phase 3 — swaps TLS to aws-lc-rs | medium |
 | serde | 1.0.229 | 1.0.229 | current | — |
 | serde_json | 1.0.151 | 1.0.151 | current | — |
 | sha1 | 0.11.0 | 0.11.0 | landed | — |
@@ -907,9 +963,11 @@ configured-but-unrun `deny.toml` gets no benefit from it.
 9. **CI repair** — independent of everything, can go any time.
 10. **Phase 5 hygiene** — `lazy_static`/`once_cell` → std first (easiest),
     then `get_if_addrs`, then `hex-string`.
-11. **`rumqttc` → 0.25.1** — the one Phase 3 item still needing a behavioural
-    check.
-12. Leave **`nom` 8**, **`fcm-push-listener` 4.x** (3.0.0 is step 1; 4.x is a
+11. **`rumqttc` → 0.25.1** — no code changes, but add `cmake` to the cross job
+    first and decide deliberately about `aws-lc-rs` replacing `ring`.
+12. **Drop `--cfg tokio_unstable`** — verified unnecessary, and it currently
+    opts the build out of tokio's semver guarantees.
+13. Leave **`nom` 8**, **`fcm-push-listener` 4.x** (3.0.0 is step 1; 4.x is a
     separate, much larger job), **`gstreamer` 0.25** and
     **`tikv-jemallocator` 0.7** alone until there is a reason. Each carries a
     failure mode the compiler will not catch. If nom 8 is eventually attempted,
