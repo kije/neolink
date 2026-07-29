@@ -130,6 +130,52 @@ error, so each was checked beyond "it builds":
 as transitive duplicates pulled by other crates; only our direct requirements
 moved.
 
+## Security advisories currently in the tree
+
+Found by auditing the lockfile against the RustSec database. None of these was
+the motivation for this audit, and two of them change the priority of upgrades
+that otherwise looked optional.
+
+| Advisory | Crate | Reached via | Fixed in |
+|---|---|---|---|
+| RUSTSEC-2026-0194 | `quick-xml` 0.36.2 | **direct** | 0.41.0 |
+| RUSTSEC-2026-0195 | `quick-xml` 0.36.2 | **direct** | 0.41.0 |
+| RUSTSEC-2026-0049 | `rustls-webpki` 0.102.8 | `rumqttc` 0.24 | 0.103.10 |
+| RUSTSEC-2026-0104 | `rustls-webpki` 0.102.8 | `rumqttc` 0.24 | 0.103.13 |
+| RUSTSEC-2026-0098/0099 | `rustls-webpki` 0.102.8 | `rumqttc` 0.24 | 0.103.12 |
+| RUSTSEC-2024-0336 | `rustls` 0.20.9 | `fcm-push-listener` 2.0.3 | 0.21.11 (no 0.20 fix) |
+| RUSTSEC-2025-0121 | `gcc` 0.3.55 | `get_if_addrs` | — (unmaintained) |
+| RUSTSEC-2024-0370 | `proc-macro-error` 1.0.4 | `validator` < 0.19 | — (unmaintained) |
+| RUSTSEC-2024-0421 | `idna` 0.5.0 | `validator` < 0.19 | 1.0.0 |
+| ~~RUSTSEC-2025-0052~~ | ~~`async-std`~~ | ~~`crates/mailnoti`~~ | **cleared** |
+
+Three of these deserve emphasis because they are reachable from network input:
+
+- **`quick-xml` — remote DoS on the most exposed parse path in the program.**
+  RUSTSEC-2026-0194 is quadratic run time when checking a start tag for duplicate
+  attribute names; RUSTSEC-2026-0195 is unbounded namespace-declaration
+  allocation in `NsReader` enabling memory exhaustion. Both are fixed **only in
+  0.41.0**. This crate parses XML arriving straight off the camera socket
+  (`crates/core/src/bc/xml.rs`, `crates/core/src/bcudp/xml.rs`) and off the
+  ONVIF/SOAP surface (`src/onvif/soap.rs`, `src/onvif/services/*.rs`,
+  `src/onvif/discovery.rs`). A malicious or spoofed camera or ONVIF peer on the
+  LAN can trigger both. **This turns the quick-xml upgrade from housekeeping into
+  the security-motivated item in this document** — and note it needs P2 first.
+- **`rustls-webpki` via `rumqttc` — a silent one.** RUSTSEC-2026-0049 means
+  correctly-issued CRLs are not consulted, so a **revoked certificate is accepted
+  with no error and no log line**. RUSTSEC-2026-0104 is a reachable panic on
+  malformed CRL DER, before signature verification. Both sit on the MQTT TLS
+  path. This is a second, independent reason to do the `rumqttc` bump.
+- **`rustls` 0.20.9 via `fcm-push-listener`** — RUSTSEC-2024-0336,
+  `ConnectionCommon::complete_io` can enter an infinite loop on network input.
+  There is no fix in the 0.20 line, so the only remedy is moving
+  `fcm-push-listener`. Reachable whenever the `pushnoti` feature is enabled.
+
+`proc-macro-error` and `idna` clear themselves when `validator` moves to ≥ 0.19
+(and the plan already targets 0.21.0). `gcc` clears when `get_if_addrs` is
+replaced. Both are build-time or unreachable, so they are hygiene rather than
+exposure.
+
 ## Prerequisite test coverage — do this before the risky phases
 
 Three of the remaining upgrades change code that has no test covering it. These
@@ -826,40 +872,78 @@ requires it.
 These are not version upgrades; they are dependencies that should be replaced or
 dropped. None is urgent, all are low-risk, and each shrinks the tree.
 
-### `get_if_addrs` 0.5.3 — last published 2018
+### DONE — four dependencies nothing referenced
 
-Used in `crates/core` and `crates/mailnoti`. Call sites:
-`crates/core/src/bc_protocol/connection/discovery.rs:1234-1250` (finds the first
-non-loopback IPv4 interface, and separately iterates IPv4 interfaces for
-broadcast/netmask), plus `crates/mailnoti`. Candidate replacements are
-`if-addrs`, `local-ip-address` and `network-interface`. Any replacement must keep
-working on Linux, macOS and Windows, since all three are CI targets, and must
-preserve the broadcast-address computation.
+`crates/mailnoti` declared `async-std`, `get_if_addrs` and `lazy_static`;
+`crates/pushnoti` declared `lazy_static`. None was referenced by a single line of
+Rust. All four are deleted, and `#![warn(unused_crate_dependencies)]` was added to
+both crates' `main.rs` — the other three crates already had it, which is precisely
+why only these two rotted. This cleared RUSTSEC-2025-0052 and removed the whole
+async-std executor subtree from the lockfile.
 
-### `async-std` 1.13.2 — discontinued upstream
+### `get_if_addrs` 0.5.3 → `if-addrs` 0.15.0 in `crates/core`
 
-Used only by `crates/mailnoti`, and likely forced by `mailin-embedded` rather
-than chosen. `mailnoti` already depends on tokio with `features = ["full"]`, so
-if `mailin-embedded` has a tokio-compatible mode the dependency can simply go.
-If it does not, the question becomes whether to replace `mailin-embedded`.
+**Formally dead**: the upstream repository is archived by its owner. Still used at
+`crates/core/src/bc_protocol/connection/discovery.rs:1234`, `:1236`, `:1243`,
+`:1244` — finding the first non-loopback IPv4 interface, and iterating IPv4
+interfaces for broadcast/netmask.
 
-### `lazy_static` 1.5.0 → `std::sync::LazyLock`
+The swap is a **four-token rename**, `get_if_addrs::` → `if_addrs::`, and removes
+`get_if_addrs` 0.5.3, `get_if_addrs-sys` 0.1.1, `c_linked_list` 1.1.1,
+`winapi` 0.2.8 and `gcc` 0.3.55 from the lockfile — clearing RUSTSEC-2025-0121.
 
-Used in `crates/core`, `crates/mailnoti` and `crates/pushnoti` (one known block
-at `crates/core/src/bc_protocol/connection/discovery.rs:62`). `LazyLock`
-stabilised in Rust 1.80 and our MSRV is now 1.88, so std covers this and the
-dependency can be dropped outright.
+**But it is not risk-free, and there is no test to catch it.** `if-addrs` skips
+every unicast address whose `DadState != IpDadStatePreferred`
+(`if-addrs-0.15.0/src/lib.rs:380-382`); `get_if_addrs` 0.5.3 has no such filter.
+On a Windows host whose NIC currently exposes a Tentative or Deprecated address,
+the two crates return different interface sets — and this feeds camera discovery
+on the wire. Note that
+`grep -rn "#\[test\]" crates/core/src/bc_protocol/connection/discovery.rs`
+returns **zero hits**: neither `get_local_ip()` (`discovery.rs:1233`) nor
+`get_broadcasts()` (`:1241`) has any automated test. Add one before swapping, or
+at minimum smoke-test discovery on Windows.
 
-### `once_cell` 1.21.4 → `std::sync::OnceLock`/`LazyLock`
+### `lazy_static` 1.5.0 → `std::sync::LazyLock` in `crates/core`
 
-Same argument. Check each use — once_cell's `Lazy` and std's `LazyLock` differ
-slightly, and once_cell's non-thread-safe `OnceCell` has no exact std
-equivalent — but most uses are likely replaceable.
+One remaining block, at `crates/core/src/bc_protocol/connection/discovery.rs:62`,
+holding four items with seven deref sites. `LazyLock` stabilised in 1.80 and our
+MSRV is 1.88, so std covers it and the dependency can be dropped entirely.
 
-### `hex-string` 0.1.0 — last published 2019
+Better still: the three `Duration` items can become plain `const`, moving the work
+to compile time and removing three atomic `Once` checks from the discovery hot
+path — `discovery.rs:259`, `:290`, `:316`, `:331`, `:422`, `:1083` and `:1107` are
+all inside per-attempt retry/timeout loops. Every missed edit is a hard type
+error, not a behaviour change, so this is safe to do mechanically.
 
-Used only in `crates/decoder/src/main.rs`. Replace with `hex`, `const-hex`, or
-plain std formatting.
+### `once_cell` 1.21.4 → `std::sync::LazyLock`
+
+`once_cell` itself is healthy (no advisory, actively maintained) — this is purely
+about dropping a dependency std now covers. All five statics are `Lazy<Regex>`
+whose initialiser is `Regex::new(<literal>).unwrap()`, which cannot fail, so the
+one real semantic difference between `Lazy` and `LazyLock` — behaviour when the
+initialiser panics and the cell is poisoned — is unreachable here. Three files,
+five declarations, zero call-site changes: `src/config.rs`,
+`crates/mailnoti/src/config.rs`, `crates/pushnoti/src/config.rs`.
+
+### `hex-string` 0.1.0 → `hex` 0.4.3 — and this fixes a latent panic
+
+**Abandoned**: 0.1.0 is the only version ever published, in 2019. Used only in
+`crates/decoder/src/main.rs`.
+
+Worth doing for more than hygiene: `hex-string` only accepts lowercase hex, so the
+decoder currently **panics on uppercase input** — including on its own log output.
+`hex::decode` is case-insensitive. That is a deliberate behaviour change, in the
+right direction, in an interactive debug CLI with no wire exposure.
+
+### `md5` — do NOT switch to RustCrypto `md-5`
+
+Recording this as an explicit non-action. The stainless-steel `md5` crate is
+actively maintained (0.8.1 published 2026-07-09) with no advisory, so there is
+nothing to fix. And migrating would put the camera login hash at risk for no
+benefit: the Baichuan key derivation depends on a 32-character **uppercase** hex
+string. Writing `format!("{:x}", …)` instead of `{:X}`, or reaching for
+`hex::encode` (which is lowercase), compiles perfectly and silently breaks
+authentication. Leave it alone.
 
 ### CI repair (independent of any dependency)
 
@@ -914,10 +998,10 @@ configured-but-unrun `deny.toml` gets no benefit from it.
 | env_logger | 0.11.11 | 0.11.11 | current, now uniform | — |
 | fcm-push-listener | 2.0.3 | 4.1.1 | **Phase 0 — go to 3.0.0** | low |
 | futures | 0.3.33 | 0.3.33 | current | — |
-| get_if_addrs | 0.5.3 | 0.5.3 | Phase 5 — replace | low |
+| get_if_addrs | 0.5.3 | 0.5.3 | Phase 5 → if-addrs 0.15 | low |
 | gstreamer\* (×4) | 0.23.5/0.23.7 | 0.25.x | Phase 1 → 0.24.5 | 1 line |
 | heck | 0.5.0 | 0.5.0 | current — wire-visible, never batch | — |
-| hex-string | 0.1.0 | 0.1.0 | Phase 5 — replace | low |
+| hex-string | 0.1.0 | 0.1.0 | Phase 5 → hex 0.4.3, fixes a panic | low |
 | indoc | 2.0.7 | 2.0.7 | current | — |
 | lazy_static | 1.5.0 | 1.5.0 | Phase 5 — drop for std | low |
 | log | 0.4.33 | 0.4.33 | current | — |
@@ -926,11 +1010,11 @@ configured-but-unrun `deny.toml` gets no benefit from it.
 | nom | 7.1.3 | 8.0.0 | Phase 2 — recommend defer | 42 errors |
 | once_cell | 1.21.4 | 1.21.4 | Phase 5 — drop for std | low |
 | percent-encoding | 2.3.2 | 2.3.2 | current | — |
-| quick-xml | 0.36.2 | 0.41.0 | Phase 1, after P2 | 9 sites |
+| quick-xml | 0.36.2 | 0.41.0 | **Phase 1 — 2 advisories** | 9 sites |
 | rand | 0.8.7 | 0.10.2 | Phase 1 — also dedupes | ~6 sites |
 | regex | 1.13.1 | 1.13.1 | current | — |
 | requestty | 0.6.3 | 0.6.3 | landed | — |
-| rumqttc | 0.24.0 | 0.25.1 | Phase 3 — swaps TLS to aws-lc-rs | medium |
+| rumqttc | 0.24.0 | 0.25.1 | Phase 3 — advisories + TLS swap | medium |
 | serde | 1.0.229 | 1.0.229 | current | — |
 | serde_json | 1.0.151 | 1.0.151 | current | — |
 | sha1 | 0.11.0 | 0.11.0 | landed | — |
@@ -944,7 +1028,7 @@ configured-but-unrun `deny.toml` gets no benefit from it.
 | toml | 0.8.23 | 1.1.4 | Phase 3 — verified safe | trivial |
 | uuid | 1.24.0 | 1.24.0 | current | — |
 | validator | 0.18.1 | 0.21.0 | Phase 3 — verified safe | trivial |
-| async-std | 1.13.2 | 1.13.2 | Phase 5 — discontinued | medium |
+| async-std | — | — | **removed** (was unused) | done |
 
 ## Suggested order
 
@@ -958,7 +1042,8 @@ configured-but-unrun `deny.toml` gets no benefit from it.
    both verified behaviourally identical.
 5. **axum → 0.8.9** — seven strings; needs P3 to be meaningful.
 6. **rand → 0.10.2** — ~6 sites, and it shrinks the lockfile.
-7. **quick-xml → 0.41** — needs P2; do not shortcut step 3.
+7. **quick-xml → 0.41** — clears two remote-DoS advisories; needs P2, and do
+   not shortcut step 3.
 8. **aes + cfb-mode → 0.9** — needs P1; single atomic commit, pin ≥ 0.9.1.
 9. **CI repair** — independent of everything, can go any time.
 10. **Phase 5 hygiene** — `lazy_static`/`once_cell` → std first (easiest),
