@@ -186,7 +186,79 @@ Since axum 0.8's rejection of the old path syntax is a runtime panic in
 test to catch it. Add a test that builds the router and asserts the routes
 resolve.
 
-## Phase 1 — low cost, do these first
+## Phase 0 — `fcm-push-listener` 2.0.3 → 3.0.0: already broken in production
+
+**This is not a "keep current" upgrade. Push-notification registration is dead
+on 2.0.3 today, and has been since 2024-06-20.** It is listed first because it
+is the only item in this document that fixes a live user-facing failure, and
+because it is cheap.
+
+`fcm-push-listener` 2.0.3's `register()` posts to
+`https://fcm.googleapis.com/fcm/connect/subscribe`
+(`fcm-push-listener-2.0.3/src/fcm.rs:40`). Google shut that endpoint down on
+2024-06-20 as part of the FCM-23 deprecation. The crate author says so in the
+first line of his own README:
+
+> # IMPORTANT
+> [An endpoint that this library is dependent upon will be shut down on June 20, 2024](https://firebase.google.com/support/faq#fcm-23-deprecation).
+> I don't plan on trying to get this working again as it looks like it would be extremely difficult.
+
+3.0.0 (published 2024-01-13, ahead of the shutdown) moves to the replacement
+APIs — `https://fcmregistrations.googleapis.com/v1/projects/{id}/registrations`
+and `https://firebaseinstallations.googleapis.com/v1/projects/{id}/installations`.
+
+**Blast radius: existing installs are fine, new ones are not.** The token file is
+loaded first and `register()` only runs when there is no saved token
+(`src/common/pushnoti.rs:110`, `crates/pushnoti/src/main.rs:57`). So anyone who
+registered before June 2024 still works; anyone setting up fresh, or who loses
+their token, cannot register at all.
+
+**Effort: low — and most of the work is already written.** Someone clearly
+started this migration and left it commented out:
+
+- `crates/pushnoti/src/main.rs:64-70` contains the correct 4-argument call,
+  commented out, with the Firebase constants at `:44-47`.
+- `src/common/pushnoti.rs:70-76` has the same constants commented out.
+
+3.0.0's signature is exactly what those comments assume:
+
+```rust
+// fcm-push-listener-3.0.0/src/register.rs:31
+pub async fn register(firebase_app_id: &str, firebase_project_id: &str,
+                      firebase_api_key: &str, vapid_key: &str)
+    -> Result<Registration, Error>
+// versus 2.0.3/src/register.rs:30
+pub async fn register(sender_id: &str) -> Result<Registration, Error>
+```
+
+**The token file format does not change**, which is what makes this safe.
+`Registration { gcm: GcmRegistration, fcm_token: String, keys: WebPushKeys }` is
+identical between `fcm-push-listener-2.0.3/src/register.rs:24-28` and
+`3.0.0/src/register.rs:25-29`. `FcmPushListener`, `FcmMessage`, `WebPushKeys` and
+every `Error` variant matched at `src/common/pushnoti.rs:199-217` are also
+unchanged, so the listener loop and error handling need no edits at all. No user
+migration, no re-registration prompt, no MSRV movement, no CI change.
+
+Steps:
+
+1. Bump `Cargo.toml:26` and `crates/pushnoti/Cargo.toml:13` to `"3.0.0"`.
+2. `src/common/pushnoti.rs`: uncomment the constants at `:72-75`, change the
+   `register(sender_id)` call to the 4-argument form, drop the now-unused
+   `sender_id`.
+3. `crates/pushnoti/src/main.rs`: uncomment `:64-70` and `:44-47`, delete the
+   `sender_id` binding at `:49` and the 1-argument call.
+
+**One genuine open question: the VAPID key.** The commented-out constant is
+`let vapid_key = "";` — an empty string. That needs confirming against a real
+camera before this is called done, because it is the one input we do not appear
+to have a known-good value for.
+
+**Bug worth fixing in the same pass:** `src/common/pushnoti.rs:67` combined with
+the `continue` at `:135` retries registration every 3 seconds with no backoff.
+Right now that means hammering a dead Google endpoint every 3 seconds forever.
+Add backoff while you are in the file.
+
+## Phase 1 — low cost, do these next
 
 ### `gstreamer`, `gstreamer-app`, `gstreamer-rtsp`, `gstreamer-rtsp-server`: 0.23 → 0.24.5
 
@@ -537,35 +609,63 @@ though — **`crates/core/src/bcmedia/ser.rs` has zero tests**, while
 manifest has no `nom` dependency edge at all (only an optional `futures`), so
 the two are fully independent.
 
-## Phase 3 — compiles clean, but the behaviour needs checking
+## Phase 3 — compiled clean, behaviour investigated
 
-Every item in this phase produced **zero compile errors** in the probes. That
-means the compiler has nothing to tell us and the entire question is behavioural
-— which is why they are not in Phase 1 despite looking cheap.
+Every item in this phase produced **zero compile errors** in the probes, so the
+compiler has nothing to tell us and the whole question is behavioural. Two of the
+four have since been investigated and cleared; two have not.
 
-### `toml`: 0.8.23 → 1.1.4
+- `toml` and `validator` — **investigated and verified safe.** Effectively
+  trivial; promote them to Phase 1 whenever convenient.
+- `rumqttc` and `tikv-jemallocator` — **still unverified.** Treat the checks
+  below as required work, not optional diligence.
 
-Compiles clean across all three crates that use it. The concern is that
-`toml::to_string` output is user-visible in three places:
+### `toml` 0.8.23 → 1.1.4 and `validator` 0.18.1 → 0.21.0 — both verified safe
 
-- `src/mqtt/mod.rs:199` and `:206` — serialises the live `Config` and
-  **publishes it over MQTT**, so a formatting change is visible to Home
-  Assistant and any other subscriber.
-- `src/common/pushnoti.rs:118` and `crates/pushnoti/src/main.rs:71` — writes the
-  saved FCM `Registration` token file, read back with `toml::from_str` at
-  `src/common/pushnoti.rs:110` and `crates/pushnoti/src/main.rs:57`.
+**Both are effectively trivial. They were the biggest unknowns in this audit and
+they came back clean, measured rather than inferred.** They can land together in
+one commit; they are independent of each other and need no source edits, no
+feature changes and no CI changes.
 
-toml 0.9 was a substantial rewrite onto `toml_parser`/`toml_writer`. Before
-landing this, diff the emitted text for both shapes and confirm a token file
-written by 0.8 still parses under 1.x.
+The worry was real: toml 0.9 was a substantial rewrite onto
+`toml_parser`/`toml_writer`, and `toml::to_string` output is user-visible in
+three places — `src/mqtt/mod.rs:199` and `:206` serialise the live `Config` and
+**publish it over MQTT** (so any formatting change reaches Home Assistant), and
+`src/common/pushnoti.rs:118` / `crates/pushnoti/src/main.rs:71` write the saved
+FCM token file that is read back with `toml::from_str`.
 
-### `validator`: 0.18.1 → 0.21.0
+**`toml::to_string` output is byte-identical between 0.8.23 and 1.1.4** for every
+shape this repo serialises. This was measured by compiling a harness replicating
+`Config` (`src/config.rs:20-56`, `202-305`) and the FCM `Registration` twice
+against the two toml rlibs and diffing the emitted text — identical md5 under
+both versions. Identical across all the places a rewrite could plausibly have
+drifted: root scalars emitted before `[[cameras]]` despite `cameras` being
+declared first, standard sub-table headers, the blank line before each table
+header, inline arrays, `skip_serializing` omission, `Option` skipping,
+`motion_timeout = 1.0` whole-float form, and string quoting/escaping (quote →
+single-quoted literal, backslash → literal string, newline → multi-line basic,
+tab → `\t`, unicode passthrough). The zero-camera case emits `cameras = []`
+inline at the declaration position under both. So the MQTT payload does not
+change and token files round-trip in both directions.
 
-Compiles clean at 0.19 and at 0.21, across all three crates. The question is
-whether the **validation error text or structure users see** changes, since
-config validation failures are surfaced to the user at startup. Review the
-derives in `src/config.rs` and `crates/mailnoti/src/config.rs` and compare the
-rendered error for a deliberately invalid config before and after.
+**`validator` 0.21.0 changes no validation behaviour either.** Verified with a
+differential harness covering every `#[validate(...)]` attribute in
+`src/config.rs` plus all three custom validator functions
+(`validate_mqtt_server` at `src/config.rs:376`, `validate_username` at `:648`,
+`validate_camera_config` at `:658`) across 13 scenarios — valid config, regex
+failure on `tls_client_auth` (`:41`), regex failure on `max_encryption` inside a
+nested `Vec` element (`:239`), range failures, and the custom-function paths.
+Same outcomes and same error structure under 0.18.1 and 0.21.0.
+
+MSRV: toml 1.1.4 declares 1.85 (fits). **validator 0.21.0 declares exactly
+1.88** — zero headroom, caused by let-chains in `validator_derive-0.20.1`. Worth
+noting that validator 0.21 would independently have forced the same 1.88 bump
+that `time` and `home` already forced, so the MSRV move buys this for free.
+Neither crate is yanked; both are the latest release.
+
+Steps: bump `toml` to `"1.1.4"` and `validator` to `"0.21.0"` (keeping
+`features = ["derive"]`) in all three manifests — root, `crates/mailnoti`,
+`crates/pushnoti` — then `cargo update -p toml -p validator`.
 
 ### `rumqttc`: 0.24.0 → 0.25.1
 
@@ -611,40 +711,13 @@ comfortably old. Note the version skew if you do: `gstreamer-rtsp` has only
 0.25.0 while the others are at 0.25.2/0.25.3, so a single `"0.25"` requirement
 is the way to express it.
 
-### `fcm-push-listener` 2.0.3 → 4.1.1
+### `fcm-push-listener` 4.1.1 — take 3.0.0 instead, and treat it as urgent
 
-**Effort: high, and the benefit is unclear.** Measured: 17 error lines. This is
-a genuine API rewrite, not a rename:
-
-- `fcm_push_listener::register(sender_id)` at `crates/pushnoti/src/main.rs:63`
-  now "takes 5 arguments but 1 argument was supplied"
-- the type `FcmPushListener` (`crates/pushnoti/src/main.rs:84`) no longer exists
-- the type `FcmMessage` (`:86`) no longer exists
-- the `Error` variants matched at `src/common/pushnoti.rs:201`
-  (`MissingMessagePayload`, `MissingCryptoMetadata`, `ProtobufDecode`,
-  `Base64Decode`) no longer all exist
-
-The commented-out constants at `src/common/pushnoti.rs:70-76`
-(`firebase_app_id`, `firebase_project_id`, `firebase_api_key`, `vapid_key`)
-strongly suggest the newer API wants the full Firebase credential set, which
-raises the question of whether Reolink's actual credentials are even usable with
-the new registration flow.
-
-Two further considerations before anyone attempts this:
-
-- **The persisted credential format may change.** The `Registration` struct is
-  written to disk as TOML and read back on startup. If its shape changed in
-  3.x/4.x, every existing user's saved token becomes unreadable and each camera
-  must re-register. That needs an explicit migration path or a re-registration
-  prompt, not a silent failure.
-- **It currently costs us our MSRV.** `fcm-push-listener` 2.0.3's build script
-  pulls `prost-build` → `which` → `home` 0.5.12, and `home` is one of the two
-  crates forcing MSRV 1.88. If 4.x drops `prost-build`, upgrading would
-  *lower* our MSRV floor — which is an argument in favour, if the credential
-  question can be answered.
-
-Recommendation: leave on 2.0.3. Revisit if Google deprecates the registration
-endpoint 2.0.3 uses, which is the failure that would force the issue.
+**See the dedicated section above.** In short: 4.1.1 is a genuine rewrite
+(17 error lines, `reqwest` 0.13 added, token file incompatible, listener loop
+rebuilt, `cmake`/AWS-LC needed in CI for the cross targets), and 3.0.0 fixes the
+actual problem for almost nothing. Only reach for 4.x if something specific
+requires it.
 
 ## Phase 5 — unmaintained dependencies and hygiene
 
@@ -737,7 +810,7 @@ configured-but-unrun `deny.toml` gets no benefit from it.
 | delegate | 0.13.5 | 0.13.5 | landed | — |
 | dirs | 6.0.0 | 6.0.0 | landed | — |
 | env_logger | 0.11.11 | 0.11.11 | current, now uniform | — |
-| fcm-push-listener | 2.0.3 | 4.1.1 | Phase 4 — hold | high |
+| fcm-push-listener | 2.0.3 | 4.1.1 | **Phase 0 — go to 3.0.0** | low |
 | futures | 0.3.33 | 0.3.33 | current | — |
 | get_if_addrs | 0.5.3 | 0.5.3 | Phase 5 — replace | low |
 | gstreamer\* (×4) | 0.23.5/0.23.7 | 0.25.x | Phase 1 → 0.24.5 | 1 line |
@@ -766,27 +839,33 @@ configured-but-unrun `deny.toml` gets no benefit from it.
 | tokio | 1.53.1 | 1.53.1 | current | — |
 | tokio-stream | 0.1.19 | 0.1.19 | current | — |
 | tokio-util | 0.7.19 | 0.7.19 | current | — |
-| toml | 0.8.23 | 1.1.4 | Phase 3 | behavioural |
+| toml | 0.8.23 | 1.1.4 | Phase 3 — verified safe | trivial |
 | uuid | 1.24.0 | 1.24.0 | current | — |
-| validator | 0.18.1 | 0.21.0 | Phase 3 | behavioural |
+| validator | 0.18.1 | 0.21.0 | Phase 3 — verified safe | trivial |
 | async-std | 1.13.2 | 1.13.2 | Phase 5 — discontinued | medium |
 
 ## Suggested order
 
-1. **P1, P2, P3** — the three prerequisite tests. Cheap, independently useful,
+1. **`fcm-push-listener` → 3.0.0** — the only item that fixes something already
+   broken for users. Cheap, and most of the code is written. Confirm the VAPID
+   key against a real camera.
+2. **P1, P2, P3** — the three prerequisite tests. Cheap, independently useful,
    and they are what make the rest verifiable.
-2. **gstreamer → 0.24.5** — one line, biggest gap closed.
-3. **axum → 0.8.9** — seven strings; needs P3 to be meaningful.
-4. **rand → 0.10.2** — two imports.
-5. **quick-xml → 0.41** — needs P2; do not shortcut step 3.
-6. **aes + cfb-mode → 0.9** — needs P1; single atomic commit.
-7. **CI repair** — independent of everything, can go any time.
-8. **Phase 5 hygiene** — `lazy_static`/`once_cell` → std first (easiest),
-   then `get_if_addrs`, then `hex-string`.
-9. **Phase 3 behavioural trio** — `toml`, `validator`, `rumqttc`, one at a time
-   with a manual check each.
-10. Leave **`nom` 8**, **`fcm-push-listener` 4**, **`gstreamer` 0.25** and
-    **`tikv-jemallocator` 0.7** alone until there is a reason. All four are
-    currently safe to stay on, and each carries a failure mode the compiler will
-    not catch. If nom 8 is eventually attempted, give it a dedicated session and
-    treat every `.parse(` insertion as a frame-boundary decision, not a rename.
+3. **gstreamer → 0.24.5** — one line, biggest version gap closed.
+4. **`toml` → 1.1.4 and `validator` → 0.21.0** — one commit, no source edits,
+   both verified behaviourally identical.
+5. **axum → 0.8.9** — seven strings; needs P3 to be meaningful.
+6. **rand → 0.10.2** — ~6 sites, and it shrinks the lockfile.
+7. **quick-xml → 0.41** — needs P2; do not shortcut step 3.
+8. **aes + cfb-mode → 0.9** — needs P1; single atomic commit, pin ≥ 0.9.1.
+9. **CI repair** — independent of everything, can go any time.
+10. **Phase 5 hygiene** — `lazy_static`/`once_cell` → std first (easiest),
+    then `get_if_addrs`, then `hex-string`.
+11. **`rumqttc` → 0.25.1** — the one Phase 3 item still needing a behavioural
+    check.
+12. Leave **`nom` 8**, **`fcm-push-listener` 4.x** (3.0.0 is step 1; 4.x is a
+    separate, much larger job), **`gstreamer` 0.25** and
+    **`tikv-jemallocator` 0.7** alone until there is a reason. Each carries a
+    failure mode the compiler will not catch. If nom 8 is eventually attempted,
+    give it a dedicated session and treat every `.parse(` insertion as a
+    frame-boundary decision, not a rename.
