@@ -39,10 +39,26 @@ in `bcconn.rs` and `mqtt/mqttc.rs` discounted.
 
 ## Baseline
 
-`cargo test --workspace --all-features` passes 129 tests today (63 in the root
-crate, 64 in `neolink_core`, 2 doc-tests). That number is the safety net for
-everything below, and §"Prerequisite test coverage" explains where it has
-holes.
+`cargo test --workspace --all-features` passes 129 tests today — 64 in
+`neolink_core`, 63 in the root crate, 2 doc-tests. That is the safety net for
+everything below. Where it sits:
+
+- **`neolink_core` (64):** `bc_protocol/smart_ai.rs` 20, `bc/de.rs` 9,
+  `bc/xml.rs` 7, `bcmedia/de.rs` 7, `bcudp/de.rs` 7, `bcudp/ser.rs` 6,
+  `bc/crypto.rs` 2, `bc/ser.rs` 2, `bcudp/xml_crypto.rs` 2, `bcudp/xml.rs` 1,
+  `bc_protocol.rs` 1.
+- **root (63):** `rtsp/timestamps.rs` 13, `onvif/services/ptz.rs` 10,
+  `onvif/events.rs` 9, `onvif/services/events.rs` 8, `onvif/soap.rs` 7,
+  `rtsp/factory.rs` 6, `config.rs` 5, `onvif/discovery.rs` 2,
+  `onvif/services/media.rs` 2, `mqtt/discovery.rs` 1.
+- **`crates/decoder`, `crates/mailnoti`, `crates/pushnoti`: zero tests.**
+- There is no `tests/` integration directory anywhere in the workspace, and the
+  root package has no `[dev-dependencies]` section at all. Only `crates/core` has
+  dev-deps.
+
+The gap that matters is not the count — it is that **the coverage sits almost
+entirely away from what these upgrades change.** §"Prerequisite test coverage"
+below is the consequence.
 
 ## Already landed on this branch
 
@@ -178,7 +194,7 @@ exposure.
 
 ## Prerequisite test coverage — do this before the risky phases
 
-Three of the remaining upgrades change code that has no test covering it. These
+Five of the remaining upgrades change code that has no test covering it. These
 tests are cheap, they are useful independently of any upgrade, and without them
 the corresponding migration cannot be verified at all. **They are the highest
 value work in this document.**
@@ -192,13 +208,22 @@ modern Reolink camera, have **no test at all**. The only non-test constructors
 are at `crates/core/src/bc/codex.rs:121` and `:124`.
 
 This matters because the `aes`/`cfb-mode` 0.9 migration deletes the `Clone` impl
-the current design depends on (see §`aes` + `cfb-mode` below), forcing a
-refactor of exactly this code. Add, before that upgrade:
+the current design depends on — verified: `cfb-mode-0.8.2/src/encrypt.rs` has
+`#[derive(Clone)]` at lines 15 and 25, and `cfb-mode-0.9.1/src/encrypt.rs` has
+none — forcing a refactor of exactly this code. Add, before that upgrade:
 
 - a round-trip test: `EncryptionProtocol::aes(key)` encrypt-then-decrypt returns
   the input, for a payload that is *not* a multiple of 16 bytes so the trailing
   partial-block path is covered;
 - the same for `full_aes`;
+- **packet-independence assertions — this is the one that actually matters.**
+  Encrypting the same plaintext twice through the same `EncryptionProtocol` must
+  produce identical ciphertext both times. A plain round-trip test passes even if
+  the refactor lets the CFB keystream advance across packets, and that is
+  precisely the failure the `Clone` removal invites: the current code clones a
+  never-mutated cipher per packet so every packet restarts from the IV. Get that
+  wrong and every post-2021-firmware camera breaks, silently, with no error
+  raised and a green test suite.
 - ideally a known-answer test: a hard-coded key and plaintext with the expected
   ciphertext bytes captured from the *current* implementation, so the refactor
   is proven byte-identical rather than merely self-consistent.
@@ -227,10 +252,45 @@ should do.
 ### P3. ONVIF router construction (blocks `axum` 0.8)
 
 Nothing currently constructs the router built at `src/onvif/server.rs:36-49`.
-Since axum 0.8's rejection of the old path syntax is a runtime panic in
-`Router::route`, the failure mode today is "panics on first ONVIF start" with no
-test to catch it. Add a test that builds the router and asserts the routes
-resolve.
+`src/onvif/server.rs` has no `#[cfg(test)]` module, and **none of the 36 tests
+under `src/onvif/` touches axum at all**. Since axum 0.8's rejection of the old
+path syntax is a runtime panic in `Router::route`, the failure mode today is
+"panics on first ONVIF start" with nothing to catch it. Add a test that builds
+the router and asserts the routes resolve.
+
+### P4. Golden-byte XML output (also blocks `quick-xml` 0.41)
+
+**There is no golden-byte test of serialized XML anywhere in the workspace** — and
+the four tests that could have been one have the assertion deliberately commented
+out, at `crates/core/src/bcudp/ser.rs:101`, `:118`, `:135` and `:152`:
+
+```rust
+// Raw samples don't quite match exactly
+// because the serde for xml puts spaces and new lines in different places
+// then the raw data from the camera so we skip this last assert
+//assert_eq!(&sample[..], ser_buf.as_slice());
+```
+
+So the existing XML tests are round-trip only: they prove
+`deserialize(serialize(x)) == x`, which stays true even if the emitted bytes
+change completely. That is exactly the blind spot for a quick-xml serializer
+change — and those bytes feed `calc_crc()` at `bcudp/ser.rs:34`, so a whitespace
+shift alters a checksum the camera validates.
+
+The commented-out assertions cannot simply be re-enabled (the reason given is
+accurate). The tractable version is a **snapshot** test: capture the bytes the
+*current* version emits and assert against that, so any future serializer change
+is visible as a diff rather than invisible.
+
+### P5. Streaming/`Incomplete` boundary (blocks `nom` 8)
+
+The nom happy path is well covered — 31 of the 64 `neolink_core` tests exercise
+the parsers, against 74 captured fixtures. But **every one of them concatenates
+its fixture into a single complete buffer**, so the `Err::Incomplete` boundary
+that `crates/core/src/bc/codex.rs:92` depends on has no test at all. Given that
+nom 8's whole risk is the streaming-vs-complete mode change (see the nom section),
+a test that feeds a parser one byte at a time and asserts `Incomplete` until the
+frame is whole is the single thing that would make that migration verifiable.
 
 ## Phase 0 — `fcm-push-listener` 2.0.3 → 3.0.0: already broken in production
 
@@ -427,7 +487,16 @@ and adds nothing. Stopping at 0.9 would instead *add* `rand_core` 0.9 and
 **Version safety.** RUSTSEC-2026-0097 ("Rand is unsound with a custom logger
 using `rand::rng()`") affects 0.7.0–0.8.5, 0.9.0–0.9.2 and 0.10.0. Our current
 0.8.7 is **not** affected, and neither is 0.10.2 — but do not land on 0.9.0–0.9.2
-or 0.10.0.
+or 0.10.0. Note the trigger additionally requires rand's `log` feature, which
+`crates/core` does not enable (it takes the default `["std", "std_rng"]`), so
+there is no live exposure either way — this constrains which patch to target, it
+is not a reason to hurry.
+
+**Unrelated bug spotted while reading these sites, worth its own ticket:**
+`generate_tid()` can return 0 (a 1-in-256 chance), and 0 is the sentinel meaning
+"no tid, invent one" at `crates/core/src/bc_protocol/connection/discovery.rs:279`
+and `:327`. That collision exists today and is unaffected by the rand version —
+the range is 0..=255 before and after.
 
 **The measured error count understates the work, and this is worth
 understanding.** A probe of `crates/core` on rand 0.10 reports exactly two
@@ -1187,8 +1256,9 @@ registration: it is the single biggest lever on tree duplication.
 1. **`fcm-push-listener` → 3.0.0** — the only item that fixes something already
    broken for users. Cheap, and most of the code is written. Confirm the VAPID
    key against a real camera.
-2. **P1, P2, P3** — the three prerequisite tests. Cheap, independently useful,
-   and they are what make the rest verifiable.
+2. **P1–P5** — the prerequisite tests. Cheap, independently useful, and they are
+   what make the rest verifiable. P1 (AES packet-independence) is the single
+   highest-value item in this document.
 3. **gstreamer → 0.24.5** — one line, biggest version gap closed.
 4. **`toml` → 1.1.4 and `validator` → 0.21.0** — one commit, no source edits,
    both verified behaviourally identical.
