@@ -15,7 +15,7 @@ use futures::{
 };
 use lazy_static::lazy_static;
 use log::*;
-use rand::{seq::SliceRandom, thread_rng, Rng};
+use rand::{seq::SliceRandom, RngExt};
 use std::collections::{btree_map::Entry, BTreeMap, HashSet};
 use std::convert::TryInto;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -1264,19 +1264,19 @@ fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
 }
 
 fn generate_tid() -> u32 {
-    let mut rng = thread_rng();
-    (rng.gen::<u8>()) as u32
+    let mut rng = rand::rng();
+    (rng.random::<u8>()) as u32
 }
 
 fn generate_cid() -> i32 {
-    let mut rng = thread_rng();
-    rng.gen()
+    let mut rng = rand::rng();
+    rng.random()
 }
 
 async fn connect() -> Result<UdpSocket> {
     let mut ports: Vec<u16> = (53500..54000).collect();
     {
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         ports.shuffle(&mut rng);
     }
 
@@ -1561,3 +1561,57 @@ async fn connect() -> Result<UdpSocket> {
     ```
 
 */
+
+#[cfg(test)]
+mod rand_tests {
+    use super::*;
+
+    /// `generate_tid` must stay inside `0..=255`.
+    ///
+    /// The value goes on the wire as the UDP discovery transmission id, and
+    /// under rand 0.8 it was `rng.gen::<u8>() as u32`. The rand 0.10 spelling is
+    /// `rng.random::<u8>() as u32`, which resolves to the same
+    /// `next_u32() as u8` -- but nothing about that is enforced by the type
+    /// system once the `as u32` widens it, so pin the range.
+    #[test]
+    fn generate_tid_stays_in_u8_range() {
+        for _ in 0..10_000 {
+            assert!(generate_tid() <= u8::MAX as u32);
+        }
+    }
+
+    /// `generate_cid` is a full-width `i32` and must stay that way -- narrowing
+    /// it would raise the collision rate on the client id.
+    #[test]
+    fn generate_cid_spans_full_i32() {
+        let mut seen_negative = false;
+        let mut seen_large = false;
+        for _ in 0..10_000 {
+            let cid = generate_cid();
+            seen_negative |= cid < 0;
+            seen_large |= cid > u16::MAX as i32;
+        }
+        assert!(
+            seen_negative,
+            "generate_cid never produced a negative value"
+        );
+        assert!(seen_large, "generate_cid looks narrower than an i32");
+    }
+
+    /// `shuffle` must still be a permutation of the port range, not a sample of
+    /// it -- `connect` relies on every candidate port being present.
+    #[test]
+    fn shuffle_is_a_permutation() {
+        let original: Vec<u16> = (53500..54000).collect();
+        let mut ports = original.clone();
+        {
+            let mut rng = rand::rng();
+            ports.shuffle(&mut rng);
+        }
+        assert_eq!(ports.len(), original.len());
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, original, "shuffle lost or duplicated ports");
+        assert_ne!(ports, original, "shuffle did not shuffle");
+    }
+}

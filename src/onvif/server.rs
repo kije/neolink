@@ -36,17 +36,17 @@ const SOAP_BODY_LIMIT: usize = 64 * 1024;
 /// failure mode is a panic on the first ONVIF start, in production.
 fn build_router(state: OnvifState) -> Router {
     Router::new()
-        .route("/onvif/:camera/device_service", post(device_service_route))
-        .route("/onvif/:camera/media_service", post(media_service_route))
-        .route("/onvif/:camera/ptz_service", post(ptz_service_route))
-        .route("/onvif/:camera/events_service", post(events_service_route))
+        .route("/onvif/{camera}/device_service", post(device_service_route))
+        .route("/onvif/{camera}/media_service", post(media_service_route))
+        .route("/onvif/{camera}/ptz_service", post(ptz_service_route))
+        .route("/onvif/{camera}/events_service", post(events_service_route))
         .route(
-            "/onvif/:camera/subscription/:sub_id",
+            "/onvif/{camera}/subscription/{sub_id}",
             post(subscription_route),
         )
         .layer(DefaultBodyLimit::max(SOAP_BODY_LIMIT))
-        .route("/onvif/:camera/snapshot/:stream", get(snapshot::handler))
-        .route("/onvif/:camera", get(camera_index))
+        .route("/onvif/{camera}/snapshot/{stream}", get(snapshot::handler))
+        .route("/onvif/{camera}", get(camera_index))
         .route("/", get(root_index))
         .with_state(state)
 }

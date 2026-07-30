@@ -14,7 +14,7 @@ members = [
 
 [dependencies]
 anyhow = "1.0.104"
-axum = "0.7.9"
+axum = "0.8.9"
 base64 = "0.23.0"
 byte-slice-cast = {version = "1.2.3", optional = true}
 bytes = "1.12.1"
