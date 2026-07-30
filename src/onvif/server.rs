@@ -27,13 +27,15 @@ const SOAP_CONTENT_TYPE: &str = "application/soap+xml; charset=utf-8";
 /// with a multi-MiB POST.
 const SOAP_BODY_LIMIT: usize = 64 * 1024;
 
-pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<()> {
-    let (bind_addr, bind_port) = {
-        let g = state.inner().globals.read().await;
-        (g.bind_addr.clone(), g.bind_port)
-    };
-
-    let app = Router::new()
+/// Build the ONVIF router.
+///
+/// Kept separate from [`run`] so tests can construct it without binding a port.
+/// That is not cosmetic: `Router::route` *panics* on a malformed path pattern
+/// rather than failing to compile, and axum has changed its path syntax across
+/// a major version before. Without a test that reaches this function, the
+/// failure mode is a panic on the first ONVIF start, in production.
+fn build_router(state: OnvifState) -> Router {
+    Router::new()
         .route("/onvif/:camera/device_service", post(device_service_route))
         .route("/onvif/:camera/media_service", post(media_service_route))
         .route("/onvif/:camera/ptz_service", post(ptz_service_route))
@@ -46,7 +48,16 @@ pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<
         .route("/onvif/:camera/snapshot/:stream", get(snapshot::handler))
         .route("/onvif/:camera", get(camera_index))
         .route("/", get(root_index))
-        .with_state(state);
+        .with_state(state)
+}
+
+pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<()> {
+    let (bind_addr, bind_port) = {
+        let g = state.inner().globals.read().await;
+        (g.bind_addr.clone(), g.bind_port)
+    };
+
+    let app = build_router(state);
 
     let bind: SocketAddr = format!("{bind_addr}:{bind_port}").parse()?;
     log::info!("ONVIF HTTP listening on {bind}");
@@ -242,4 +253,127 @@ fn soap_fault(code: FaultCode, reason: &str) -> Response {
         xml,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OnvifGlobalConfig;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    fn test_state() -> OnvifState {
+        OnvifState::new(OnvifGlobalConfig::default(), 8554)
+    }
+
+    /// `Router::route` rejects a malformed path pattern by panicking, not by
+    /// failing to compile, so simply reaching this function is the assertion.
+    #[test]
+    fn router_builds() {
+        let _ = build_router(test_state());
+    }
+
+    /// Send a request through the router and report the status.
+    ///
+    /// The assertions below deliberately check only "did the router match this
+    /// path", not what the handler returned: with no cameras configured the
+    /// handlers answer with SOAP faults and 404s of their own, and those are
+    /// not what this test is about.
+    async fn respond(method: Method, uri: &str) -> (StatusCode, String) {
+        let resp = build_router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), SOAP_BODY_LIMIT)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    async fn status_of(method: Method, uri: &str) -> StatusCode {
+        respond(method, uri).await.0
+    }
+
+    #[tokio::test]
+    async fn index_routes_respond() {
+        assert_eq!(status_of(Method::GET, "/").await, StatusCode::OK);
+        assert_eq!(
+            status_of(Method::GET, "/onvif/frontdoor").await,
+            StatusCode::OK
+        );
+    }
+
+    /// Every parameterised route must actually capture its segment. A path
+    /// pattern that axum no longer understands shows up here as a 404 from the
+    /// router itself.
+    #[tokio::test]
+    async fn parameterised_routes_match() {
+        for uri in [
+            "/onvif/frontdoor/device_service",
+            "/onvif/frontdoor/media_service",
+            "/onvif/frontdoor/ptz_service",
+            "/onvif/frontdoor/events_service",
+            "/onvif/frontdoor/subscription/sub-1",
+        ] {
+            let status = status_of(Method::POST, uri).await;
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "router failed to match POST {uri}"
+            );
+            assert_ne!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "router matched POST {uri} to the wrong method"
+            );
+        }
+
+        // The snapshot route needs the body, not just the status: with no
+        // cameras configured its handler answers 404 too, so the status alone
+        // cannot tell a matched route from an unmatched one. The router's own
+        // 404 has an empty body; this one names the camera it could not find,
+        // which also proves both path parameters were captured -- the handler
+        // extracts `Path<(String, String)>`, and a pattern axum no longer
+        // understands would fail that extraction instead.
+        let (status, body) = respond(Method::GET, "/onvif/frontdoor/snapshot/main").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body, "Unknown camera",
+            "snapshot route did not reach its handler"
+        );
+    }
+
+    /// The counterpart: paths we do *not* serve must still 404, so the tests
+    /// above cannot pass simply because everything matches everything.
+    #[tokio::test]
+    async fn unknown_routes_are_not_matched() {
+        assert_eq!(
+            status_of(Method::GET, "/onvif/frontdoor/nope").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_of(Method::GET, "/onvif").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// The service routes are POST-only, which is worth pinning separately:
+    /// it is the property that proves `status_of` above is reading real
+    /// routing decisions.
+    #[tokio::test]
+    async fn service_routes_reject_get() {
+        assert_eq!(
+            status_of(Method::GET, "/onvif/frontdoor/device_service").await,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
 }

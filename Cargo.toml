@@ -49,6 +49,11 @@ toml = "0.8.23"
 uuid = { version = "1.24.0", features = ["v4", "v5"] }
 validator = {version="0.18.1", features = ["derive"] }
 
+[dev-dependencies]
+# `ServiceExt::oneshot`, so the ONVIF router can be exercised without binding a
+# port. Already in the tree as an axum dependency -- this only turns on `util`.
+tower = { version = "0.5.3", features = ["util"] }
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.5.4"
 

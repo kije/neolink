@@ -407,6 +407,123 @@ mod tests {
         }
     }
 
+    /// Regression guard for the quick-xml upgrade path.
+    ///
+    /// XML has no way to carry `&` `<` `>` `"` `'` literally in element content,
+    /// so a client with such a character in its password sends an entity
+    /// reference. On quick-xml 0.36 the reader folds those into the surrounding
+    /// `Event::Text`, so `parse_envelope`'s single `Event::Text` arm sees the
+    /// whole password and `unescape()` turns it back into the literal.
+    ///
+    /// From quick-xml 0.38 onwards an entity reference is delivered as its own
+    /// `Event::GeneralRef` instead. `parse_envelope` ends in a catch-all `_ =>
+    /// {}` arm, so unless that upgrade also teaches the loop about `GeneralRef`,
+    /// `p&w` arrives as `Text("p")`, `GeneralRef("amp")`, `Text("w")` and the
+    /// middle event is dropped. Worse, the `Text` arms *assign* rather than
+    /// append, so the password would come out as `w`, not even `pw`.
+    ///
+    /// That failure is completely silent: the build is green, no error is
+    /// raised, and ONVIF auth simply stops working for anyone whose credentials
+    /// contain one of those five characters. This test is what makes it loud.
+    #[test]
+    fn parse_username_and_password_with_entity_references() {
+        // All five predefined XML entities, in both fields.
+        let username = r#"me&<>"'x"#;
+        let password = r#"p&w<1>"2'3"#;
+        let xml = r#"<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+      <wsse:UsernameToken>
+        <wsse:Username>me&amp;&lt;&gt;&quot;&apos;x</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">p&amp;w&lt;1&gt;&quot;2&apos;3</wsse:Password>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </env:Header>
+  <env:Body>
+    <tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>
+  </env:Body>
+</env:Envelope>"#;
+        let parsed = parse_envelope(xml).unwrap();
+        let tok = parsed.auth.expect("token");
+        assert_eq!(tok.username, username, "username lost an entity reference");
+        match &tok.credential {
+            Credential::Plain(p) => {
+                assert_eq!(p, password, "password lost an entity reference")
+            }
+            _ => panic!("expected plain"),
+        }
+
+        // And it has to survive all the way through verification, which is where
+        // a user would actually notice.
+        let mut users = HashMap::new();
+        users.insert(username.to_string(), password.to_string());
+        assert!(verify_token(&tok, &users), "plain auth should verify");
+    }
+
+    /// The same hazard on the digest path. Here a dropped entity does not just
+    /// mangle a string, it changes the bytes fed to SHA1, so the digest simply
+    /// never matches.
+    #[test]
+    fn digest_with_entity_reference_in_password() {
+        use chrono::Utc;
+        let password = r#"p&w<1>"2'3"#;
+        let nonce = b"some-random-nonce";
+        let created_text = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let nonce_b64 = B64.encode(nonce);
+
+        let mut hasher = Sha1::new();
+        hasher.update(nonce);
+        hasher.update(created_text.as_bytes());
+        hasher.update(password.as_bytes());
+        let digest = B64.encode(hasher.finalize());
+
+        let xml = format!(
+            r#"<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+      <wsse:UsernameToken>
+        <wsse:Username>m&amp;e</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest}</wsse:Password>
+        <wsse:Nonce>{nonce_b64}</wsse:Nonce>
+        <wsu:Created xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">{created_text}</wsu:Created>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </env:Header>
+  <env:Body><tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/></env:Body>
+</env:Envelope>"#
+        );
+        let parsed = parse_envelope(&xml).unwrap();
+        let tok = parsed.auth.expect("token");
+        assert_eq!(tok.username, "m&e", "username lost an entity reference");
+        let mut users = HashMap::new();
+        users.insert("m&e".to_string(), password.to_string());
+        assert!(verify_token(&tok, &users), "digest should verify");
+    }
+
+    /// A numeric character reference takes the same `GeneralRef`-adjacent path
+    /// through the reader, so pin it too. `&#38;` is `&`.
+    #[test]
+    fn parse_password_with_numeric_character_reference() {
+        let xml = r#"<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+      <wsse:UsernameToken>
+        <wsse:Username>me</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">p&#38;w&#x3C;q</wsse:Password>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </env:Header>
+  <env:Body>
+    <tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>
+  </env:Body>
+</env:Envelope>"#;
+        let parsed = parse_envelope(xml).unwrap();
+        match parsed.auth.expect("token").credential {
+            Credential::Plain(p) => assert_eq!(p, "p&w<q"),
+            _ => panic!("expected plain"),
+        }
+    }
+
     #[test]
     fn fault_round_trip() {
         let f = fault_envelope(FaultCode::NotAuthorized, "Auth required", None);

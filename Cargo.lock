@@ -2051,6 +2051,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml 0.8.23",
+ "tower",
  "uuid",
  "validator",
 ]

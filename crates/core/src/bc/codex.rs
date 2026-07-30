@@ -150,3 +150,112 @@ impl Decoder for BcCodex {
         Ok(Some(bc))
     }
 }
+
+/// The `Err::Incomplete` boundary.
+///
+/// The nom parsers are well covered on the happy path -- 31 of this crate's
+/// tests exercise them against captured fixtures -- but every one of those
+/// concatenates its fixture into a single complete buffer before parsing. That
+/// leaves the branch this codec is built around, `Err(Error::NomIncomplete(_))
+/// => return Ok(None)` at `decode`, with no test at all.
+///
+/// It is not an edge case. It is the normal case: a BC frame arrives split
+/// across however many TCP segments the network felt like, and `Framed` calls
+/// `decode` after each one. If the parsers ever stopped reporting `Incomplete`
+/// on a short buffer -- which is exactly what switching nom from its streaming
+/// parsers to its complete ones would do -- a partial frame would surface as a
+/// parse *error* instead, and the connection would drop rather than wait for the
+/// rest of the packet.
+///
+/// So: feed a real frame one byte at a time and assert `Ok(None)` every time
+/// until the last byte, which must yield the whole message.
+#[cfg(test)]
+mod incomplete_tests {
+    use super::*;
+
+    /// The captured login fixtures are BCEncrypt, which is what a camera uses
+    /// before the login reply negotiates anything stronger. `BcCodex::new`
+    /// starts at `Unencrypted`, so build the context directly -- this module is
+    /// a child of `codex`, so the private field is reachable.
+    fn test_codex() -> BcCodex {
+        BcCodex {
+            context: BcContext::new_with_encryption(EncryptionProtocol::BCEncrypt),
+        }
+    }
+
+    /// Decode `sample` one byte at a time.
+    ///
+    /// Returns the number of bytes that had to arrive before a frame came out.
+    fn decode_byte_at_a_time(sample: &[u8]) -> usize {
+        let mut codex = test_codex();
+        let mut buf = BytesMut::new();
+
+        for (i, byte) in sample.iter().enumerate() {
+            buf.extend_from_slice(&[*byte]);
+            match codex.decode(&mut buf) {
+                Ok(None) => {
+                    assert!(
+                        i + 1 < sample.len(),
+                        "the whole frame arrived and still no message came out"
+                    );
+                }
+                Ok(Some(_)) => return i + 1,
+                Err(e) => panic!(
+                    "byte {} of {} produced a hard error instead of Incomplete: {e:?}",
+                    i + 1,
+                    sample.len()
+                ),
+            }
+        }
+        panic!("never produced a frame");
+    }
+
+    #[test]
+    fn partial_frames_report_incomplete_not_error() {
+        let sample = include_bytes!("samples/modern_login_success.bin");
+        let consumed = decode_byte_at_a_time(&sample[..]);
+        assert_eq!(
+            consumed,
+            sample.len(),
+            "frame emitted before all its bytes had arrived"
+        );
+    }
+
+    #[test]
+    fn partial_frames_report_incomplete_not_error_failed_login() {
+        let sample = include_bytes!("samples/modern_login_failed.bin");
+        let consumed = decode_byte_at_a_time(&sample[..]);
+        assert_eq!(consumed, sample.len());
+    }
+
+    /// An empty buffer is the very first thing `Framed` hands us, and it must be
+    /// `Incomplete` rather than an error.
+    #[test]
+    fn empty_buffer_is_incomplete() {
+        let mut codex = test_codex();
+        let mut buf = BytesMut::new();
+        assert!(matches!(codex.decode(&mut buf), Ok(None)));
+    }
+
+    /// A frame delivered whole must be consumed exactly -- no bytes left behind,
+    /// which is what lets a second frame in the same read be decoded after it.
+    #[test]
+    fn complete_frame_consumes_exactly_its_own_bytes() {
+        let sample = &include_bytes!("samples/modern_login_success.bin")[..];
+        let mut codex = test_codex();
+
+        // Two frames back to back, as a single TCP read would deliver them.
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(sample);
+        buf.extend_from_slice(sample);
+
+        assert!(matches!(codex.decode(&mut buf), Ok(Some(_))));
+        assert_eq!(
+            buf.len(),
+            sample.len(),
+            "decoding one frame did not consume exactly one frame"
+        );
+        assert!(matches!(codex.decode(&mut buf), Ok(Some(_))));
+        assert!(buf.is_empty(), "trailing bytes left after the second frame");
+    }
+}
