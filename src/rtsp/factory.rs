@@ -300,12 +300,19 @@ pub(super) async fn make_factory(
                         // Run blocking code on a separate thread
                         // This is not an async thread
                         let pump_handle = tokio::runtime::Handle::current();
+                        let mut fps_limiter = FpsLimiter::new(stream_config.fps, config.max_fps);
                         std::thread::spawn(move || {
                             let mut tracker = TimestampTracker::new();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
-                                send_to_sources(buffered, &vid_src, &aud_src, &mut tracker)?;
+                                send_to_sources(
+                                    buffered,
+                                    &vid_src,
+                                    &aud_src,
+                                    &mut tracker,
+                                    &mut fps_limiter,
+                                )?;
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
@@ -321,8 +328,13 @@ pub(super) async fn make_factory(
                                         .await
                                 }) {
                                     Ok(Some(data)) => {
-                                        let r =
-                                            send_to_sources(data, &vid_src, &aud_src, &mut tracker);
+                                        let r = send_to_sources(
+                                            data,
+                                            &vid_src,
+                                            &aud_src,
+                                            &mut tracker,
+                                            &mut fps_limiter,
+                                        );
                                         if let Err(r) = &r {
                                             log::info!("Failed to send to source: {r:?}");
                                         }
@@ -374,6 +386,7 @@ fn send_to_sources(
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     tracker: &mut TimestampTracker,
+    fps_limiter: &mut FpsLimiter,
 ) -> AnyResult<()> {
     match data {
         BcMedia::Aac(aac) => {
@@ -400,41 +413,173 @@ fn send_to_sources(
             time,
             ..
         }) => {
+            // The tracker is advanced for every frame, including dropped
+            // ones, so that its camera-clock baseline stays correct and the
+            // surviving frames keep their true capture times.
             let ts_us = tracker.next_video_us(microseconds);
+            let send = fps_limiter.take();
             if let Some(posix) = time {
                 log::trace!(
-                    "IFrame: pts={:?} camera_us={} posix={}",
+                    "IFrame: pts={:?} camera_us={} posix={} send={}",
                     Duration::from_micros(ts_us),
                     microseconds,
-                    posix
+                    posix,
+                    send
                 );
             } else {
                 log::trace!(
-                    "IFrame: pts={:?} camera_us={}",
+                    "IFrame: pts={:?} camera_us={} send={}",
                     Duration::from_micros(ts_us),
-                    microseconds
+                    microseconds,
+                    send
                 );
             }
-            if let Some(vid_src) = vid_src.as_ref() {
-                send_to_appsrc(vid_src, data, Duration::from_micros(ts_us), false)?;
+            if send {
+                if let Some(vid_src) = vid_src.as_ref() {
+                    send_to_appsrc(vid_src, data, Duration::from_micros(ts_us), false)?;
+                }
             }
         }
         BcMedia::Pframe(BcMediaPframe {
             data, microseconds, ..
         }) => {
             let ts_us = tracker.next_video_us(microseconds);
+            let send = fps_limiter.take();
             log::trace!(
-                "PFrame: pts={:?} camera_us={}",
+                "PFrame: pts={:?} camera_us={} send={}",
                 Duration::from_micros(ts_us),
-                microseconds
+                microseconds,
+                send
             );
-            if let Some(vid_src) = vid_src.as_ref() {
-                send_to_appsrc(vid_src, data, Duration::from_micros(ts_us), true)?;
+            if send {
+                if let Some(vid_src) = vid_src.as_ref() {
+                    send_to_appsrc(vid_src, data, Duration::from_micros(ts_us), true)?;
+                }
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Per-client video frame decimator backing the `max_fps` camera option.
+///
+/// One instance lives in each client's blocking frame-pump thread, so two
+/// clients on the same camera decimate independently. Audio is never
+/// throttled and never reaches this type.
+struct FpsLimiter {
+    camera_fps: u32,
+    max_fps: Option<u32>,
+    frame_count: u64,
+}
+
+impl FpsLimiter {
+    fn new(camera_fps: u32, max_fps: Option<u32>) -> Self {
+        Self {
+            camera_fps,
+            max_fps,
+            frame_count: 0,
+        }
+    }
+
+    /// Account for one video frame, returning whether it should be forwarded.
+    ///
+    /// Must be called exactly once per video frame — including frames that
+    /// end up dropped — or the decimation ratio drifts.
+    fn take(&mut self) -> bool {
+        let send = should_send_frame(self.frame_count, self.camera_fps, self.max_fps);
+        self.frame_count = self.frame_count.wrapping_add(1);
+        send
+    }
+}
+
+/// Returns `true` if this video frame should be forwarded to the GStreamer pipeline.
+///
+/// The timestamp tracker is advanced for dropped frames too; only the payload
+/// is withheld. `limit = 0` or `limit >= camera_fps` means no frames are dropped.
+fn should_send_frame(vid_frame_count: u64, camera_fps: u32, max_fps: Option<u32>) -> bool {
+    match max_fps {
+        Some(limit) if limit > 0 && camera_fps > limit => {
+            // Ceiling-integer skip factor: 15 fps / 5 limit → skip 3
+            let frame_skip = (camera_fps as u64).div_ceil(limit as u64);
+            vid_frame_count.is_multiple_of(frame_skip)
+        }
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod fps_limit_tests {
+    use super::*;
+
+    #[test]
+    fn fps_15_to_5() {
+        // skip=3 → frames 0,3,6,9,12 pass out of 15
+        let sent: Vec<u64> = (0..15)
+            .filter(|&i| should_send_frame(i, 15, Some(5)))
+            .collect();
+        assert_eq!(sent, vec![0, 3, 6, 9, 12]);
+    }
+
+    #[test]
+    fn fps_no_limit() {
+        for i in 0..100 {
+            assert!(should_send_frame(i, 15, None));
+        }
+    }
+
+    #[test]
+    fn fps_limit_equals_camera() {
+        for i in 0..15 {
+            assert!(should_send_frame(i, 15, Some(15)));
+        }
+    }
+
+    #[test]
+    fn fps_camera_zero_no_panic() {
+        // camera_fps=0 means the condition `camera_fps > limit` is never true
+        for i in 0..10 {
+            assert!(should_send_frame(i, 0, Some(5)));
+        }
+    }
+
+    #[test]
+    fn fps_limit_one() {
+        // 30fps → skip=30 → only frame 0 (and 30, 60, …) pass
+        assert!(should_send_frame(0, 30, Some(1)));
+        for i in 1..30 {
+            assert!(!should_send_frame(i, 30, Some(1)));
+        }
+        assert!(should_send_frame(30, 30, Some(1)));
+    }
+
+    #[test]
+    fn fps_limit_zero_means_no_limit() {
+        for i in 0..15 {
+            assert!(should_send_frame(i, 15, Some(0)));
+        }
+    }
+
+    #[test]
+    fn fps_near_u64_max_no_panic() {
+        let near_max = u64::MAX - 1;
+        let _ = should_send_frame(near_max, 15, Some(5));
+    }
+
+    #[test]
+    fn limiter_decimates_and_advances() {
+        let mut limiter = FpsLimiter::new(15, Some(5));
+        let sent: Vec<bool> = (0..15).map(|_| limiter.take()).collect();
+        assert_eq!(sent.iter().filter(|s| **s).count(), 5);
+        assert!(sent[0] && sent[3] && sent[6] && sent[9] && sent[12]);
+        assert_eq!(limiter.frame_count, 15);
+    }
+
+    #[test]
+    fn limiter_without_limit_sends_everything() {
+        let mut limiter = FpsLimiter::new(15, None);
+        assert!((0..50).all(|_| limiter.take()));
+    }
 }
 
 fn send_to_appsrc(

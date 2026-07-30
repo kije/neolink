@@ -131,6 +131,19 @@ address = "192.168.1.187:9000"
 #
 # buffer_duration = 3000
 
+# Cap the RTSP output at this many frames per second. Excess video frames are
+# dropped before they reach GStreamer, which cuts CPU and bandwidth. Audio is
+# never throttled. Omitted (or 0) means no limit. `fps_limit` is accepted as an
+# alias.
+#
+# Frames are dropped, not re-encoded, so this only suits consumers that tolerate
+# a broken inter-frame chain (still grabs, motion snapshots, bandwidth caps).
+# Dropping P-frames leaves the frames that referenced them incomplete, so a
+# decoder playing the stream back will show artefacts until the next keyframe.
+# Leave this unset for normal live viewing.
+#
+# max_fps = 5
+
 # Per-camera ONVIF settings (only meaningful when the global [onvif] block is
 # enabled). Each camera can opt out by setting `enabled = false`.
 # [cameras.onvif]
