@@ -21,6 +21,14 @@ COPY . /usr/local/src/neolink
 # docker to see if it will build from scratch
 # so if it is failing please make a PR
 #
+# `JEMALLOC_SYS_WITH_LG_PAGE=16` on the from-scratch branch is not optional.
+# jemalloc's page size must be at least the running kernel's, and it is chosen
+# at compile time. Building arm64 under buildx/QEMU on a 4K-page host makes
+# jemalloc pick LG_PAGE=12, and that binary aborts at startup on a 16K-page
+# arm64 kernel -- a Raspberry Pi 5. The CI cross and native jobs already export
+# this (build.yml); the artifact branch below inherits their binary, but the
+# from-scratch branch builds its own and needs it too.
+#
 # hadolint ignore=DL3008
 RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
   if [ -f "${TARGETPLATFORM}/neolink" ]; then \
@@ -41,7 +49,7 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
           protobuf-compiler \
           libglib2.0-dev && \
         apt-get clean -y && rm -rf /var/lib/apt/lists/* ; \
-    cargo build --release; \
+    JEMALLOC_SYS_WITH_LG_PAGE=16 cargo build --release; \
   fi
 
 # Create the release container. Match the base OS used to build

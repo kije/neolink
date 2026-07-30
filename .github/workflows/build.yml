@@ -239,7 +239,13 @@ jobs:
       - name: Install basic tools
         run: |
           apt-get update
-          apt-get install --assume-yes --no-install-recommends curl ca-certificates protobuf-compiler
+          # cmake is not needed by anything in the tree today. It is here as
+          # insurance for `aws-lc-sys`, which any rustls 0.23 dependency pulls
+          # in: it prefers its cmake-free `CcBuilder` when pre-generated
+          # bindings exist for the target, but falls through to `CmakeBuilder`
+          # otherwise -- and that hard-fails with "Missing dependency: cmake"
+          # in this image, which ships neither.
+          apt-get install --assume-yes --no-install-recommends curl ca-certificates protobuf-compiler cmake
       - name: Install ${{ matrix.arch }} cross compiler and gstreamer
         id: setup
         run: |
