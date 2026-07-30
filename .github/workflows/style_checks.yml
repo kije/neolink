@@ -28,7 +28,7 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y aptitude
-          sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler
+          sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev protobuf-compiler libssl-dev
       - name: Install nightly rust
         run: |
           rustup toolchain install nightly --component clippy
