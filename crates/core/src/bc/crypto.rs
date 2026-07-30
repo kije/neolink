@@ -1,14 +1,11 @@
-use aes::{
-    cipher::{AsyncStreamCipher, KeyIvInit},
-    Aes128,
-};
+use aes::{cipher::KeyIvInit, Aes128};
 use cfb_mode::{Decryptor, Encryptor};
 
 type Aes128CfbEnc = Encryptor<Aes128>;
 type Aes128CfbDec = Decryptor<Aes128>;
 
 const XML_KEY: [u8; 8] = [0x1F, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0xFF];
-const IV: &[u8] = b"0123456789abcdef";
+const IV: &[u8; 16] = b"0123456789abcdef";
 
 /// These are the encyption modes supported by the camera
 ///
@@ -22,18 +19,14 @@ pub enum EncryptionProtocol {
     /// Latest cameras/firmwares use Aes with the key derived from
     /// the camera's password and the negotiated NONCE
     Aes {
-        /// The encryptor
-        enc: Aes128CfbEnc,
-        /// The decryptor
-        dec: Aes128CfbDec,
+        /// The AES-128 key derived from the password and the login NONCE
+        key: [u8; 16],
     },
     /// Same as Aes but the media stream is also encrypted and not just
     /// the control commands
     FullAes {
-        /// The encryptor
-        enc: Aes128CfbEnc,
-        /// The decryptor
-        dec: Aes128CfbDec,
+        /// The AES-128 key derived from the password and the login NONCE
+        key: [u8; 16],
     },
 }
 
@@ -48,20 +41,22 @@ impl EncryptionProtocol {
     }
     /// Helper to make aes
     pub fn aes(key: [u8; 16]) -> Self {
-        EncryptionProtocol::Aes {
-            enc: Aes128CfbEnc::new(key.as_slice().into(), IV.into()),
-            dec: Aes128CfbDec::new(key.as_slice().into(), IV.into()),
-        }
+        EncryptionProtocol::Aes { key }
     }
     /// Helper to make full aes
     pub fn full_aes(key: [u8; 16]) -> Self {
-        EncryptionProtocol::FullAes {
-            enc: Aes128CfbEnc::new(key.as_slice().into(), IV.into()),
-            dec: Aes128CfbDec::new(key.as_slice().into(), IV.into()),
-        }
+        EncryptionProtocol::FullAes { key }
     }
 
     /// Decrypt the data, offset comes from the header of the packet
+    ///
+    /// A fresh cipher is constructed for every packet, and that is deliberate:
+    /// the camera restarts the CFB keystream from the fixed IV on each one, so
+    /// the keystream must never carry across packets. This used to be spelled
+    /// as a stored cipher that was cloned per call -- `cfb-mode` 0.9 removed
+    /// `Clone`, and since `&self` here meant the stored cipher was never
+    /// advanced anyway, constructing it here is the same computation.
+    /// `aes_tests::test_aes_packets_are_independent` is what holds this down.
     pub fn decrypt(&self, offset: u32, buf: &[u8]) -> Vec<u8> {
         match self {
             EncryptionProtocol::Unencrypted => buf.to_vec(),
@@ -72,11 +67,10 @@ impl EncryptionProtocol {
                     .map(|(key, i)| *i ^ key ^ (offset as u8))
                     .collect()
             }
-            EncryptionProtocol::Aes { dec, .. } | EncryptionProtocol::FullAes { dec, .. } => {
+            EncryptionProtocol::Aes { key } | EncryptionProtocol::FullAes { key } => {
                 // AES decryption
-
                 let mut decrypted = buf.to_vec();
-                dec.clone().decrypt(&mut decrypted);
+                Aes128CfbDec::new(key.into(), IV.into()).decrypt(&mut decrypted);
                 decrypted
             }
         }
@@ -93,10 +87,10 @@ impl EncryptionProtocol {
                 // Encrypt is the same as decrypt
                 self.decrypt(offset, buf)
             }
-            EncryptionProtocol::Aes { enc, .. } | EncryptionProtocol::FullAes { enc, .. } => {
+            EncryptionProtocol::Aes { key } | EncryptionProtocol::FullAes { key } => {
                 // AES encryption
                 let mut encrypted = buf.to_vec();
-                enc.clone().encrypt(&mut encrypted);
+                Aes128CfbEnc::new(key.into(), IV.into()).encrypt(&mut encrypted);
                 encrypted
             }
         }
