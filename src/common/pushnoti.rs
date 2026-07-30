@@ -20,6 +20,36 @@ use tokio::{
 use super::NeoInstance;
 use crate::AnyResult;
 
+/// Reolink's Firebase project, as used by the Android app.
+///
+/// These replace the bare `sender_id` that `fcm-push-listener` 2.x took.
+/// Google shut down the endpoint that version registered against
+/// (`fcm/connect/subscribe`) on 2024-06-20, so registration on 2.x fails
+/// outright; 3.0.0 uses `fcmregistrations.googleapis.com` instead, which needs
+/// the project identified this way.
+const FIREBASE_APP_ID: &str = "1:743639030586:android:86f60a4fb7143876";
+const FIREBASE_PROJECT_ID: &str = "reolink-login";
+const FIREBASE_API_KEY: &str = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
+
+/// The VAPID application public key, sent to FCM as `applicationPubKey`.
+///
+/// **This is the one value here that is not confirmed.** It is passed through
+/// verbatim by `fcm-push-listener` with no validation
+/// (`fcm-push-listener-3.0.0/src/fcm.rs`), and empty means "not bound to a
+/// specific application server key", which is a valid registration. Whether
+/// Reolink's push server requires a particular key is not something that can be
+/// determined without a real camera.
+///
+/// Registration is currently broken for everyone regardless, so an unconfirmed
+/// value here is strictly better than the dead endpoint it replaces -- but if
+/// push notifications still fail to arrive after this change, this constant is
+/// the first thing to suspect.
+const VAPID_KEY: &str = "";
+
+/// Backoff bounds for registration retries.
+const RETRY_WAIT_MIN: Duration = Duration::from_secs(3);
+const RETRY_WAIT_MAX: Duration = Duration::from_secs(300);
+
 pub(crate) struct PushNotiThread {
     pn_watcher: Arc<WatchSender<Option<PushNoti>>>,
     registed_cameras: HashMap<String, NeoInstance>,
@@ -62,17 +92,14 @@ impl PushNotiThread {
         sender: &MpscSender<PnRequest>,
         pn_request_rx: &mut MpscReceiver<PnRequest>,
     ) -> AnyResult<()> {
+        // Backoff between registration attempts. The old code slept a flat 3
+        // seconds and `continue`d on failure, so a persistent outage meant
+        // hammering Google 20 times a minute forever.
+        let mut retry_wait = RETRY_WAIT_MIN;
+
         loop {
             // Short wait on start/retry
-            sleep(Duration::from_secs(3)).await;
-
-            let sender_id = "743639030586"; // andriod
-                                            // let sender_id = "696841269229"; // ios
-
-            // let firebase_app_id = "1:743639030586:android:86f60a4fb7143876";
-            // let firebase_project_id = "reolink-login";
-            // let firebase_api_key = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
-            // let vapid_key = "????";
+            sleep(retry_wait).await;
 
             let token_path = dirs::config_dir().map(|mut d| {
                 fs::create_dir(&d)
@@ -113,7 +140,14 @@ impl PushNotiThread {
                 registration
             } else {
                 log::debug!("Registering new push notification token");
-                match fcm_push_listener::register(sender_id).await {
+                match fcm_push_listener::register(
+                    FIREBASE_APP_ID,
+                    FIREBASE_PROJECT_ID,
+                    FIREBASE_API_KEY,
+                    VAPID_KEY,
+                )
+                .await
+                {
                     Ok(registration) => {
                         let new_token = toml::to_string(&registration)
                             .with_context(|| "Unable to serialise fcm token")?;
@@ -131,11 +165,20 @@ impl PushNotiThread {
                         registration
                     }
                     Err(e) => {
-                        log::warn!("Issue connecting to push notifications server: {:?}", e);
+                        log::warn!(
+                            "Issue connecting to push notifications server (retrying in {:?}): {:?}",
+                            retry_wait,
+                            e
+                        );
+                        retry_wait = (retry_wait * 2).min(RETRY_WAIT_MAX);
                         continue;
                     }
                 }
             };
+
+            // Registration worked, so a later reconnect starts from the short
+            // wait again rather than inheriting a backed-off one.
+            retry_wait = RETRY_WAIT_MIN;
 
             // Send registration.fcm_token to the server to allow it to send push messages to you.
             log::debug!("registration.fcm_token: {}", registration.fcm_token);
