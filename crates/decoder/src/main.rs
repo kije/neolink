@@ -2,7 +2,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::todo)]
 //! Use to decode AES packet data
-use hex_string::HexString;
+use anyhow::Context;
 use requestty::Question;
 use std::convert::TryInto;
 
@@ -57,9 +57,13 @@ fn main() -> Result<(), anyhow::Error> {
         .ok_or_else(|| anyhow::anyhow!("Did not get reply"))?
         .to_string();
 
-    let source_hex = HexString::from_string(&source_str).unwrap();
+    // `hex::decode` is case-insensitive, where the old `hex-string` crate
+    // accepted lowercase only and panicked otherwise -- including on hex copied
+    // straight out of this tool's own `{:X?}` log output.
+    let source_hex = hex::decode(source_str.trim())
+        .with_context(|| format!("{source_str:?} is not a valid hex string"))?;
 
-    let decrypted = decrypt(&source_hex.as_bytes(), &make_aeskey(&pass, &nonce));
+    let decrypted = decrypt(&source_hex, &make_aeskey(&pass, &nonce));
     log::info!("Bytes: {:X?}", decrypted);
     log::info!("Text: {}", String::from_utf8(decrypted)?);
 
