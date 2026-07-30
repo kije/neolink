@@ -21,6 +21,10 @@ env:
   # Note 1.26.11 exists on macOS but NOT on Chocolatey, so do not "bump" to it.
   # This is a minimum-version bump only; the crates' `v1_20` feature is a floor.
   gstreamer_version: "1.26.9"
+  # Windows OpenSSL (Chocolatey). Pinned to 3.x: openssl-sys accepts OpenSSL 4
+  # but the 4.x Win64 installer's library layout is not one it can link against.
+  # macOS uses homebrew's openssl@3 for the same reason.
+  openssl_version: "3.6.2"
 
 jobs:
   pre_job:
@@ -95,26 +99,46 @@ jobs:
           # Proto buffers
           choco install -y --no-progress protoc --version=24.2.0
 
-          # Open SSL. Left unpinned deliberately: the previous pin of
-          # 1.1.1.2100 is an OpenSSL release EOL since 2023. Choco currently
-          # serves 4.0.1, which is supported -- openssl-sys 0.9.117's
-          # validate_headers() maps (4,0,0) through (4,3,x) and only rejects
-          # >= 0x5_00_00_00_0, i.e. OpenSSL 5.
-          choco install -y --no-progress openssl
-          $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL-Win64\'
+          # Open SSL. Pinned to the 3.x line rather than left floating. The old
+          # 1.1.1.2100 pin was EOL-since-2023, but floating picks up 4.0.1, and
+          # while openssl-sys 0.9.117 ACCEPTS OpenSSL 4 (it emits ossl400 and
+          # only rejects >= OpenSSL 5), the 4.x installer lays its import
+          # libraries out differently and the build then dies with "OpenSSL
+          # libdir at [...] does not contain the required files to either
+          # statically or dynamically link OpenSSL".
+          choco install -y --no-progress openssl --version=$env:openssl_version
 
-          # Alternative openssl location (depends on version that gets installed by choco)
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL\'
+          # Locate the install root, then the directory that actually holds the
+          # import libraries. Both matter: previous versions of this step only
+          # guessed the root and assumed "<root>\lib", but the Win64 installers
+          # place libs under lib\VC\x64\MD on some versions. openssl-sys honours
+          # the explicit OPENSSL_LIB_DIR + OPENSSL_INCLUDE_DIR pair, which is
+          # more precise than OPENSSL_DIR, so resolve and set those.
+          $sslRoot = @(
+            (Join-Path $env:ProgramFiles 'OpenSSL-Win64'),
+            (Join-Path $env:ProgramFiles 'OpenSSL'),
+            'C:\Program Files\OpenSSL-Win64',
+            'C:\Program Files\OpenSSL'
+          ) | Where-Object { Test-Path -Path $_ -PathType Container } | Select-Object -First 1
+          if (-not $sslRoot) {
+            Write-Error "Could not locate the OpenSSL install root after installing openssl $env:openssl_version."
+            exit 1
           }
-          # Github runners work on both C or D drive and figuring out which was used is difficult
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR='D:\\Program Files\OpenSSL-Win64\'
+          $sslLib = Get-ChildItem -Path $sslRoot -Recurse -Filter 'libssl.lib' -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if (-not $sslLib) {
+            Write-Error "Found OpenSSL at $sslRoot but no libssl.lib beneath it."
+            Get-ChildItem -Path $sslRoot -Recurse -Filter '*.lib' -ErrorAction SilentlyContinue |
+              Select-Object -First 20 | ForEach-Object { Write-Host "  candidate: $($_.FullName)" }
+            exit 1
           }
-          # Or course we could be on alternative location and drive....
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR='D:\\Program Files\OpenSSL\'
-          }
+          $env:OPENSSL_DIR = $sslRoot
+          $env:OPENSSL_LIB_DIR = $sslLib.DirectoryName
+          $env:OPENSSL_INCLUDE_DIR = (Join-Path $sslRoot 'include')
+          Write-Host "Resolved OPENSSL_DIR=$env:OPENSSL_DIR"
+          Write-Host "Resolved OPENSSL_LIB_DIR=$env:OPENSSL_LIB_DIR"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_LIB_DIR=$env:OPENSSL_LIB_DIR"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_INCLUDE_DIR=$env:OPENSSL_INCLUDE_DIR"
 
           # Set github vars
           Add-Content -Path $env:GITHUB_ENV  -Value "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
