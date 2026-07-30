@@ -63,24 +63,43 @@ jobs:
           # Gstreamer. The choco packages download their MSIs from
           # gstreamer.freedesktop.org at install time, so a version whose
           # upstream MSI has been deleted fails here rather than in choco --
-          # which is what happened to 1.24.2: the package resolved fine but
-          # .../data/pkg/windows/1.24.2/msvc/*.msi is now 404, so nothing was
-          # installed and the directory check below failed on an empty path.
+          # which is what happened to the old 1.24.2 pin: the package resolved
+          # fine but .../data/pkg/windows/1.24.2/msvc/*.msi is now 404, so
+          # nothing was installed at all.
           choco install -y --no-progress gstreamer --version=$env:gstreamer_version
           choco install -y --no-progress gstreamer-devel --version=$env:gstreamer_version
-          $env:GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:SYSTEMDRIVE + '\gstreamer\1.0\msvc_x86_64\'
-          # Github runners work on both C or D drive and figuring out which was used is difficult
-          if (-not (Test-Path -Path "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64" -PathType Container)) {
-            $env:GSTREAMER_1_0_ROOT_MSVC_X86_64='D:\\gstreamer\1.0\msvc_x86_64\'
+          # Resolve the install root instead of guessing it. The MSI sets a
+          # machine-level GSTREAMER_1_0_ROOT_MSVC_X86_64 itself, but that is not
+          # visible to this already-running shell, so read it from the machine
+          # environment directly. Guessing is what broke here: the old code built
+          # "$env:SYSTEMDRIVE\gstreamer\1.0\msvc_x86_64\" while the MSI actually
+          # installs to "$env:ProgramFiles\gstreamer\1.0\msvc_x86_64\", so the
+          # probe missed, fell back to a hardcoded D:\ path that also did not
+          # exist, and the `dir` at the end of this step failed cryptically.
+          $gstRoot = [System.Environment]::GetEnvironmentVariable('GSTREAMER_1_0_ROOT_MSVC_X86_64', 'Machine')
+          if (-not $gstRoot -or -not (Test-Path -Path $gstRoot -PathType Container)) {
+            $gstRoot = @(
+              (Join-Path $env:ProgramFiles 'gstreamer\1.0\msvc_x86_64'),
+              "$env:SYSTEMDRIVE\gstreamer\1.0\msvc_x86_64",
+              'C:\Program Files\gstreamer\1.0\msvc_x86_64',
+              'D:\gstreamer\1.0\msvc_x86_64'
+            ) | Where-Object { Test-Path -Path $_ -PathType Container } | Select-Object -First 1
           }
+          if (-not $gstRoot) {
+            Write-Error "Could not locate the GStreamer MSVC x86_64 install root after installing gstreamer-devel $env:gstreamer_version."
+            exit 1
+          }
+          $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = $gstRoot
           echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
 
           # Proto buffers
           choco install -y --no-progress protoc --version=24.2.0
 
           # Open SSL. Left unpinned deliberately: the previous pin of
-          # 1.1.1.2100 is an OpenSSL release that has been EOL since 2023, and
-          # openssl-sys 0.9.x supports 3.x fine.
+          # 1.1.1.2100 is an OpenSSL release EOL since 2023. Choco currently
+          # serves 4.0.1, which is supported -- openssl-sys 0.9.117's
+          # validate_headers() maps (4,0,0) through (4,3,x) and only rejects
+          # >= 0x5_00_00_00_0, i.e. OpenSSL 5.
           choco install -y --no-progress openssl
           $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL-Win64\'
 
@@ -100,7 +119,6 @@ jobs:
           # Set github vars
           Add-Content -Path $env:GITHUB_ENV  -Value "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
           Add-Content -Path $env:GITHUB_PATH  -Value "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\bin"
-          Add-Content -Path $env:GITHUB_PATH  -Value "%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin"
           Add-Content -Path $env:GITHUB_ENV  -Value "OPENSSL_DIR=$env:OPENSSL_DIR"
 
           # One last check on directories
