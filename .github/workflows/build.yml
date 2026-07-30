@@ -6,7 +6,21 @@ on:
   workflow_dispatch:
 
 env:
-  rust_version: "1.82.0"
+  # Keep in sync with `rust-version` in every Cargo.toml of the workspace.
+  # 1.88 is the floor imposed by the current lockfile: `time` 0.3.54 and
+  # `home` 0.5.12 declare `rust-version = "1.88"`, and 25 transitive crates
+  # (clap 4.6, toml 1.1, cpufeatures 0.3, getrandom 0.4, ...) are edition 2024,
+  # which needs Cargo >= 1.85 just to parse their manifests.
+  rust_version: "1.88.0"
+  # GStreamer version for macOS and Windows, which install it from upstream
+  # packages rather than from a distro. Upstream only keeps the FINAL point
+  # release of each series, so pinning a non-final patch (as 1.20.4 and 1.24.2
+  # were) eventually 404s. 1.26.9 is the newest version available on every
+  # channel we need: the macOS devel+runtime pkgs, the Chocolatey `gstreamer`
+  # and `gstreamer-devel` packages, and the upstream MSVC MSIs those pull.
+  # Note 1.26.11 exists on macOS but NOT on Chocolatey, so do not "bump" to it.
+  # This is a minimum-version bump only; the crates' `v1_20` feature is a floor.
+  gstreamer_version: "1.26.9"
 
 jobs:
   pre_job:
@@ -31,7 +45,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-12, macos-14] # macos-14+ is arm64
+        # GitHub supports only the latest two macOS versions, so these labels
+        # rot fast and a removed label does not fail -- the job just queues
+        # forever, which is how macos-12 and then macos-13 sat pending here.
+        # As of this change: macos-13 is REMOVED from the available images and
+        # macos-14 is marked deprecated. macos-15-intel is the x86_64 runner and
+        # macos-15 is arm64.
+        # NOTE: the release job downloads artifacts named `release-${{ matrix.os }}`,
+        # so changing a label here requires changing it there too.
+        os: [ubuntu-22.04, windows-2022, macos-15-intel, macos-15]
     steps:
       - uses: actions/checkout@v4
         name: Checkout onto ${{ runner.os }}
@@ -40,44 +62,95 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y aptitude
-          sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
+          sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev protobuf-compiler libssl-dev
       - if: runner.os == 'Windows'
         name: Install Windows deps
         run: |
-          # Gstreamer
-          choco install -y --no-progress gstreamer --version=1.24.2
-          choco install -y --no-progress gstreamer-devel --version=1.24.2
-          $env:GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:SYSTEMDRIVE + '\gstreamer\1.0\msvc_x86_64\'
-          # Github runners work on both C or D drive and figuring out which was used is difficult
-          if (-not (Test-Path -Path "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64" -PathType Container)) {
-            $env:GSTREAMER_1_0_ROOT_MSVC_X86_64='D:\\gstreamer\1.0\msvc_x86_64\'
+          # Gstreamer. The choco packages download their MSIs from
+          # gstreamer.freedesktop.org at install time, so a version whose
+          # upstream MSI has been deleted fails here rather than in choco --
+          # which is what happened to the old 1.24.2 pin: the package resolved
+          # fine but .../data/pkg/windows/1.24.2/msvc/*.msi is now 404, so
+          # nothing was installed at all.
+          choco install -y --no-progress gstreamer --version=$env:gstreamer_version
+          choco install -y --no-progress gstreamer-devel --version=$env:gstreamer_version
+          # Resolve the install root instead of guessing it. The MSI sets a
+          # machine-level GSTREAMER_1_0_ROOT_MSVC_X86_64 itself, but that is not
+          # visible to this already-running shell, so read it from the machine
+          # environment directly. Guessing is what broke here: the old code built
+          # "$env:SYSTEMDRIVE\gstreamer\1.0\msvc_x86_64\" while the MSI actually
+          # installs to "$env:ProgramFiles\gstreamer\1.0\msvc_x86_64\", so the
+          # probe missed, fell back to a hardcoded D:\ path that also did not
+          # exist, and the `dir` at the end of this step failed cryptically.
+          $gstRoot = [System.Environment]::GetEnvironmentVariable('GSTREAMER_1_0_ROOT_MSVC_X86_64', 'Machine')
+          if (-not $gstRoot -or -not (Test-Path -Path $gstRoot -PathType Container)) {
+            $gstRoot = @(
+              (Join-Path $env:ProgramFiles 'gstreamer\1.0\msvc_x86_64'),
+              "$env:SYSTEMDRIVE\gstreamer\1.0\msvc_x86_64",
+              'C:\Program Files\gstreamer\1.0\msvc_x86_64',
+              'D:\gstreamer\1.0\msvc_x86_64'
+            ) | Where-Object { Test-Path -Path $_ -PathType Container } | Select-Object -First 1
           }
+          if (-not $gstRoot) {
+            Write-Error "Could not locate the GStreamer MSVC x86_64 install root after installing gstreamer-devel $env:gstreamer_version."
+            exit 1
+          }
+          $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = $gstRoot
           echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
 
           # Proto buffers
           choco install -y --no-progress protoc --version=24.2.0
 
-          # Open SSL
-          choco install -y --no-progress openssl --version=1.1.1.2100
-          $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL-Win64\'
-
-          # Alternative openssl location (depends on version that gets installed by choco)
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL\'
+          # Open SSL: use the copy the runner image already ships, and do not
+          # install one. The windows-2022 image provides OpenSSL 3.x at
+          # C:\Program Files\OpenSSL (libssl-3-x64.dll), which is everything
+          # openssl-sys needs.
+          #
+          # Installing it via Chocolatey was the problem, not the solution. That
+          # package downloads its installer from slproweb.com, which only hosts
+          # the CURRENT build of each line, so ANY pinned version eventually
+          # 404s -- exactly what killed the old 1.1.1.2100 pin and then killed a
+          # 3.6.2 pin too ("Attempt to get headers for
+          # .../Win64OpenSSL-3_6_2.exe failed ... (404) Not Found"). Leaving it
+          # unpinned is no better: that resolves to OpenSSL 4.x, whose library
+          # layout openssl-sys cannot link against even though it accepts the
+          # version. Not installing sidesteps the whole class of failure, and
+          # drops a 245 MB download from every Windows run.
+          #
+          # Resolve the root, then the directory that actually holds the import
+          # libraries -- the Win64 layout puts them under lib\VC\x64\MD, not
+          # <root>\lib, which is what the previous OPENSSL_DIR-only approach
+          # assumed. openssl-sys honours the explicit OPENSSL_LIB_DIR +
+          # OPENSSL_INCLUDE_DIR pair in preference to OPENSSL_DIR.
+          $sslRoot = @(
+            (Join-Path $env:ProgramFiles 'OpenSSL-Win64'),
+            (Join-Path $env:ProgramFiles 'OpenSSL'),
+            'C:\Program Files\OpenSSL-Win64',
+            'C:\Program Files\OpenSSL'
+          ) | Where-Object { Test-Path -Path $_ -PathType Container } | Select-Object -First 1
+          if (-not $sslRoot) {
+            Write-Error "Could not locate a pre-installed OpenSSL on this runner image. If the image stopped shipping OpenSSL, install it here explicitly."
+            exit 1
           }
-          # Github runners work on both C or D drive and figuring out which was used is difficult
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR='D:\\Program Files\OpenSSL-Win64\'
+          $sslLib = Get-ChildItem -Path $sslRoot -Recurse -Filter 'libssl.lib' -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if (-not $sslLib) {
+            Write-Error "Found OpenSSL at $sslRoot but no libssl.lib beneath it."
+            Get-ChildItem -Path $sslRoot -Recurse -Filter '*.lib' -ErrorAction SilentlyContinue |
+              Select-Object -First 20 | ForEach-Object { Write-Host "  candidate: $($_.FullName)" }
+            exit 1
           }
-          # Or course we could be on alternative location and drive....
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR='D:\\Program Files\OpenSSL\'
-          }
+          $env:OPENSSL_DIR = $sslRoot
+          $env:OPENSSL_LIB_DIR = $sslLib.DirectoryName
+          $env:OPENSSL_INCLUDE_DIR = (Join-Path $sslRoot 'include')
+          Write-Host "Resolved OPENSSL_DIR=$env:OPENSSL_DIR"
+          Write-Host "Resolved OPENSSL_LIB_DIR=$env:OPENSSL_LIB_DIR"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_LIB_DIR=$env:OPENSSL_LIB_DIR"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_INCLUDE_DIR=$env:OPENSSL_INCLUDE_DIR"
 
           # Set github vars
           Add-Content -Path $env:GITHUB_ENV  -Value "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
           Add-Content -Path $env:GITHUB_PATH  -Value "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\bin"
-          Add-Content -Path $env:GITHUB_PATH  -Value "%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin"
           Add-Content -Path $env:GITHUB_ENV  -Value "OPENSSL_DIR=$env:OPENSSL_DIR"
 
           # One last check on directories
@@ -86,16 +159,22 @@ jobs:
       - if: runner.os == 'macOS'
         name: Install macOS deps
         run: |
-          curl -L 'https://gstreamer.freedesktop.org/data/pkg/osx/1.20.4/gstreamer-1.0-devel-1.20.4-universal.pkg' -o "$(pwd)/gstreamer-devel.pkg"
+          # `-f` matters: without it curl saves upstream's HTML 404 page as the
+          # .pkg and the failure only surfaces later at `installer`, which is
+          # how the dead 1.20.4 pin stayed confusing for so long.
+          gst_pkg="gstreamer-1.0-devel-${gstreamer_version}-universal.pkg"
+          curl -fL "https://gstreamer.freedesktop.org/data/pkg/osx/${gstreamer_version}/${gst_pkg}" -o "$(pwd)/gstreamer-devel.pkg"
           sudo installer -verbose -pkg "$(pwd)/gstreamer-devel.pkg" -target /
           PKG_CONFIG_PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           PKG_CONFIG_GSTREAMER_1_0_PREFIX="/Library/Frameworks/GStreamer.framework/Versions/1.0"
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_GSTREAMER_1_0_PREFIX=${PKG_CONFIG_GSTREAMER_1_0_PREFIX}" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
-          brew install pkg-config protobuf openssl@1.1
-          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@1.1)/include/" >>  "${GITHUB_ENV}"
-          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@1.1)/lib/" >>  "${GITHUB_ENV}"
+          # openssl@1.1 has been removed from homebrew-core (EOL since 2023);
+          # openssl-sys 0.9.x supports OpenSSL 3.x.
+          brew install pkg-config protobuf openssl@3
+          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@3)/include/" >>  "${GITHUB_ENV}"
+          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@3)/lib/" >>  "${GITHUB_ENV}"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -172,7 +251,6 @@ jobs:
           g++-${{ matrix.gcc }} \
           libgstrtspserver-1.0-dev:${{ matrix.arch }} \
           libgstreamer1.0-dev:${{ matrix.arch }} \
-          libgtk2.0-dev:${{ matrix.arch }} \
           libglib2.0-dev:${{ matrix.arch }} \
           libssl-dev:${{ matrix.arch }}
       - name: Install rustup
@@ -210,14 +288,19 @@ jobs:
         id: vars
         shell: bash
         run: |
-          unset HAS_SECRET
-          if [ -n $SECRET ]; then HAS_SECRET='true' ; fi
+          # `$SECRET` must be quoted. Unquoted, an empty secret makes this
+          # `[ -n ]`, which POSIX test evaluates as the one-argument form on the
+          # non-empty string "-n" -- i.e. TRUE. That is why every step below ran
+          # on forks with no DOCKER_TOKEN and docker/login-action then failed
+          # with "Password required".
+          HAS_SECRET='false'
+          if [ -n "$SECRET" ]; then HAS_SECRET='true' ; fi
           echo "HAS_SECRET_TOKEN=${HAS_SECRET}" >> $GITHUB_OUTPUT
         env:
           SECRET: "${{ secrets.DOCKER_TOKEN }}"
       - name: Check out the repo
         uses: actions/checkout@v4
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
       - name: Convert username to lower case for docker
         id: string_user
         uses: ASzc/change-string-case-action@v6
@@ -229,20 +312,20 @@ jobs:
         with:
           string: ${{ github.repository }}
       - name: Set up QEMU
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         uses: docker/login-action@v3
         with:
           registry: docker.io
           username: ${{ vars.DOCKER_USERNAME || steps.string_user.outputs.lowercase }}
           password: ${{ secrets.DOCKER_TOKEN }}
       - name: Set Docker name with owner (package name) depending on if DOCKER_USERNAME is set
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         id: docker_repo
         shell: bash
         run: |
@@ -257,7 +340,7 @@ jobs:
           DOCKER_USERNAME: ${{ vars.DOCKER_USERNAME }}
           GITHUB_NWO: ${{ steps.string_repo.outputs.lowercase }}
       - name: Get tag name
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         id: tags
         shell: bash
         run: |
@@ -324,7 +407,7 @@ jobs:
           name: release-i386-bookworm
           path: linux/386
       - name: Push to Docker Hub
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         uses: docker/build-push-action@v5
         with:
           platforms: linux/amd64,linux/arm/v7,linux/arm64,linux/386
@@ -366,12 +449,13 @@ jobs:
       - name: Download Macos
         uses: actions/download-artifact@v4
         with:
-          name: release-macos-12
+          # Must match `release-${{ matrix.os }}` from the native job's upload.
+          name: release-macos-15-intel
           path: neolink_macos_intel
       - name: Download Macos arm64
         uses: actions/download-artifact@v4
         with:
-          name: release-macos-14
+          name: release-macos-15
           path: neolink_macos_m1
       - name: Download Linux x86_64
         uses: actions/download-artifact@v4

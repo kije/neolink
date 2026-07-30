@@ -105,6 +105,43 @@ pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
 /// Get the floodlight task xml
 pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
 
+/// Get the AI config block: auto-tracking plus baby-cry detection
+pub const MSG_ID_GET_AI_CFG: u32 = 299;
+/// Set the AI config block: auto-tracking plus baby-cry detection
+pub const MSG_ID_SET_AI_CFG: u32 = 300;
+/// Get the per-AI detection config (sensitivity / stay-time / area mask)
+pub const MSG_ID_GET_AI_ALARM: u32 = 342;
+/// Set the per-AI detection config (sensitivity / stay-time / area mask)
+pub const MSG_ID_SET_AI_ALARM: u32 = 343;
+/// Get the line-cross detection zones
+pub const MSG_ID_GET_CROSSLINE_DETECT: u32 = 527;
+/// Set the line-cross detection zones.
+///
+/// This and the other four smart-AI write ids are defined but not currently
+/// issued — see the "Why the zone detectors are read-only" section of
+/// [`crate::bc_protocol`]'s smart-AI module.
+pub const MSG_ID_SET_CROSSLINE_DETECT: u32 = 528;
+/// Get the intrusion detection zones
+pub const MSG_ID_GET_INTRUSION_DETECT: u32 = 529;
+/// Set the intrusion detection zones
+pub const MSG_ID_SET_INTRUSION_DETECT: u32 = 530;
+/// Get the loitering detection zones
+pub const MSG_ID_GET_LOITERING_DETECT: u32 = 531;
+/// Set the loitering detection zones
+pub const MSG_ID_SET_LOITERING_DETECT: u32 = 532;
+/// Get the "legacy"/forgotten-item detection zones
+pub const MSG_ID_GET_LEGACY_DETECT: u32 = 549;
+/// Set the "legacy"/forgotten-item detection zones
+pub const MSG_ID_SET_LEGACY_DETECT: u32 = 550;
+/// Get the "loss"/taken-item detection zones
+pub const MSG_ID_GET_LOSS_DETECT: u32 = 551;
+/// Set the "loss"/taken-item detection zones
+pub const MSG_ID_SET_LOSS_DETECT: u32 = 552;
+/// Push-only YOLO basic detection event
+pub const MSG_ID_YOLO_DETECT: u32 = 600;
+/// Push-only YOLO detailed detection event with sub-class
+pub const MSG_ID_YOLO_DETECT_DETAIL: u32 = 696;
+
 /// An empty password in legacy format
 pub const EMPTY_LEGACY_PASSWORD: &str =
     "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";

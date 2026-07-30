@@ -26,13 +26,14 @@ use super::{
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
 use crate::{config::CameraConfig, AnyResult, Result};
-use neolink_core::bc_protocol::BcCamera;
+use neolink_core::bc_protocol::{AiState, BcCamera};
 
 #[allow(dead_code)]
 pub(crate) enum NeoCamCommand {
     HangUp,
     Instance(OneshotSender<Result<NeoInstance>>),
     Motion(OneshotSender<WatchReceiver<MdState>>),
+    Ai(OneshotSender<WatchReceiver<AiState>>),
     Config(OneshotSender<WatchReceiver<CameraConfig>>),
     Disconnect(OneshotSender<()>),
     Connect(OneshotSender<()>),
@@ -110,6 +111,13 @@ impl NeoCam {
                             NeoCamCommand::Motion(sender) => {
                                 md_request_tx.send(
                                     MdRequest::Get {
+                                        sender,
+                                    }
+                                ).await?;
+                            },
+                            NeoCamCommand::Ai(sender) => {
+                                md_request_tx.send(
+                                    MdRequest::GetAi {
                                         sender,
                                     }
                                 ).await?;

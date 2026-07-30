@@ -18,6 +18,8 @@ pub(crate) enum Discoveries {
     Camera,
     #[serde(alias = "motion", alias = "md", alias = "pir")]
     Motion,
+    #[serde(alias = "ai", alias = "object", alias = "detections")]
+    Ai,
     #[serde(alias = "led")]
     Led,
     #[serde(alias = "ir")]
@@ -161,6 +163,8 @@ struct DiscoveryBinarySensor {
     unique_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_class: Option<String>,
     device: DiscoveryDevice,
     availability: DiscoveryAvaliablity,
     // BinarySensor specific
@@ -168,6 +172,44 @@ struct DiscoveryBinarySensor {
     payload_on: String,
     // - State
     state_topic: String,
+}
+
+/// The AI detections we advertise to Home Assistant.
+///
+/// The camera only reports the types it actually supports, so a sensor for a
+/// type this model cannot detect simply stays `off`. Each entry is
+/// `(ai type as reported by the camera, home assistant device class, icon)`.
+pub(super) const AI_DISCOVERY_TYPES: &[(&str, &str, &str)] = &[
+    ("people", "motion", "mdi:account"),
+    ("vehicle", "motion", "mdi:car"),
+    ("dog_cat", "motion", "mdi:dog-side"),
+    ("face", "motion", "mdi:face-recognition"),
+    ("visitor", "occupancy", "mdi:doorbell-video"),
+    ("package", "occupancy", "mdi:package-variant-closed"),
+    ("non-motor vehicle", "motion", "mdi:bike"),
+    ("cry", "sound", "mdi:baby-face-outline"),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::AI_DISCOVERY_TYPES;
+    use neolink_core::bc::xml::AI_CANONICAL_TYPES;
+
+    #[test]
+    fn every_canonical_ai_type_is_discoverable() {
+        // The publisher emits a topic for whatever the camera reports, so a
+        // canonical type with no discovery row would be published but never
+        // show up in Home Assistant.
+        for ai_type in AI_CANONICAL_TYPES {
+            assert!(
+                AI_DISCOVERY_TYPES
+                    .iter()
+                    .any(|(name, _, _)| name == ai_type),
+                "{}",
+                ai_type
+            );
+        }
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -444,6 +486,52 @@ pub(crate) async fn enable_discovery(
                     )
                 })?;
             }
+            Discoveries::Ai => {
+                for (ai_type, device_class, icon) in AI_DISCOVERY_TYPES {
+                    let topic_segment = super::mqtt_topic_segment(ai_type);
+                    let config_data = DiscoveryBinarySensor {
+                        // Common across all potential features
+                        device: device.clone(),
+                        availability: availability.clone(),
+
+                        // Identifiers
+                        name: format!(
+                            "{} {}",
+                            friendly_name.as_str(),
+                            ai_type.replace('_', " ").to_title_case()
+                        ),
+                        unique_id: format!("neolink_{}_ai_{}", cam_config.name, topic_segment),
+                        icon: Some(icon.to_string()),
+                        device_class: Some(device_class.to_string()),
+
+                        // Binary sensor specific
+                        state_topic: format!(
+                            "neolink/{}/status/ai/{}",
+                            cam_config.name, topic_segment
+                        ),
+                        payload_off: "off".to_string(),
+                        payload_on: "on".to_string(),
+                    };
+
+                    mqtt.send_message_with_root_topic(
+                        &format!(
+                            "{}/binary_sensor/{}",
+                            discovery_config.topic, &config_data.unique_id
+                        ),
+                        "config",
+                        &serde_json::to_string(&config_data)
+                            .with_context(|| "Cound not serialise discovery ai config into json")?,
+                        true,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to publish ai auto-discover data on over MQTT for {}",
+                            cam_config.name
+                        )
+                    })?;
+                }
+            }
             Discoveries::Motion => {
                 let config_data = DiscoveryBinarySensor {
                     // Common across all potential features
@@ -454,6 +542,7 @@ pub(crate) async fn enable_discovery(
                     name: format!("{} MD", friendly_name.as_str()),
                     unique_id: format!("neolink_{}_md", cam_config.name),
                     icon: Some("mdi:motion-sensor".to_string()),
+                    device_class: Some("motion".to_string()),
 
                     // Switch specific
                     state_topic: format!("neolink/{}/status/motion", cam_config.name),

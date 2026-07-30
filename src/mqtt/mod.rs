@@ -22,6 +22,12 @@
 //!
 //! `/status offline` Sent when the neolink goes offline this is a LastWill message
 //! `/status disconnected` Sent when the camera goes offline
+//! `/status/motion [on|off]` Sent when motion starts/stops
+//! `/status/ai` Comma separated list of the AI types currently detected, or
+//!    `none`. Requires a camera with AI detection.
+//! `/status/ai/{type} [on|off]` Sent per AI type as it starts/stops being
+//!    detected. `{type}` is one of `people`, `vehicle`, `dog_cat`, `face`,
+//!    `visitor`, `package`, `cry`, ... with spaces replaced by `_`
 //! `/status/battery` Sent in reply to a `/query/battery`
 //! `/status/pir` Sent in reply to a `/query/pir`
 //! `/status/ptz/preset` Sent in reply to a `/query/ptz/preset`
@@ -91,6 +97,20 @@ use self::{
     discovery::enable_discovery,
     mqttc::{MqttInstance, MqttReply},
 };
+
+/// Make an AI type name safe to use as a single MQTT topic level.
+///
+/// Reolink uses names like `non-motor vehicle`; MQTT topics must not contain
+/// spaces (nor `+`/`#`, which are wildcards).
+fn mqtt_topic_segment(ai_type: &str) -> String {
+    ai_type
+        .chars()
+        .map(|c| match c {
+            ' ' | '+' | '#' | '/' => '_',
+            c => c,
+        })
+        .collect()
+}
 
 /// Entry point for the mqtt subcommand
 ///
@@ -312,6 +332,41 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     .await
                     .with_context(|| format!("Failed to publish push notification unknown for {}", camera_name))?;
                 let _drop_message2 = mqtt_instance.last_will("status/motion", "unknown").await?;
+                // Seed the AI topics. Detections are published retained, so
+                // without this an `on` left on the broker by an unclean
+                // shutdown would stay `on` until the camera happened to report
+                // that type again. `unknown` is neither payload_on nor
+                // payload_off, so Home Assistant shows the sensor as unknown
+                // rather than asserting a state we have not observed. There is
+                // deliberately no per-type last will: each one would need its
+                // own broker connection.
+                let ai_enabled = config.enable_motion && config.enable_ai;
+                let _drop_message3 = if ai_enabled {
+                    mqtt_instance
+                        .send_message("status/ai", "unknown", true)
+                        .await
+                        .with_context(|| {
+                            format!("Failed to publish ai unknown for {}", camera_name)
+                        })?;
+                    for (ai_type, _, _) in discovery::AI_DISCOVERY_TYPES {
+                        mqtt_instance
+                            .send_message(
+                                &format!("status/ai/{}", mqtt_topic_segment(ai_type)),
+                                "unknown",
+                                true,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to publish ai {} unknown for {}",
+                                    ai_type, camera_name
+                                )
+                            })?;
+                    }
+                    Some(mqtt_instance.last_will("status/ai", "unknown").await?)
+                } else {
+                    None
+                };
 
                 if let Some(discovery_config) = config.discovery.as_ref() {
                     enable_discovery(discovery_config, &mqtt_instance, &camera).await?;
@@ -330,6 +385,9 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
 
                 let camera_motion = camera.clone();
                 let mqtt_motion = mqtt_instance.resubscribe().await?;
+
+                let camera_ai = camera.clone();
+                let mqtt_ai = mqtt_instance.resubscribe().await?;
 
                 #[cfg(feature = "pushnoti")]
                 let camera_pn = camera.clone();
@@ -476,6 +534,61 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                             }?;
                         }
                     }, if config.enable_motion => v,
+                    // Handle the AI detection messages
+                    //
+                    // These ride on the same alarm messages as motion, so they are
+                    // gated behind the same switch.
+                    v = async {
+                        let mut ai = camera_ai.ai().await?;
+                        // Remember what we published so a repeated alarm event
+                        // does not re-publish an unchanged state.
+                        let mut published: HashMap<String, bool> = HashMap::new();
+                        // The watch starts out empty, which is "we have not heard
+                        // from the camera yet" and not "nothing is detected". Wait
+                        // for the first real update before overwriting the retained
+                        // `unknown` seed with a summary.
+                        let mut heard_from_camera = false;
+                        loop {
+                            let v = async {
+                                let state = ai.borrow_and_update().clone();
+                                for (ai_type, detected) in state.detections().iter() {
+                                    if published.get(ai_type) == Some(detected) {
+                                        continue;
+                                    }
+                                    published.insert(ai_type.clone(), *detected);
+                                    mqtt_ai.send_message(
+                                        &format!("status/ai/{}", mqtt_topic_segment(ai_type)),
+                                        if *detected { "on" } else { "off" },
+                                        true,
+                                    ).await.with_context(|| {
+                                        format!("{}: Failed to publish AI {}", camera_name, ai_type)
+                                    })?;
+                                }
+                                if heard_from_camera {
+                                    let detected = state.detected_types().collect::<Vec<_>>();
+                                    let summary = if detected.is_empty() {
+                                        "none".to_string()
+                                    } else {
+                                        detected.join(",")
+                                    };
+                                    mqtt_ai.send_message("status/ai", &summary, true).await.with_context(|| {
+                                        format!("{}: Failed to publish AI summary", camera_name)
+                                    })?;
+                                }
+                                ai.changed().await.with_context(|| {
+                                    format!("{}: AI Watch Dropped", camera_name)
+                                })?;
+                                heard_from_camera = true;
+                                AnyResult::Ok(())
+                            }.await;
+                            match v.map_err(|e| e.downcast::<neolink_core::Error>()) {
+                                Err(Ok(neolink_core::Error::UnintelligibleReply{..})) => futures::future::pending().await,
+                                Ok(()) => AnyResult::Ok(()),
+                                Err(Ok(e)) => Err(e.into()),
+                                Err(Err(e)) => Err(e),
+                            }?;
+                        }
+                    }, if config.enable_motion && config.enable_ai => v,
                     // Handle the SNAP (image preview)
                     v = async {
                         let mut wait = IntervalStream::new({

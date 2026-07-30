@@ -1,7 +1,8 @@
-use super::{BcCamera, Error, Result};
+use super::{AiState, BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, error::TryRecvError, Receiver};
+use tokio::sync::watch::{channel as watch, Receiver as WatchReceiver};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -24,9 +25,23 @@ pub struct MotionData {
     cancel: CancellationToken,
     rx: Receiver<Result<MotionStatus>>,
     last_update: MotionStatus,
+    ai_state: WatchReceiver<AiState>,
 }
 
 impl MotionData {
+    /// Watch the AI detection state of the channel.
+    ///
+    /// The camera reports its AI detections in the same alarm messages that
+    /// drive motion, and only one subscriber per message id is allowed, so the
+    /// AI state rides along with the motion listener rather than having its
+    /// own subscription.
+    ///
+    /// The returned watch is updated whenever an alarm event for this channel
+    /// arrives; it starts out empty until the camera reports something.
+    pub fn ai_state(&self) -> WatchReceiver<AiState> {
+        self.ai_state.clone()
+    }
+
     /// Get if motion has been detected. Returns None if
     /// no motion data has yet been recieved from the camera
     ///
@@ -164,7 +179,11 @@ impl MotionData {
 impl BcCamera {
     /// This message tells the camera to send the motion events to us
     /// Which are the recieved on msgid 33
-    async fn start_motion_query(&self) -> Result<u16> {
+    ///
+    /// This is the generic "start sending me events" request: the AI/YOLO
+    /// pushes are gated behind it too, which is why
+    /// [`BcCamera::listen_on_smart_ai`] calls it as well.
+    pub(crate) async fn start_motion_query(&self) -> Result<u16> {
         self.has_ability_rw("motion").await?;
         let connection = self.get_connection();
 
@@ -212,6 +231,8 @@ impl BcCamera {
         // when whenever motion is detected.
         let (tx, rx) = channel(20);
 
+        let (ai_tx, ai_rx) = watch(AiState::default());
+
         let mut set = JoinSet::new();
         let channel_id = self.channel_id;
         let cancel = CancellationToken::new();
@@ -236,6 +257,28 @@ impl BcCamera {
                                     ..
                                 }) = motion_msg.body
                                 {
+                                    // Fold the AI detections of every event for our
+                                    // channel into the shared state before deciding
+                                    // the motion status. This is the only place the
+                                    // camera tells us which AI types fired.
+                                    let mut ours = alarm_event_list
+                                        .alarm_events
+                                        .iter()
+                                        .filter(|e| e.channel_id == channel_id)
+                                        .peekable();
+                                    if ours.peek().is_some() {
+                                        let mut ai_state = ai_tx.borrow().clone();
+                                        ai_state.apply_events(ours);
+                                        ai_tx.send_if_modified(|current| {
+                                            if *current == ai_state {
+                                                false
+                                            } else {
+                                                *current = ai_state;
+                                                true
+                                            }
+                                        });
+                                    }
+
                                     let mut result = MotionStatus::NoChange(Instant::now());
                                     for alarm_event in &alarm_event_list.alarm_events {
                                         if alarm_event.channel_id == channel_id {
@@ -278,6 +321,7 @@ impl BcCamera {
             cancel,
             rx,
             last_update: MotionStatus::NoChange(Instant::now()),
+            ai_state: ai_rx,
         })
     }
 }

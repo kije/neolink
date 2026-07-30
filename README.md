@@ -113,6 +113,74 @@ using the terminal in the same folder the neolink binary is in.
 ./neolink rtsp --config=neolink.toml
 ```
 
+### Audio and Latency
+
+Reolink cameras send audio either as AAC or as DVI4 ADPCM.
+
+For AAC cameras neolink passes the compressed audio straight through to the
+RTSP client as `MP4A-LATM` (RFC 6416). Nothing is decoded, resampled or
+re-encoded, so the audio adds no codec latency and costs the camera's own
+bitrate (typically 16-32kbps) instead of the ~256kbps that raw 16kHz mono
+samples need.
+
+If you have a client that cannot handle `MP4A-LATM` you can ask neolink to
+decode the audio and send raw `L16` samples instead, which is what it always
+used to do:
+
+```toml
+[[cameras]]
+name = "Camera01"
+username = "admin"
+password = "password"
+uid = "ABCDEF0123456789"
+audio_format = "pcm"   # "latm" (default) or "pcm"
+```
+
+ADPCM cameras have no RTP passthrough format available and are always decoded
+to `L16`; `audio_format` has no effect on them.
+
+The other latency control is `buffer_duration`, which caps how much media the
+server-side queues may hold, in milliseconds:
+
+```toml
+[[cameras]]
+name = "Camera01"
+username = "admin"
+password = "password"
+uid = "ABCDEF0123456789"
+buffer_duration = 3000   # default
+```
+
+Lowering it reduces how far behind live a client can drift when it briefly
+stops keeping up, at the cost of dropping frames sooner on a congested
+network. Raising it does the opposite. Values below 50ms are treated as 50ms.
+
+### Limiting the frame rate
+
+`max_fps` caps how many video frames per second neolink forwards to its RTSP
+clients. Excess frames are dropped on the way in, before GStreamer sees them,
+which reduces both CPU use and outgoing bandwidth. Audio is never throttled.
+
+```toml
+[[cameras]]
+name = "Camera01"
+username = "admin"
+password = "password"
+uid = "ABCDEF0123456789"
+max_fps = 5   # or fps_limit = 5
+```
+
+Omitting the option, or setting it to `0`, means no limit. Each connected
+client is decimated independently, and the frames that do get through keep the
+camera's own capture timestamps, so the media timeline stays correct.
+
+Note that neolink drops frames rather than re-encoding the stream. H.264 and
+H.265 P-frames are predicted from earlier frames, so removing some of them
+leaves the survivors referencing frames that never arrived, and a decoder will
+show artefacts until the next keyframe. Use `max_fps` where that is acceptable
+— periodic still grabs, motion snapshots, or a hard bandwidth ceiling — and
+leave it unset for normal live viewing.
+
 ### Discovery
 
 To connect to a camera using a UID we need to find the IP address of the camera
@@ -248,6 +316,12 @@ Status Messages:
   pir status
 - `/status/motion` Contains the motion detection alarm status. `on` for motion
   and `off` for still, only published when `enable_moton` is true in the config
+- `/status/ai` A comma separated list of the AI types currently detected, or
+  `none`. Only published when `enable_ai` is true in the config
+- `/status/ai/{type}` One topic per AI type (`people`, `vehicle`, `dog_cat`,
+  `face`, `visitor`, `package`, `cry`), `on` while that type is detected and
+  `off` otherwise. Types the camera cannot detect simply stay `unknown`.
+  Requires an AI capable camera
 - `/status/ptz/preset` Sent in reply to a `/query/ptz/preset` an XML encoded
   version of the PTZ presets
 - `/status/preview` a base64 encoded camera image updated every 2s. Not
@@ -330,6 +404,10 @@ enable_motion = false        # motion detection
                              # (limited battery drain since it
                              # is a passive listening connection)
                              #
+enable_ai = false            # per AI type detections in `/status/ai/*`
+                             # (no extra battery drain: these arrive on the
+                             # same connection as motion detection)
+                             #
 enable_light = false         # flood lights only available on some camera
                              # (limited battery drain since it
                              # is a passive listening connection)
@@ -373,6 +451,9 @@ Available features are:
 - `ir`: This adds a selection switch to chage the IR light on/off/auto to home
   assistant
 - `motion`: This adds a motion detection binary sensor to home assistant
+- `ai`: This adds one binary sensor per AI type (person, vehicle, pet, face,
+  visitor, package, baby cry) to home assistant. Only meaningful on cameras
+  with AI detection; sensors for types the camera cannot detect stay unknown
 - `reboot`: This adds a reboot button to home assistant
 - `pt`: This adds a selection of buttons to control the pan and tilt of the
   camera
@@ -567,6 +648,25 @@ name = "driveway"
 | Device | `GetDeviceInformation`, `GetSystemDateAndTime`, `GetCapabilities`, `GetServices`, `GetServiceCapabilities`, `GetHostname`, `GetScopes` |
 | Media  | `GetProfiles`, `GetProfile`, `GetStreamUri`, `GetSnapshotUri`, `GetVideoSources`, `GetVideoEncoderConfigurations` |
 | PTZ    | `GetNodes`, `GetConfigurations`, `GetConfigurationOptions`, `ContinuousMove`, `RelativeMove`, `AbsoluteMove` (zoom only), `Stop`, `GetStatus`, `GetPresets`, `GotoPreset`, `SetPreset`, `GotoHomePosition` |
+| Events | `GetEventProperties`, `CreatePullPointSubscription`, `Subscribe`, `PullMessages`, `Renew`, `Unsubscribe` |
+
+The Events service publishes the same topics a Reolink camera publishes
+natively, so a VMS sees the bridge as it would see the camera:
+
+| Topic | Meaning |
+|---|---|
+| `tns1:VideoSource/MotionAlarm` | Motion |
+| `tns1:RuleEngine/MyRuleDetector/PeopleDetect` | Person detected |
+| `tns1:RuleEngine/MyRuleDetector/VehicleDetect` | Vehicle detected |
+| `tns1:RuleEngine/MyRuleDetector/DogCatDetect` | Pet detected |
+| `tns1:RuleEngine/MyRuleDetector/FaceDetect` | Face detected |
+| `tns1:RuleEngine/MyRuleDetector/Visitor` | Doorbell press |
+| `tns1:RuleEngine/MyRuleDetector/Package` | Package detected |
+| `tns1:RuleEngine/FieldDetector/ObjectsInside` | A smart-AI zone triggered; the `Rule` item names the detector (`crossline`, `intrusion`, `loitering`, `legacy`, `loss`) |
+| `tns1:AudioAnalytics/Audio/DetectedSound` | Baby cry detected |
+
+These are the topics Home Assistant's ONVIF integration parses, so AI
+detections show up as binary sensors without any extra configuration.
 
 `GetSnapshotUri` returns `http://<host>:<onvif_port>/onvif/<camera>/snapshot/<stream>`;
 that URL serves a JPEG produced by Reolink's `SNAP` command (HTTP Basic auth,
@@ -590,8 +690,11 @@ ONVIF spec: `GetSystemDateAndTime`, `GetCapabilities`, `GetServices`,
   absolute PT coordinates, so `AbsoluteMove` for pan/tilt returns the
   standard `ter:NoAbsolutePTZSpace` fault. Profile S explicitly allows this
   on continuous-only devices; `RelativeMove` and `ContinuousMove` work.
-- **No Profile T (Events)** yet. Motion / IO alarms aren't surfaced via
-  ONVIF — use the MQTT surface for those today.
+- **PullPoint events only.** Motion and AI detections are delivered through
+  PullPoint subscriptions, which every VMS we target supports. Push
+  (`NotificationConsumer`) subscriptions, an optional part of Profile T, are
+  not implemented. The client-supplied topic `Filter` is ignored: like a real
+  camera, every subscription receives every topic.
 - **No HTTPS yet** on the ONVIF port. Run behind a TLS-terminating reverse
   proxy if you need it.
 
@@ -642,6 +745,41 @@ neolink battery --config=config.toml CameraName
 ```
 
 This will produce an xml formatted battery status on stdout for processing
+
+### AI Detection
+
+Second generation Reolink cameras (Duo 3, TrackMix, CX series, Argus Eco
+Ultra, ...) expose their AI detectors over the Baichuan protocol. The `ai`
+subcommand reads and configures them.
+
+```bash
+# Dump the configured smart-AI zones (all five detectors, or name one)
+neolink ai --config=config.toml CameraName zones
+neolink ai --config=config.toml CameraName zones intrusion
+
+# Read, then change, the alarm settings of one AI type
+neolink ai --config=config.toml CameraName alarm people
+neolink ai --config=config.toml CameraName alarm people --sensitivity 60
+
+# Read and set the baby-cry detection sensitivity
+neolink ai --config=config.toml CameraName cry
+neolink ai --config=config.toml CameraName cry 50
+
+# Dump the AiCfg block (auto tracking plus cry detection)
+neolink ai --config=config.toml CameraName cfg
+
+# Follow detections live
+neolink ai --config=config.toml CameraName watch
+```
+
+Detections themselves do not need this subcommand: they are published to
+MQTT under `/status/ai/*` and over ONVIF as the `tns1:RuleEngine/...` topics,
+both described above.
+
+The detection *zones* are read-only for now. Reolink expects the whole zone
+container to be written back, and the zone geometry it contains has not been
+captured from a real camera yet — writing a partially understood container
+could erase a configured detection line or area.
 
 ### PIR
 

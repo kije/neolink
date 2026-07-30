@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{MdState, NeoCamCommand, NeoCamThreadState, Permit};
 use crate::{config::CameraConfig, AnyResult, Result};
-use neolink_core::bc_protocol::BcCamera;
+use neolink_core::bc_protocol::{AiState, BcCamera};
 
 #[cfg(feature = "gstreamer")]
 mod gst;
@@ -234,6 +234,17 @@ impl NeoInstance {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control
             .send(NeoCamCommand::Motion(instance_tx))
+            .await?;
+        Ok(instance_rx.await?)
+    }
+
+    /// Watch the AI detections (people, vehicle, dog_cat, ...) of this camera.
+    ///
+    /// These come from the same alarm messages as [`NeoInstance::motion`].
+    pub(crate) async fn ai(&self) -> Result<WatchReceiver<AiState>> {
+        let (instance_tx, instance_rx) = oneshot();
+        self.camera_control
+            .send(NeoCamCommand::Ai(instance_tx))
             .await?;
         Ok(instance_rx.await?)
     }

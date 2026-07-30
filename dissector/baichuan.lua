@@ -196,8 +196,24 @@ local message_types = {
   [294]="<StartZoomFocus> (read)",
   [295]="<StartZoomFocus> (write)",
   [299]="<AiCfg>",
+  [300]="<AiCfg> (write)",
   [319]="<timelapseCfg>",
   [342]="<AiDetectCfg>",
+  [343]="<AiDetectCfg> (write)",
+  [527]="<CrosslineDetect>",
+  [528]="<CrosslineDetect> (write)",
+  [529]="<IntrusionDetect>",
+  [530]="<IntrusionDetect> (write)",
+  [531]="<LoiteringDetect>",
+  [532]="<LoiteringDetect> (write)",
+  [549]="<LegacyDetect>",
+  [550]="<LegacyDetect> (write)",
+  [551]="<LossDetect>",
+  [552]="<LossDetect> (write)",
+  -- 600/696 push the YOLO detections. The inner <YoloWorldType> is confirmed,
+  -- the list/event wrapper names are inferred and need a capture.
+  [600]="YOLO detect (push)",
+  [696]="YOLO detect detailed (push)",
 }
 
 local message_classes = {

@@ -36,6 +36,7 @@ use log::*;
 use std::fs;
 use validator::Validate;
 
+mod ai;
 mod battery;
 mod cmdline;
 mod common;
@@ -151,6 +152,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Users(opts)) => {
             users::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Ai(opts)) => {
+            ai::main(opts, neo_reactor.clone()).await?;
         }
     }
 

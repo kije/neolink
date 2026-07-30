@@ -40,11 +40,16 @@ bind = "0.0.0.0"
 #     http://<host>:<bind_port>/onvif/<camera-name>/device_service
 # VMS clients (Home Assistant, Frigate, BlueIris, ...) can then discover the
 # camera over WS-Discovery, fetch the RTSP URL automatically, control PTZ,
-# and subscribe to motion-detection events via the ONVIF Events service
-# (PullPoint subscriptions). The standard topic
+# and subscribe to motion and AI events via the ONVIF Events service
+# (PullPoint subscriptions). The standard topics
 #     tns1:VideoSource/MotionAlarm
-# is published whenever the camera reports motion start/stop, so VMS clients
-# that record on motion (Frigate, BlueIris, ...) work out of the box.
+#     tns1:RuleEngine/MyRuleDetector/{PeopleDetect,VehicleDetect,DogCatDetect,
+#                                     FaceDetect,Visitor,Package}
+#     tns1:RuleEngine/FieldDetector/ObjectsInside   (smart-AI zones)
+#     tns1:AudioAnalytics/Audio/DetectedSound       (baby cry)
+# are published as the camera reports them, so VMS clients that record on
+# motion or on a person/vehicle detection (Frigate, BlueIris, ...) work out of
+# the box.
 # [onvif]
 # enabled = true
 # bind = "0.0.0.0"
@@ -62,6 +67,9 @@ address = "192.168.1.187:9000"
 # mqtt.discovery.topic = "homeassistant" # Uncomment to enable
 # If using discovery, _ characters are replaced with spaces in the name and title case is applied
 # mqtt.discovery.features = ["floodlight"] # Uncomment if this camera has a spotlight/floodlight
+# Add "ai" to features for one binary sensor per AI type (person, vehicle, pet,
+# face, visitor, package, baby cry) on cameras that support AI detection.
+# mqtt.enable_ai = false                 # Uncomment to stop publishing /status/ai/*
 
 # If you use a battery camera: **Instead** of an `address` supply the uid
 # as follows
@@ -100,6 +108,41 @@ address = "192.168.1.187:9000"
 # - Xml
 #
 # print_format = "None"
+
+# How the camera's audio is delivered over RTSP.
+#
+# "latm" (the default) passes AAC through untouched as MP4A-LATM (RFC 6416).
+#        No decoding happens, so there is no codec latency and the audio uses
+#        the camera's own bitrate rather than ~256kbps of raw samples.
+#        Understood by ffmpeg, VLC, go2rtc (Home Assistant, Frigate) and
+#        Blue Iris.
+# "pcm"  decodes the audio and sends raw L16 samples. Slower and much larger,
+#        but understood by everything. Use this if your client cannot play
+#        MP4A-LATM.
+#
+# ADPCM cameras are always decoded to L16 and ignore this setting.
+#
+# audio_format = "latm"
+
+# How much media the server side queues may hold, in milliseconds.
+# This bounds how far behind live a client can drift when it stops keeping
+# up. Lower drops frames sooner but stays closer to live; higher rides out
+# congestion at the cost of latency. Minimum effective value is 50.
+#
+# buffer_duration = 3000
+
+# Cap the RTSP output at this many frames per second. Excess video frames are
+# dropped before they reach GStreamer, which cuts CPU and bandwidth. Audio is
+# never throttled. Omitted (or 0) means no limit. `fps_limit` is accepted as an
+# alias.
+#
+# Frames are dropped, not re-encoded, so this only suits consumers that tolerate
+# a broken inter-frame chain (still grabs, motion snapshots, bandwidth caps).
+# Dropping P-frames leaves the frames that referenced them incomplete, so a
+# decoder playing the stream back will show artefacts until the next keyframe.
+# Leave this unset for normal live viewing.
+#
+# max_fps = 5
 
 # Per-camera ONVIF settings (only meaningful when the global [onvif] block is
 # enabled). Each camera can opt out by setting `enabled = false`.

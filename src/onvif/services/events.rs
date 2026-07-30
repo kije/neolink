@@ -8,9 +8,13 @@
 //! * `subscription/{id}` — per-subscription endpoint. Handles `PullMessages`,
 //!   `Renew`, `Unsubscribe`.
 //!
-//! Only one topic is published: `tns1:VideoSource/MotionAlarm`, fed from the
-//! existing motion-detection watcher in `src/common/mdthread.rs` via
-//! `NeoInstance::motion()`. See `src/onvif/events.rs` for the manager.
+//! The published topics are `tns1:VideoSource/MotionAlarm`, the
+//! `tns1:RuleEngine/MyRuleDetector/*` AI detectors,
+//! `tns1:RuleEngine/FieldDetector/ObjectsInside` for the smart-AI zones and
+//! `tns1:AudioAnalytics/Audio/DetectedSound` for baby cry. They are fed from
+//! the motion and AI watchers in `src/common/mdthread.rs` via
+//! `NeoInstance::motion()` / `NeoInstance::ai()`. See `src/onvif/events.rs`
+//! for the manager.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -155,6 +159,14 @@ pub(crate) async fn dispatch_subscription(
             cam.events.remove(sub_id).await;
             "<wsnt:UnsubscribeResponse/>".to_string()
         }
+        // Home Assistant calls this on every subscription right after creating
+        // it, and a client may call it any time it thinks it has lost track.
+        // The correct response is to re-send the current state of every
+        // property, which is exactly what seeding does.
+        "SetSynchronizationPoint" => {
+            cam.events.resync(&sub).await;
+            "<tev:SetSynchronizationPointResponse/>".to_string()
+        }
         // Pause/Resume aren't supported (we don't pause notification generation).
         other => {
             return Err(FaultBody {
@@ -167,9 +179,15 @@ pub(crate) async fn dispatch_subscription(
 }
 
 fn get_event_properties_xml() -> String {
-    // We expose a single concrete topic. The TopicNamespaceLocation is the
-    // canonical ONVIF topic-namespace URL; clients use it for documentation
-    // only — they don't need to fetch it.
+    // The topic set mirrors what a Reolink camera natively advertises: plain
+    // motion, the per-AI-type rule detectors, the smart-AI zone detector and
+    // audio (baby cry). The TopicNamespaceLocation is the canonical ONVIF
+    // topic-namespace URL; clients use it for documentation only — they don't
+    // need to fetch it.
+    //
+    // Note the client-supplied topic Filter is not applied: like a real
+    // camera, every subscription receives every topic, and clients ignore the
+    // topics they do not care about.
     "<tev:GetEventPropertiesResponse>\
 <tev:TopicNamespaceLocation>http://www.onvif.org/onvif/ver10/topics/topicns.xml</tev:TopicNamespaceLocation>\
 <wsnt:FixedTopicSet>true</wsnt:FixedTopicSet>\
@@ -186,6 +204,72 @@ fn get_event_properties_xml() -> String {
 </tt:MessageDescription>\
 </MotionAlarm>\
 </tns1:VideoSource>\
+<tns1:RuleEngine wstop:topic=\"false\">\
+<MyRuleDetector wstop:topic=\"false\">\
+<PeopleDetect wstop:topic=\"true\">\
+<tt:MessageDescription IsProperty=\"true\">\
+<tt:Source><tt:SimpleItemDescription Name=\"Source\" Type=\"tt:ReferenceToken\"/></tt:Source>\
+<tt:Data><tt:SimpleItemDescription Name=\"State\" Type=\"xsd:boolean\"/></tt:Data>\
+</tt:MessageDescription>\
+</PeopleDetect>\
+<VehicleDetect wstop:topic=\"true\">\
+<tt:MessageDescription IsProperty=\"true\">\
+<tt:Source><tt:SimpleItemDescription Name=\"Source\" Type=\"tt:ReferenceToken\"/></tt:Source>\
+<tt:Data><tt:SimpleItemDescription Name=\"State\" Type=\"xsd:boolean\"/></tt:Data>\
+</tt:MessageDescription>\
+</VehicleDetect>\
+<DogCatDetect wstop:topic=\"true\">\
+<tt:MessageDescription IsProperty=\"true\">\
+<tt:Source><tt:SimpleItemDescription Name=\"Source\" Type=\"tt:ReferenceToken\"/></tt:Source>\
+<tt:Data><tt:SimpleItemDescription Name=\"State\" Type=\"xsd:boolean\"/></tt:Data>\
+</tt:MessageDescription>\
+</DogCatDetect>\
+<FaceDetect wstop:topic=\"true\">\
+<tt:MessageDescription IsProperty=\"true\">\
+<tt:Source><tt:SimpleItemDescription Name=\"Source\" Type=\"tt:ReferenceToken\"/></tt:Source>\
+<tt:Data><tt:SimpleItemDescription Name=\"State\" Type=\"xsd:boolean\"/></tt:Data>\
+</tt:MessageDescription>\
+</FaceDetect>\
+<Visitor wstop:topic=\"true\">\
+<tt:MessageDescription IsProperty=\"true\">\
+<tt:Source><tt:SimpleItemDescription Name=\"Source\" Type=\"tt:ReferenceToken\"/></tt:Source>\
+<tt:Data><tt:SimpleItemDescription Name=\"State\" Type=\"xsd:boolean\"/></tt:Data>\
+</tt:MessageDescription>\
+</Visitor>\
+<Package wstop:topic=\"true\">\
+<tt:MessageDescription IsProperty=\"true\">\
+<tt:Source><tt:SimpleItemDescription Name=\"Source\" Type=\"tt:ReferenceToken\"/></tt:Source>\
+<tt:Data><tt:SimpleItemDescription Name=\"State\" Type=\"xsd:boolean\"/></tt:Data>\
+</tt:MessageDescription>\
+</Package>\
+</MyRuleDetector>\
+<FieldDetector wstop:topic=\"false\">\
+<ObjectsInside wstop:topic=\"true\">\
+<tt:MessageDescription IsProperty=\"true\">\
+<tt:Source>\
+<tt:SimpleItemDescription Name=\"VideoSourceConfigurationToken\" Type=\"tt:ReferenceToken\"/>\
+<tt:SimpleItemDescription Name=\"VideoAnalyticsConfigurationToken\" Type=\"tt:ReferenceToken\"/>\
+<tt:SimpleItemDescription Name=\"Rule\" Type=\"xsd:string\"/>\
+</tt:Source>\
+<tt:Data><tt:SimpleItemDescription Name=\"IsInside\" Type=\"xsd:boolean\"/></tt:Data>\
+</tt:MessageDescription>\
+</ObjectsInside>\
+</FieldDetector>\
+</tns1:RuleEngine>\
+<tns1:AudioAnalytics wstop:topic=\"false\">\
+<Audio wstop:topic=\"false\">\
+<DetectedSound wstop:topic=\"true\">\
+<tt:MessageDescription IsProperty=\"true\">\
+<tt:Source>\
+<tt:SimpleItemDescription Name=\"AudioSourceConfigurationToken\" Type=\"tt:ReferenceToken\"/>\
+<tt:SimpleItemDescription Name=\"AudioAnalyticsConfigurationToken\" Type=\"tt:ReferenceToken\"/>\
+<tt:SimpleItemDescription Name=\"Rule\" Type=\"xsd:string\"/>\
+</tt:Source>\
+<tt:Data><tt:SimpleItemDescription Name=\"IsSoundDetected\" Type=\"xsd:boolean\"/></tt:Data>\
+</tt:MessageDescription>\
+</DetectedSound>\
+</Audio>\
+</tns1:AudioAnalytics>\
 </wstop:TopicSet>\
 <wsnt:TopicExpressionDialect>http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet</wsnt:TopicExpressionDialect>\
 <wsnt:TopicExpressionDialect>http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete</wsnt:TopicExpressionDialect>\
@@ -260,23 +344,38 @@ fn render_pull_messages_response(term: DateTime<Utc>, msgs: Vec<Notification>) -
 }
 
 fn render_notification(n: &Notification) -> String {
+    let render_items = |items: &[(&'static str, String)]| -> String {
+        items
+            .iter()
+            .map(|(name, value)| {
+                format!(
+                    "<tt:SimpleItem Name=\"{name}\" Value=\"{value}\"/>",
+                    value = xml_escape(value)
+                )
+            })
+            .collect()
+    };
+    // The topic dialect must be the ONVIF ConcreteSet one, not the plain
+    // WS-Topics Concrete dialect: every real camera capture uses it, and
+    // `reolink_aio` matches on it literally
+    // (`Topic[@Dialect='http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet']`),
+    // discarding the notification outright when it differs. It is also the
+    // first dialect this service advertises in GetEventProperties.
     format!(
         "<wsnt:NotificationMessage>\
-<wsnt:Topic Dialect=\"http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete\">{topic}</wsnt:Topic>\
+<wsnt:Topic Dialect=\"http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet\">{topic}</wsnt:Topic>\
 <wsnt:Message>\
 <tt:Message UtcTime=\"{ts}\" PropertyOperation=\"{op}\">\
-<tt:Source><tt:SimpleItem Name=\"{sname}\" Value=\"{sval}\"/></tt:Source>\
-<tt:Data><tt:SimpleItem Name=\"{dname}\" Value=\"{dval}\"/></tt:Data>\
+<tt:Source>{source}</tt:Source>\
+<tt:Data>{data}</tt:Data>\
 </tt:Message>\
 </wsnt:Message>\
 </wsnt:NotificationMessage>",
         topic = n.topic,
         ts = format_dt(n.utc_time),
         op = n.property_op,
-        sname = n.source_name,
-        sval = xml_escape(&n.source_value),
-        dname = n.data_name,
-        dval = xml_escape(&n.data_value),
+        source = render_items(&n.source),
+        data = render_items(&n.data),
     )
 }
 
@@ -499,10 +598,8 @@ mod tests {
         let n = Notification {
             utc_time: Utc::now(),
             topic: "tns1:VideoSource/MotionAlarm",
-            source_name: "Source",
-            source_value: "vsrc_cam1".to_string(),
-            data_name: "State",
-            data_value: "true".to_string(),
+            source: vec![("Source", "vsrc_cam1".to_string())],
+            data: vec![("State", "true".to_string())],
             property_op: "Changed",
         };
         let xml = render_notification(&n);
