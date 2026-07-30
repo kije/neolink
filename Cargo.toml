@@ -25,10 +25,10 @@ dirs = {version = "6.0.0", optional = true}
 env_logger = "0.11.11"
 fcm-push-listener = {version = "2.0.3", optional = true}
 futures = "0.3.33"
-gstreamer = {version = "0.23.7", optional = true}
-gstreamer-app = { version = "0.23.5", features = ["v1_20"], optional = true }
-gstreamer-rtsp = { version = "0.23.5", features = ["v1_20"], optional = true }
-gstreamer-rtsp-server = { version = "0.23.5", features = ["v1_20"], optional = true }
+gstreamer = {version = "0.24.5", optional = true}
+gstreamer-app = { version = "0.24.5", features = ["v1_20"], optional = true }
+gstreamer-rtsp = { version = "0.24.5", features = ["v1_20"], optional = true }
+gstreamer-rtsp-server = { version = "0.24.5", features = ["v1_20"], optional = true }
 heck = "0.5.0"
 log = { version = "0.4.33", features = [ "release_max_level_debug" ] }
 md5 = {version = "0.8.1", optional = true}
@@ -45,9 +45,9 @@ socket2 = "0.6.5"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-util", "tracing"] }
 tokio-stream = "0.1.19"
 tokio-util = { version = "0.7.19", features = ["full", "tracing"] }
-toml = "0.8.23"
+toml = "1.1.4"
 uuid = { version = "1.24.0", features = ["v4", "v5"] }
-validator = {version="0.18.1", features = ["derive"] }
+validator = {version="0.21.0", features = ["derive"] }
 
 [dev-dependencies]
 # `ServiceExt::oneshot`, so the ONVIF router can be exercised without binding a
