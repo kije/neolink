@@ -12,6 +12,15 @@ env:
   # (clap 4.6, toml 1.1, cpufeatures 0.3, getrandom 0.4, ...) are edition 2024,
   # which needs Cargo >= 1.85 just to parse their manifests.
   rust_version: "1.88.0"
+  # GStreamer version for macOS and Windows, which install it from upstream
+  # packages rather than from a distro. Upstream only keeps the FINAL point
+  # release of each series, so pinning a non-final patch (as 1.20.4 and 1.24.2
+  # were) eventually 404s. 1.26.9 is the newest version available on every
+  # channel we need: the macOS devel+runtime pkgs, the Chocolatey `gstreamer`
+  # and `gstreamer-devel` packages, and the upstream MSVC MSIs those pull.
+  # Note 1.26.11 exists on macOS but NOT on Chocolatey, so do not "bump" to it.
+  # This is a minimum-version bump only; the crates' `v1_20` feature is a floor.
+  gstreamer_version: "1.26.9"
 
 jobs:
   pre_job:
@@ -36,7 +45,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-12, macos-14] # macos-14+ is arm64
+        # macos-14+ is arm64. macos-12 was removed by GitHub in Dec 2024 — jobs
+        # targeting it never start, so macos-13 is the x86_64 runner to use.
+        os: [ubuntu-22.04, windows-2022, macos-13, macos-14]
     steps:
       - uses: actions/checkout@v4
         name: Checkout onto ${{ runner.os }}
@@ -45,13 +56,18 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y aptitude
-          sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
+          sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev protobuf-compiler libssl-dev
       - if: runner.os == 'Windows'
         name: Install Windows deps
         run: |
-          # Gstreamer
-          choco install -y --no-progress gstreamer --version=1.24.2
-          choco install -y --no-progress gstreamer-devel --version=1.24.2
+          # Gstreamer. The choco packages download their MSIs from
+          # gstreamer.freedesktop.org at install time, so a version whose
+          # upstream MSI has been deleted fails here rather than in choco --
+          # which is what happened to 1.24.2: the package resolved fine but
+          # .../data/pkg/windows/1.24.2/msvc/*.msi is now 404, so nothing was
+          # installed and the directory check below failed on an empty path.
+          choco install -y --no-progress gstreamer --version=$env:gstreamer_version
+          choco install -y --no-progress gstreamer-devel --version=$env:gstreamer_version
           $env:GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:SYSTEMDRIVE + '\gstreamer\1.0\msvc_x86_64\'
           # Github runners work on both C or D drive and figuring out which was used is difficult
           if (-not (Test-Path -Path "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64" -PathType Container)) {
@@ -62,8 +78,10 @@ jobs:
           # Proto buffers
           choco install -y --no-progress protoc --version=24.2.0
 
-          # Open SSL
-          choco install -y --no-progress openssl --version=1.1.1.2100
+          # Open SSL. Left unpinned deliberately: the previous pin of
+          # 1.1.1.2100 is an OpenSSL release that has been EOL since 2023, and
+          # openssl-sys 0.9.x supports 3.x fine.
+          choco install -y --no-progress openssl
           $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL-Win64\'
 
           # Alternative openssl location (depends on version that gets installed by choco)
@@ -91,16 +109,22 @@ jobs:
       - if: runner.os == 'macOS'
         name: Install macOS deps
         run: |
-          curl -L 'https://gstreamer.freedesktop.org/data/pkg/osx/1.20.4/gstreamer-1.0-devel-1.20.4-universal.pkg' -o "$(pwd)/gstreamer-devel.pkg"
+          # `-f` matters: without it curl saves upstream's HTML 404 page as the
+          # .pkg and the failure only surfaces later at `installer`, which is
+          # how the dead 1.20.4 pin stayed confusing for so long.
+          gst_pkg="gstreamer-1.0-devel-${gstreamer_version}-universal.pkg"
+          curl -fL "https://gstreamer.freedesktop.org/data/pkg/osx/${gstreamer_version}/${gst_pkg}" -o "$(pwd)/gstreamer-devel.pkg"
           sudo installer -verbose -pkg "$(pwd)/gstreamer-devel.pkg" -target /
           PKG_CONFIG_PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           PKG_CONFIG_GSTREAMER_1_0_PREFIX="/Library/Frameworks/GStreamer.framework/Versions/1.0"
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_GSTREAMER_1_0_PREFIX=${PKG_CONFIG_GSTREAMER_1_0_PREFIX}" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
-          brew install pkg-config protobuf openssl@1.1
-          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@1.1)/include/" >>  "${GITHUB_ENV}"
-          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@1.1)/lib/" >>  "${GITHUB_ENV}"
+          # openssl@1.1 has been removed from homebrew-core (EOL since 2023);
+          # openssl-sys 0.9.x supports OpenSSL 3.x.
+          brew install pkg-config protobuf openssl@3
+          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@3)/include/" >>  "${GITHUB_ENV}"
+          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@3)/lib/" >>  "${GITHUB_ENV}"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -177,7 +201,6 @@ jobs:
           g++-${{ matrix.gcc }} \
           libgstrtspserver-1.0-dev:${{ matrix.arch }} \
           libgstreamer1.0-dev:${{ matrix.arch }} \
-          libgtk2.0-dev:${{ matrix.arch }} \
           libglib2.0-dev:${{ matrix.arch }} \
           libssl-dev:${{ matrix.arch }}
       - name: Install rustup
@@ -215,14 +238,19 @@ jobs:
         id: vars
         shell: bash
         run: |
-          unset HAS_SECRET
-          if [ -n $SECRET ]; then HAS_SECRET='true' ; fi
+          # `$SECRET` must be quoted. Unquoted, an empty secret makes this
+          # `[ -n ]`, which POSIX test evaluates as the one-argument form on the
+          # non-empty string "-n" -- i.e. TRUE. That is why every step below ran
+          # on forks with no DOCKER_TOKEN and docker/login-action then failed
+          # with "Password required".
+          HAS_SECRET='false'
+          if [ -n "$SECRET" ]; then HAS_SECRET='true' ; fi
           echo "HAS_SECRET_TOKEN=${HAS_SECRET}" >> $GITHUB_OUTPUT
         env:
           SECRET: "${{ secrets.DOCKER_TOKEN }}"
       - name: Check out the repo
         uses: actions/checkout@v4
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
       - name: Convert username to lower case for docker
         id: string_user
         uses: ASzc/change-string-case-action@v6
@@ -234,20 +262,20 @@ jobs:
         with:
           string: ${{ github.repository }}
       - name: Set up QEMU
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         uses: docker/login-action@v3
         with:
           registry: docker.io
           username: ${{ vars.DOCKER_USERNAME || steps.string_user.outputs.lowercase }}
           password: ${{ secrets.DOCKER_TOKEN }}
       - name: Set Docker name with owner (package name) depending on if DOCKER_USERNAME is set
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         id: docker_repo
         shell: bash
         run: |
@@ -262,7 +290,7 @@ jobs:
           DOCKER_USERNAME: ${{ vars.DOCKER_USERNAME }}
           GITHUB_NWO: ${{ steps.string_repo.outputs.lowercase }}
       - name: Get tag name
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         id: tags
         shell: bash
         run: |
@@ -329,7 +357,7 @@ jobs:
           name: release-i386-bookworm
           path: linux/386
       - name: Push to Docker Hub
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN == 'true' }}
         uses: docker/build-push-action@v5
         with:
           platforms: linux/amd64,linux/arm/v7,linux/arm64,linux/386
@@ -371,7 +399,8 @@ jobs:
       - name: Download Macos
         uses: actions/download-artifact@v4
         with:
-          name: release-macos-12
+          # Must match `release-${{ matrix.os }}` from the native job's upload.
+          name: release-macos-13
           path: neolink_macos_intel
       - name: Download Macos arm64
         uses: actions/download-artifact@v4
