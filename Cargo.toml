@@ -36,7 +36,7 @@ neolink_core = { path = "crates/core", version = "0.6.3-rc.3" }
 percent-encoding = "2.3.2"
 quick-xml = { version = "0.41.0", features = ["serialize"] }
 regex = "1.13.1"
-rumqttc = "0.24.0"
+rumqttc = "0.25.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha1 = "0.11.0"
