@@ -155,6 +155,32 @@ Lowering it reduces how far behind live a client can drift when it briefly
 stops keeping up, at the cost of dropping frames sooner on a congested
 network. Raising it does the opposite. Values below 50ms are treated as 50ms.
 
+### Limiting the frame rate
+
+`max_fps` caps how many video frames per second neolink forwards to its RTSP
+clients. Excess frames are dropped on the way in, before GStreamer sees them,
+which reduces both CPU use and outgoing bandwidth. Audio is never throttled.
+
+```toml
+[[cameras]]
+name = "Camera01"
+username = "admin"
+password = "password"
+uid = "ABCDEF0123456789"
+max_fps = 5   # or fps_limit = 5
+```
+
+Omitting the option, or setting it to `0`, means no limit. Each connected
+client is decimated independently, and the frames that do get through keep the
+camera's own capture timestamps, so the media timeline stays correct.
+
+Note that neolink drops frames rather than re-encoding the stream. H.264 and
+H.265 P-frames are predicted from earlier frames, so removing some of them
+leaves the survivors referencing frames that never arrived, and a decoder will
+show artefacts until the next keyframe. Use `max_fps` where that is acceptable
+— periodic still grabs, motion snapshots, or a hard bandwidth ceiling — and
+leave it unset for normal live viewing.
+
 ### Discovery
 
 To connect to a camera using a UID we need to find the IP address of the camera

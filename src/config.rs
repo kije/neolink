@@ -299,6 +299,18 @@ pub(crate) struct CameraConfig {
     #[serde(default = "default_false", alias = "idle", alias = "idle_disc")]
     pub(crate) idle_disconnect: bool,
 
+    /// Limit the RTSP output to at most this many frames per second.
+    /// When set, the ingest path drops excess video frames before they enter
+    /// the GStreamer pipeline, reducing both CPU load and RTSP bandwidth.
+    /// Audio is never throttled. `null` / omitted (or `0`) means no limit.
+    ///
+    /// Frames are dropped rather than re-encoded, so the inter-frame
+    /// prediction chain is broken and decoders will show artefacts until the
+    /// next keyframe. Intended for still grabs and bandwidth caps, not for
+    /// normal live viewing. See the README for the full caveat.
+    #[serde(default, alias = "fps_limit")]
+    pub(crate) max_fps: Option<u32>,
+
     #[validate(nested)]
     #[serde(default)]
     pub(crate) onvif: OnvifCameraConfig,
