@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use neolink_core::bc_protocol::{BcCamera, Direction};
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use tokio::time::{sleep, Duration};
 
 use crate::onvif::services::device::FaultBody;
@@ -94,7 +94,7 @@ fn parse_velocity(xml: &str, wrapper: &str) -> Velocity {
                     for a in e.attributes().flatten() {
                         let k = std::str::from_utf8(a.key.into_inner()).unwrap_or("");
                         let val: f32 = a
-                            .unescape_value()
+                            .normalized_value(XmlVersion::Explicit1_0)
                             .unwrap_or_default()
                             .parse()
                             .unwrap_or(0.0);
@@ -110,7 +110,7 @@ fn parse_velocity(xml: &str, wrapper: &str) -> Velocity {
                         let k = std::str::from_utf8(a.key.into_inner()).unwrap_or("");
                         if k == "x" {
                             v.zoom = a
-                                .unescape_value()
+                                .normalized_value(XmlVersion::Explicit1_0)
                                 .unwrap_or_default()
                                 .parse()
                                 .unwrap_or(0.0);

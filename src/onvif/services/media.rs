@@ -322,9 +322,13 @@ fn other_fault(e: anyhow::Error) -> FaultBody {
 /// Pull the inner text of the first element with the given local name from a
 /// SOAP body fragment. Tolerates namespace prefixes.
 pub(crate) fn read_first_text_element(xml: &str, local: &str) -> Option<String> {
+    // See `soap::push_entity_ref`: the value is accumulated across events
+    // because an entity reference no longer arrives inside `Event::Text`. This
+    // one matters -- it reads profile and PTZ tokens straight out of client
+    // requests, and those are echoed back for the client to match on.
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
     let mut in_target = false;
+    let mut text = String::new();
     loop {
         match reader.read_event() {
             Err(_) => return None,
@@ -336,11 +340,21 @@ pub(crate) fn read_first_text_element(xml: &str, local: &str) -> Option<String> 
                 let local_name = s.rsplit(':').next().unwrap_or(s);
                 if local_name == local {
                     in_target = true;
+                    text.clear();
                 }
             }
-            Ok(Event::End(_)) => in_target = false,
-            Ok(Event::Text(t)) if in_target => {
-                return Some(t.unescape().unwrap_or_default().to_string());
+            Ok(Event::End(_)) => {
+                if in_target {
+                    let found = std::mem::take(&mut text).trim().to_string();
+                    if !found.is_empty() {
+                        return Some(found);
+                    }
+                }
+                in_target = false;
+            }
+            Ok(Event::Text(t)) if in_target => text.push_str(&t.decode().unwrap_or_default()),
+            Ok(Event::GeneralRef(r)) if in_target => {
+                crate::onvif::soap::push_entity_ref(&mut text, &r)
             }
             _ => {}
         }
@@ -357,6 +371,31 @@ mod tests {
         assert_eq!(
             read_first_text_element(xml, "ProfileToken").as_deref(),
             Some("profile_foo_main")
+        );
+    }
+
+    /// A profile token containing an entity reference must survive the read.
+    /// The token is echoed back to the client, which matches on it, so losing a
+    /// character here means the client silently never finds its own profile.
+    #[test]
+    fn read_text_element_with_entity_references() {
+        let xml = r#"<trt:GetStreamUri xmlns:trt="x"><trt:ProfileToken>a&amp;b&lt;c&gt;d&quot;e&apos;f</trt:ProfileToken></trt:GetStreamUri>"#;
+        assert_eq!(
+            read_first_text_element(xml, "ProfileToken").as_deref(),
+            Some(r#"a&b<c>d"e'f"#)
+        );
+    }
+
+    /// Entity references split the text run, so the spaces on either side of
+    /// one must not be swallowed. This is why the reader no longer sets
+    /// `trim_text(true)` -- that trims each run separately, which would turn
+    /// `main &amp; sub` into `main&sub`.
+    #[test]
+    fn read_text_element_keeps_spaces_around_entities() {
+        let xml = r#"<trt:X xmlns:trt="x"><trt:ProfileToken>  main &amp; sub  </trt:ProfileToken></trt:X>"#;
+        assert_eq!(
+            read_first_text_element(xml, "ProfileToken").as_deref(),
+            Some("main & sub")
         );
     }
 

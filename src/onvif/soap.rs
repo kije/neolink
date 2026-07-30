@@ -18,7 +18,10 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::{DateTime, Utc};
-use quick_xml::{events::Event, Reader};
+use quick_xml::{
+    events::{BytesRef, Event},
+    Reader, XmlVersion,
+};
 use sha1::{Digest, Sha1};
 
 /// Result of parsing an incoming SOAP request.
@@ -53,9 +56,38 @@ pub(crate) enum Credential {
     Digest(String),
 }
 
+/// Append what a `&...;` reference stands for to `buf`.
+///
+/// Since quick-xml 0.38 an entity reference inside element content is reported
+/// as its own `Event::GeneralRef` rather than being folded into the surrounding
+/// `Event::Text`. Every reader loop in this module therefore has to reassemble
+/// the text itself; dropping these events silently mangles any value containing
+/// `&`, `<`, `>`, `"` or `'`.
+///
+/// Unknown entities are skipped rather than treated as an error, which matches
+/// what the old `unescape().unwrap_or_default()` did with a value it could not
+/// resolve.
+pub(crate) fn push_entity_ref(buf: &mut String, r: &BytesRef) {
+    // Numeric character reference -- `&#38;` or `&#x26;`.
+    if let Ok(Some(c)) = r.resolve_char_ref() {
+        buf.push(c);
+        return;
+    }
+    // Named reference. XML predefines exactly five.
+    if let Ok(name) = r.decode() {
+        if let Some(text) = quick_xml::escape::resolve_predefined_entity(&name) {
+            buf.push_str(text);
+        }
+    }
+}
+
 pub(crate) fn parse_envelope(xml: &str) -> Result<ParsedRequest<'_>> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // Deliberately *not* `trim_text(true)`. With entity references arriving as
+    // separate events, trimming each text run individually would eat the spaces
+    // around them -- a password of `my pass & word` would come back as
+    // `my pass&word`. Instead the accumulated value is trimmed once, at the
+    // closing tag, which is what trimming a single text run used to do.
 
     // Scan for: WS-Security UsernameToken (in Header) and the first child of Body.
     let mut auth: Option<UsernameToken> = None;
@@ -68,6 +100,9 @@ pub(crate) fn parse_envelope(xml: &str) -> Result<ParsedRequest<'_>> {
     let mut current_created_text: Option<String> = None;
     let mut current_nonce: Option<Vec<u8>> = None;
     let mut current_field: Option<&'static str> = None;
+    // Accumulates the text of the field named by `current_field`, across
+    // however many `Text` and `GeneralRef` events it takes to spell it.
+    let mut current_text = String::new();
 
     let mut action: Option<String> = None;
     let mut body_span: Option<(usize, usize)> = None;
@@ -96,14 +131,19 @@ pub(crate) fn parse_envelope(xml: &str) -> Result<ParsedRequest<'_>> {
                     "Header" => in_header = true,
                     "Security" if in_header => in_security = true,
                     "UsernameToken" if in_security => in_username_token = true,
-                    "Username" if in_username_token => current_field = Some("Username"),
+                    "Username" if in_username_token => {
+                        current_field = Some("Username");
+                        current_text.clear();
+                    }
                     "Password" if in_username_token => {
                         // Detect Type attribute for digest vs text.
                         let mut is_digest = false;
                         for attr in e.attributes().flatten() {
                             let key = local_name(attr.key.into_inner());
                             if key == "Type" {
-                                let v = attr.unescape_value().unwrap_or_default();
+                                let v = attr
+                                    .normalized_value(XmlVersion::Explicit1_0)
+                                    .unwrap_or_default();
                                 if v.contains("#PasswordDigest") {
                                     is_digest = true;
                                 }
@@ -114,9 +154,16 @@ pub(crate) fn parse_envelope(xml: &str) -> Result<ParsedRequest<'_>> {
                         } else {
                             "PasswordText"
                         });
+                        current_text.clear();
                     }
-                    "Nonce" if in_username_token => current_field = Some("Nonce"),
-                    "Created" if in_username_token => current_field = Some("Created"),
+                    "Nonce" if in_username_token => {
+                        current_field = Some("Nonce");
+                        current_text.clear();
+                    }
+                    "Created" if in_username_token => {
+                        current_field = Some("Created");
+                        current_text.clear();
+                    }
                     "Body" => in_body = true,
                     _ => {}
                 }
@@ -157,26 +204,34 @@ pub(crate) fn parse_envelope(xml: &str) -> Result<ParsedRequest<'_>> {
                             });
                         }
                     }
-                    "Username" | "Password" | "Nonce" | "Created" => current_field = None,
-                    _ => {}
-                }
-            }
-            Ok(Event::Text(t)) => {
-                let text = t.unescape().unwrap_or_default().to_string();
-                match current_field {
-                    Some("Username") => current_user = Some(text),
-                    Some("PasswordText") => current_pw = Some(Credential::Plain(text)),
-                    Some("PasswordDigest") => current_pw = Some(Credential::Digest(text)),
-                    Some("Nonce") => current_nonce = B64.decode(text.as_bytes()).ok(),
-                    Some("Created") => {
-                        let trimmed = text.trim().to_string();
-                        current_created = DateTime::parse_from_rfc3339(&trimmed)
-                            .ok()
-                            .map(|t| t.with_timezone(&Utc));
-                        current_created_text = Some(trimmed);
+                    "Username" | "Password" | "Nonce" | "Created" => {
+                        // Commit the accumulated text here rather than on each
+                        // `Text` event: a single value can span several events
+                        // once entity references are involved.
+                        let text = std::mem::take(&mut current_text).trim().to_string();
+                        match current_field {
+                            Some("Username") => current_user = Some(text),
+                            Some("PasswordText") => current_pw = Some(Credential::Plain(text)),
+                            Some("PasswordDigest") => current_pw = Some(Credential::Digest(text)),
+                            Some("Nonce") => current_nonce = B64.decode(text.as_bytes()).ok(),
+                            Some("Created") => {
+                                current_created = DateTime::parse_from_rfc3339(&text)
+                                    .ok()
+                                    .map(|t| t.with_timezone(&Utc));
+                                current_created_text = Some(text);
+                            }
+                            _ => {}
+                        }
+                        current_field = None;
                     }
                     _ => {}
                 }
+            }
+            Ok(Event::Text(t)) if current_field.is_some() => {
+                current_text.push_str(&t.decode().unwrap_or_default());
+            }
+            Ok(Event::GeneralRef(r)) if current_field.is_some() => {
+                push_entity_ref(&mut current_text, &r);
             }
             Ok(Event::Empty(e)) if in_body && body_child_start.is_none() => {
                 let name = local_name(e.name().into_inner());
@@ -520,6 +575,34 @@ mod tests {
         let parsed = parse_envelope(xml).unwrap();
         match parsed.auth.expect("token").credential {
             Credential::Plain(p) => assert_eq!(p, "p&w<q"),
+            _ => panic!("expected plain"),
+        }
+    }
+
+    /// An entity reference splits the text run, and the spaces on either side
+    /// of it must survive. This is why `parse_envelope` no longer sets
+    /// `trim_text(true)`: that trims each run individually, which would turn a
+    /// password of `my pass & word` into `my pass&word`. The value is trimmed
+    /// once, at the closing tag, which is what trimming a single run used to do.
+    #[test]
+    fn parse_password_keeps_spaces_around_entity() {
+        let xml = r#"<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+  <env:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+      <wsse:UsernameToken>
+        <wsse:Username>me</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">  my pass &amp; word  </wsse:Password>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </env:Header>
+  <env:Body>
+    <tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>
+  </env:Body>
+</env:Envelope>"#;
+        let parsed = parse_envelope(xml).unwrap();
+        match parsed.auth.expect("token").credential {
+            // Leading and trailing whitespace trimmed, interior preserved.
+            Credential::Plain(p) => assert_eq!(p, "my pass & word"),
             _ => panic!("expected plain"),
         }
     }

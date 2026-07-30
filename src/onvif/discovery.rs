@@ -95,12 +95,18 @@ fn is_probe(xml: &str) -> bool {
 }
 
 fn extract_msg_id(xml: &str) -> Option<String> {
+    use crate::onvif::soap::push_entity_ref;
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
+    // The text is accumulated rather than returned from the first `Text` event
+    // because since quick-xml 0.38 an entity reference arrives as its own
+    // event, splitting the run. A `MessageID` is a URN and so rarely contains
+    // one -- but "rarely" is how the equivalent bug in the WS-Security parser
+    // would have gone unnoticed too.
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
     let mut in_id = false;
+    let mut text = String::new();
     loop {
         match reader.read_event() {
             Err(_) | Ok(Event::Eof) => return None,
@@ -109,12 +115,20 @@ fn extract_msg_id(xml: &str) -> Option<String> {
                 let s = std::str::from_utf8(name.into_inner()).unwrap_or("");
                 if s.rsplit(':').next().unwrap_or(s) == "MessageID" {
                     in_id = true;
+                    text.clear();
                 }
             }
-            Ok(Event::End(_)) => in_id = false,
-            Ok(Event::Text(t)) if in_id => {
-                return Some(t.unescape().unwrap_or_default().to_string());
+            Ok(Event::End(_)) => {
+                if in_id {
+                    let found = std::mem::take(&mut text).trim().to_string();
+                    if !found.is_empty() {
+                        return Some(found);
+                    }
+                }
+                in_id = false;
             }
+            Ok(Event::Text(t)) if in_id => text.push_str(&t.decode().unwrap_or_default()),
+            Ok(Event::GeneralRef(r)) if in_id => push_entity_ref(&mut text, &r),
             _ => {}
         }
     }
