@@ -21,10 +21,6 @@ env:
   # Note 1.26.11 exists on macOS but NOT on Chocolatey, so do not "bump" to it.
   # This is a minimum-version bump only; the crates' `v1_20` feature is a floor.
   gstreamer_version: "1.26.9"
-  # Windows OpenSSL (Chocolatey). Pinned to 3.x: openssl-sys accepts OpenSSL 4
-  # but the 4.x Win64 installer's library layout is not one it can link against.
-  # macOS uses homebrew's openssl@3 for the same reason.
-  openssl_version: "3.6.2"
 
 jobs:
   pre_job:
@@ -49,9 +45,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-14+ is arm64. macos-12 was removed by GitHub in Dec 2024 — jobs
-        # targeting it never start, so macos-13 is the x86_64 runner to use.
-        os: [ubuntu-22.04, windows-2022, macos-13, macos-14]
+        # GitHub supports only the latest two macOS versions, so these labels
+        # rot fast and a removed label does not fail -- the job just queues
+        # forever, which is how macos-12 and then macos-13 sat pending here.
+        # As of this change: macos-13 is REMOVED from the available images and
+        # macos-14 is marked deprecated. macos-15-intel is the x86_64 runner and
+        # macos-15 is arm64.
+        # NOTE: the release job downloads artifacts named `release-${{ matrix.os }}`,
+        # so changing a label here requires changing it there too.
+        os: [ubuntu-22.04, windows-2022, macos-15-intel, macos-15]
     steps:
       - uses: actions/checkout@v4
         name: Checkout onto ${{ runner.os }}
@@ -99,21 +101,27 @@ jobs:
           # Proto buffers
           choco install -y --no-progress protoc --version=24.2.0
 
-          # Open SSL. Pinned to the 3.x line rather than left floating. The old
-          # 1.1.1.2100 pin was EOL-since-2023, but floating picks up 4.0.1, and
-          # while openssl-sys 0.9.117 ACCEPTS OpenSSL 4 (it emits ossl400 and
-          # only rejects >= OpenSSL 5), the 4.x installer lays its import
-          # libraries out differently and the build then dies with "OpenSSL
-          # libdir at [...] does not contain the required files to either
-          # statically or dynamically link OpenSSL".
-          choco install -y --no-progress openssl --version=$env:openssl_version
-
-          # Locate the install root, then the directory that actually holds the
-          # import libraries. Both matter: previous versions of this step only
-          # guessed the root and assumed "<root>\lib", but the Win64 installers
-          # place libs under lib\VC\x64\MD on some versions. openssl-sys honours
-          # the explicit OPENSSL_LIB_DIR + OPENSSL_INCLUDE_DIR pair, which is
-          # more precise than OPENSSL_DIR, so resolve and set those.
+          # Open SSL: use the copy the runner image already ships, and do not
+          # install one. The windows-2022 image provides OpenSSL 3.x at
+          # C:\Program Files\OpenSSL (libssl-3-x64.dll), which is everything
+          # openssl-sys needs.
+          #
+          # Installing it via Chocolatey was the problem, not the solution. That
+          # package downloads its installer from slproweb.com, which only hosts
+          # the CURRENT build of each line, so ANY pinned version eventually
+          # 404s -- exactly what killed the old 1.1.1.2100 pin and then killed a
+          # 3.6.2 pin too ("Attempt to get headers for
+          # .../Win64OpenSSL-3_6_2.exe failed ... (404) Not Found"). Leaving it
+          # unpinned is no better: that resolves to OpenSSL 4.x, whose library
+          # layout openssl-sys cannot link against even though it accepts the
+          # version. Not installing sidesteps the whole class of failure, and
+          # drops a 245 MB download from every Windows run.
+          #
+          # Resolve the root, then the directory that actually holds the import
+          # libraries -- the Win64 layout puts them under lib\VC\x64\MD, not
+          # <root>\lib, which is what the previous OPENSSL_DIR-only approach
+          # assumed. openssl-sys honours the explicit OPENSSL_LIB_DIR +
+          # OPENSSL_INCLUDE_DIR pair in preference to OPENSSL_DIR.
           $sslRoot = @(
             (Join-Path $env:ProgramFiles 'OpenSSL-Win64'),
             (Join-Path $env:ProgramFiles 'OpenSSL'),
@@ -121,7 +129,7 @@ jobs:
             'C:\Program Files\OpenSSL'
           ) | Where-Object { Test-Path -Path $_ -PathType Container } | Select-Object -First 1
           if (-not $sslRoot) {
-            Write-Error "Could not locate the OpenSSL install root after installing openssl $env:openssl_version."
+            Write-Error "Could not locate a pre-installed OpenSSL on this runner image. If the image stopped shipping OpenSSL, install it here explicitly."
             exit 1
           }
           $sslLib = Get-ChildItem -Path $sslRoot -Recurse -Filter 'libssl.lib' -ErrorAction SilentlyContinue |
@@ -442,12 +450,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           # Must match `release-${{ matrix.os }}` from the native job's upload.
-          name: release-macos-13
+          name: release-macos-15-intel
           path: neolink_macos_intel
       - name: Download Macos arm64
         uses: actions/download-artifact@v4
         with:
-          name: release-macos-14
+          name: release-macos-15
           path: neolink_macos_m1
       - name: Download Linux x86_64
         uses: actions/download-artifact@v4
