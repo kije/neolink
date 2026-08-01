@@ -119,6 +119,12 @@ address = "192.168.1.187:9000"
 # "pcm"  decodes the audio and sends raw L16 samples. Slower and much larger,
 #        but understood by everything. Use this if your client cannot play
 #        MP4A-LATM.
+# "both" offers both as separate audio tracks in the SDP and lets the client
+#        set up the one it wants. Only useful for clients that negotiate
+#        (go2rtc, and so Home Assistant and Frigate): others subscribe to
+#        every track and get both audio streams at once. The decode branch
+#        also runs either way, and a decoder failure on this camera's audio
+#        takes the whole mount down with it, video included.
 #
 # ADPCM cameras are always decoded to L16 and ignore this setting.
 #

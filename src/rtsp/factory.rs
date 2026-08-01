@@ -333,9 +333,13 @@ pub(super) async fn make_factory(
                                         _ => None,
                                     })
                                     .collect::<Vec<_>>();
-                                let use_latm =
-                                    decide_latm(samples, *framing, stream_config.clone()).await;
-                                let src = build_aac(&element, *framing, use_latm, &stream_config)?;
+                                let tracks = decide_audio_tracks_off_thread(
+                                    samples,
+                                    *framing,
+                                    stream_config.clone(),
+                                )
+                                .await;
+                                let src = build_aac(&element, *framing, tracks, &stream_config)?;
                                 AnyResult::Ok(Some(src))
                             }
                             Some(AudioType::Adpcm(block_size)) => {
@@ -940,7 +944,12 @@ const AUD_BUFFER_SIZE: u32 = 512 * 1416;
 /// conversion and a ~10x bitrate increase from the serving path, and it
 /// drops the `fallbackswitch` (which cannot sit in a compressed stream)
 /// along with the buffering it needs to do its silence substitution.
-fn pipe_aac_latm(
+/// The part of the audio pipeline both payload formats share:
+///
+/// ```text
+/// appsrc ! queue ! aacparse
+/// ```
+fn pipe_aac_head(
     bin: &Element,
     framing: AacFraming,
     stream_config: &StreamConfig,
@@ -949,7 +958,6 @@ fn pipe_aac_latm(
         .clone()
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
-    log::debug!("Building Aac LATM passthrough pipeline");
 
     let source = make_appsrc("audsrc", AUD_BUFFER_SIZE)?;
     set_aac_caps(&source, framing);
@@ -959,6 +967,27 @@ fn pipe_aac_latm(
 
     let queue = make_queue("audqueue", AUD_BUFFER_SIZE, stream_config.queue_time)?;
     let parser = make_element("aacparse", "audparser")?;
+
+    bin.add_many([&source, &queue, &parser])?;
+    Element::link_many([&source, &queue, &parser])?;
+
+    let source = source
+        .dynamic_cast::<AppSrc>()
+        .map_err(|_| anyhow!("Cannot convert appsrc"))?;
+    Ok(Linked {
+        appsrc: source,
+        output: parser,
+    })
+}
+
+/// Convert parsed AAC to the `raw` framing `rtpmp4apay` needs, returning
+/// the element the payloader should be linked to.
+fn pipe_aac_latm_tail(bin: &Element, input: &Element) -> Result<Element> {
+    let bin = bin
+        .clone()
+        .dynamic_cast::<Bin>()
+        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
+
     // `rtpmp4apay` only accepts unframed AAC, so ask `aacparse` to convert
     // the camera's ADTS framing to `raw` rather than passing it through.
     let raw_aac = make_element("capsfilter", "audrawcaps")?;
@@ -969,41 +998,19 @@ fn pipe_aac_latm(
             .field("stream-format", "raw")
             .build(),
     );
-
-    bin.add_many([&source, &queue, &parser, &raw_aac])?;
-    Element::link_many([&source, &queue, &parser, &raw_aac])?;
-
-    let source = source
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot convert appsrc"))?;
-    Ok(Linked {
-        appsrc: source,
-        output: raw_aac,
-    })
+    bin.add_many([&raw_aac])?;
+    Element::link_many([input, &raw_aac])?;
+    Ok(raw_aac)
 }
 
-/// Build the AAC -> raw -> L16 pipeline.
-///
-/// Kept for `audio_format = "pcm"`, and used automatically when the
-/// `rtpmp4apay` payloader is not available in the local GStreamer install.
-fn pipe_aac_pcm(
-    bin: &Element,
-    framing: AacFraming,
-    stream_config: &StreamConfig,
-) -> Result<Linked> {
+/// Decode parsed AAC to raw samples for `rtpL16pay`, returning the element
+/// the payloader should be linked to.
+fn pipe_aac_pcm_tail(bin: &Element, input: &Element) -> Result<Element> {
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
-    log::debug!("Building Aac pipeline");
-    let source = make_appsrc("audsrc", AUD_BUFFER_SIZE)?;
-    set_aac_caps(&source, framing);
-    let source = source
-        .dynamic_cast::<Element>()
-        .map_err(|_| anyhow!("Cannot cast back"))?;
 
-    let queue = make_queue("audqueue", AUD_BUFFER_SIZE, stream_config.queue_time)?;
-    let parser = make_element("aacparse", "audparser")?;
     let decoder = match make_element("faad", "auddecoder_faad") {
         Ok(ele) => Ok(ele),
         Err(_) => make_element("avdec_aac", "auddecoder_avdec_aac"),
@@ -1020,28 +1027,33 @@ fn pipe_aac_pcm(
 
     let encoder = make_element("audioconvert", "audencoder")?;
 
-    bin.add_many([&source, &queue, &parser, &decoder, &encoder])?;
+    bin.add_many([&decoder, &encoder])?;
     if let Ok(fallback_switch) = fallback_switch.as_ref() {
         bin.add_many([&silence, fallback_switch])?;
-        Element::link_many([
-            &source,
-            &queue,
-            &parser,
-            &decoder,
-            fallback_switch,
-            &encoder,
-        ])?;
+        Element::link_many([input, &decoder, fallback_switch, &encoder])?;
         Element::link_many([&silence, fallback_switch])?;
     } else {
-        Element::link_many([&source, &queue, &parser, &decoder, &encoder])?;
+        Element::link_many([input, &decoder, &encoder])?;
     }
 
-    let source = source
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot convert appsrc"))?;
+    Ok(encoder)
+}
+
+/// The whole LATM chain, head and tail.
+///
+/// Used by the negotiation probe, which needs a standalone copy of exactly
+/// what the serving pipeline would build.
+fn pipe_aac_latm(
+    bin: &Element,
+    framing: AacFraming,
+    stream_config: &StreamConfig,
+) -> Result<Linked> {
+    log::debug!("Building Aac LATM passthrough pipeline");
+    let head = pipe_aac_head(bin, framing, stream_config)?;
+    let output = pipe_aac_latm_tail(bin, &head.output)?;
     Ok(Linked {
-        appsrc: source,
-        output: encoder,
+        appsrc: head.appsrc,
+        output,
     })
 }
 
@@ -1163,19 +1175,59 @@ fn probe_run(
     Ok(())
 }
 
+/// Which RTP payload formats the SDP offers for this camera's audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioTracks {
+    /// One `MP4A-LATM` track.
+    Latm,
+    /// One `L16` track.
+    Pcm,
+    /// Both, LATM first, for clients that negotiate.
+    Both,
+}
+
+/// Work out what to offer, given the config and what this camera's audio
+/// can actually be payloaded as.
+fn decide_audio_tracks(
+    samples: &[Vec<u8>],
+    framing: AacFraming,
+    stream_config: &StreamConfig,
+) -> AudioTracks {
+    match stream_config.audio_format {
+        AudioFormat::Pcm => AudioTracks::Pcm,
+        AudioFormat::Latm => {
+            if can_use_latm(samples, framing, stream_config) {
+                AudioTracks::Latm
+            } else {
+                AudioTracks::Pcm
+            }
+        }
+        AudioFormat::Both => {
+            if can_use_latm(samples, framing, stream_config) {
+                AudioTracks::Both
+            } else {
+                // The warning naming the blocker has already been logged.
+                log::info!("Offering the audio as a single L16 track");
+                AudioTracks::Pcm
+            }
+        }
+    }
+}
+
 /// Whether the AAC frames from this camera can be passed through as LATM.
 ///
 /// Errs towards L16: a wrong "yes" costs the whole stream, a wrong "no"
 /// costs only the decode we were trying to avoid.
 fn can_use_latm(samples: &[Vec<u8>], framing: AacFraming, stream_config: &StreamConfig) -> bool {
-    if !matches!(stream_config.audio_format, AudioFormat::Latm) {
+    if matches!(stream_config.audio_format, AudioFormat::Pcm) {
         return false;
     }
     if !has_latm_payloader() {
         log::warn!(
-            "audio_format is \"latm\" but the `rtpmp4apay` element is missing \
+            "audio_format is \"{}\" but the `rtpmp4apay` element is missing \
              (install the rtp plugin from gst-plugins-good); \
-             falling back to decoding the audio to L16"
+             falling back to decoding the audio to L16",
+            stream_config.audio_format
         );
         return false;
     }
@@ -1202,54 +1254,91 @@ fn can_use_latm(samples: &[Vec<u8>], framing: AacFraming, stream_config: &Stream
     }
 }
 
-/// [`can_use_latm`] off the async runtime.
+/// [`decide_audio_tracks`] off the async runtime.
 ///
 /// The probe runs a real pipeline and waits on its bus, so it must not sit
 /// on a runtime worker thread while it does.
-async fn decide_latm(
+async fn decide_audio_tracks_off_thread(
     samples: Vec<Vec<u8>>,
     framing: AacFraming,
     stream_config: StreamConfig,
-) -> bool {
-    tokio::task::spawn_blocking(move || can_use_latm(&samples, framing, &stream_config))
+) -> AudioTracks {
+    tokio::task::spawn_blocking(move || decide_audio_tracks(&samples, framing, &stream_config))
         .await
         .unwrap_or_else(|e| {
             log::warn!("Could not check whether the audio can be passed through as LATM ({e:?}); decoding it to L16 instead");
-            false
+            AudioTracks::Pcm
         })
 }
 
-/// Build the audio half of the pipeline.
-///
-/// `use_latm` is decided by [`can_use_latm`] before we get here: a
-/// half-built pipeline cannot be unwound cleanly, so the choice must be
-/// settled before the bin is touched.
-fn build_aac(
-    bin: &Element,
-    framing: AacFraming,
-    use_latm: bool,
-    stream_config: &StreamConfig,
-) -> Result<AppSrc> {
-    let (linked, payload) = if use_latm {
-        (
-            pipe_aac_latm(bin, framing, stream_config)?,
-            make_element("rtpmp4apay", "pay1")?,
-        )
-    } else {
-        (
-            pipe_aac_pcm(bin, framing, stream_config)?,
-            make_element("rtpL16pay", "pay1")?,
-        )
-    };
-
+/// Add a payloader to the bin and link it to the end of a branch.
+fn attach_payloader(bin: &Element, output: &Element, kind: &str, name: &str) -> Result<()> {
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
-
+    let payload = make_element(kind, name)?;
     bin.add_many([&payload])?;
-    Element::link_many([&linked.output, &payload])?;
-    Ok(linked.appsrc)
+    Element::link_many([output, &payload])?;
+    Ok(())
+}
+
+/// Build the audio half of the pipeline.
+///
+/// `tracks` is decided by [`decide_audio_tracks`] before we get here: a
+/// half-built pipeline cannot be unwound cleanly, so the choice must be
+/// settled before the bin is touched.
+///
+/// The payloaders must be named `pay0`, `pay1`, ... with no gaps —
+/// gst-rtsp-server stops collecting at the first index it cannot find — so
+/// the audio always starts at `pay1` (video is `pay0`) and only claims
+/// `pay2` when there really is a second track.
+fn build_aac(
+    bin: &Element,
+    framing: AacFraming,
+    tracks: AudioTracks,
+    stream_config: &StreamConfig,
+) -> Result<AppSrc> {
+    let head = pipe_aac_head(bin, framing, stream_config)?;
+
+    match tracks {
+        AudioTracks::Latm => {
+            log::debug!("Offering the audio as one MP4A-LATM track");
+            let out = pipe_aac_latm_tail(bin, &head.output)?;
+            attach_payloader(bin, &out, "rtpmp4apay", "pay1")?;
+        }
+        AudioTracks::Pcm => {
+            log::debug!("Offering the audio as one L16 track");
+            let out = pipe_aac_pcm_tail(bin, &head.output)?;
+            attach_payloader(bin, &out, "rtpL16pay", "pay1")?;
+        }
+        AudioTracks::Both => {
+            log::debug!("Offering the audio as both an MP4A-LATM and an L16 track");
+            let bin_as_bin = bin
+                .clone()
+                .dynamic_cast::<Bin>()
+                .map_err(|_| anyhow!("Media source's element should be a bin"))?;
+
+            let tee = make_element("tee", "audtee")?;
+            bin_as_bin.add_many([&tee])?;
+            Element::link_many([&head.output, &tee])?;
+
+            // A queue per branch. Without them the slower branch (the
+            // decode) would stall the tee and with it the passthrough.
+            let latm_queue = make_queue("audlatm", AUD_BUFFER_SIZE, stream_config.queue_time)?;
+            let pcm_queue = make_queue("audpcm", AUD_BUFFER_SIZE, stream_config.queue_time)?;
+            bin_as_bin.add_many([&latm_queue, &pcm_queue])?;
+            Element::link_many([&tee, &latm_queue])?;
+            Element::link_many([&tee, &pcm_queue])?;
+
+            let latm_out = pipe_aac_latm_tail(bin, &latm_queue)?;
+            attach_payloader(bin, &latm_out, "rtpmp4apay", "pay1")?;
+            let pcm_out = pipe_aac_pcm_tail(bin, &pcm_queue)?;
+            attach_payloader(bin, &pcm_out, "rtpL16pay", "pay2")?;
+        }
+    }
+
+    Ok(head.appsrc)
 }
 
 fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> Result<Linked> {
@@ -1609,12 +1698,13 @@ mod tests {
         let config = test_stream_config(AudioFormat::Latm);
 
         let samples = vec![adts_frame(64); 4];
-        assert!(
-            can_use_latm(&samples, MP4_FRAMING, &config),
+        assert_eq!(
+            decide_audio_tracks(&samples, MP4_FRAMING, &config),
+            AudioTracks::Latm,
             "MPEG-4 ADTS should be passed through"
         );
-        let appsrc =
-            build_aac(&bin, MP4_FRAMING, true, &config).expect("LATM pipeline should build");
+        let appsrc = build_aac(&bin, MP4_FRAMING, AudioTracks::Latm, &config)
+            .expect("LATM pipeline should build");
 
         let payloader = pipeline.by_name("pay1").expect("pay1 should exist");
         assert_eq!(
@@ -1740,10 +1830,14 @@ mod tests {
         };
 
         let samples = vec![adts_frame_versioned(64, 2)];
-        let use_latm = can_use_latm(&samples, framing, &config);
-        assert!(!use_latm, "MPEG-2 AAC cannot be passed through as LATM");
+        let tracks = decide_audio_tracks(&samples, framing, &config);
+        assert_eq!(
+            tracks,
+            AudioTracks::Pcm,
+            "MPEG-2 AAC cannot be passed through as LATM"
+        );
 
-        build_aac(&bin, framing, use_latm, &config)
+        build_aac(&bin, framing, tracks, &config)
             .expect("MPEG-2 AAC should still build a pipeline");
 
         let payloader = pipeline.by_name("pay1").expect("pay1 should exist");
@@ -1751,6 +1845,104 @@ mod tests {
             payloader.factory().map(|f| f.name().to_string()).as_deref(),
             Some("rtpL16pay"),
             "MPEG-2 AAC cannot be payloaded as LATM, so it must be decoded"
+        );
+
+        pipeline.set_state(State::Null).unwrap();
+    }
+
+    /// `audio_format = "both"` offers the client a choice: an MP4A-LATM
+    /// track and an L16 track, so a client that negotiates (go2rtc) can
+    /// set up only the one it wants.
+    #[test]
+    fn both_offers_a_latm_and_an_l16_track() {
+        if !require(&[
+            "appsrc",
+            "queue",
+            "tee",
+            "aacparse",
+            "capsfilter",
+            "rtpmp4apay",
+            "rtpL16pay",
+            "audioconvert",
+        ]) {
+            return;
+        }
+        if ElementFactory::find("faad").is_none() && ElementFactory::find("avdec_aac").is_none() {
+            eprintln!("skipping: no AAC decoder available");
+            return;
+        }
+
+        let pipeline = Pipeline::new();
+        let bin = pipeline.clone().upcast::<Element>();
+        let config = test_stream_config(AudioFormat::Both);
+
+        let samples = vec![adts_frame(64); 4];
+        let tracks = decide_audio_tracks(&samples, MP4_FRAMING, &config);
+        assert_eq!(tracks, AudioTracks::Both);
+
+        build_aac(&bin, MP4_FRAMING, tracks, &config).expect("dual pipeline should build");
+
+        let named = |name: &str| {
+            pipeline
+                .by_name(name)
+                .and_then(|e| e.factory().map(|f| f.name().to_string()))
+        };
+        assert_eq!(named("pay1").as_deref(), Some("rtpmp4apay"));
+        assert_eq!(named("pay2").as_deref(), Some("rtpL16pay"));
+        // One parse, split after it: the passthrough must not be paying for
+        // the decode branch's work twice over.
+        assert!(pipeline.by_name("audtee").is_some(), "branches share a tee");
+        assert_eq!(
+            pipeline
+                .iterate_elements()
+                .into_iter()
+                .flatten()
+                .filter(|e| { e.factory().map(|f| f.name() == "aacparse").unwrap_or(false) })
+                .count(),
+            1,
+            "the two branches should share one parser"
+        );
+
+        pipeline.set_state(State::Null).unwrap();
+    }
+
+    /// When the camera cannot do LATM at all, `both` has to collapse to a
+    /// single track — and it must still be `pay1`. gst-rtsp-server stops
+    /// collecting payloaders at the first missing index, so a gap would
+    /// lose every track after it.
+    #[test]
+    fn both_collapses_to_one_track_without_leaving_a_gap() {
+        if !require(&["appsrc", "queue", "aacparse", "rtpL16pay", "audioconvert"]) {
+            return;
+        }
+        if ElementFactory::find("faad").is_none() && ElementFactory::find("avdec_aac").is_none() {
+            eprintln!("skipping: no AAC decoder available");
+            return;
+        }
+
+        let pipeline = Pipeline::new();
+        let bin = pipeline.clone().upcast::<Element>();
+        let config = test_stream_config(AudioFormat::Both);
+        let framing = AacFraming {
+            adts: true,
+            mpegversion: Some(2),
+        };
+
+        let tracks = decide_audio_tracks(&[adts_frame_versioned(64, 2)], framing, &config);
+        assert_eq!(tracks, AudioTracks::Pcm, "MPEG-2 AAC has no LATM to offer");
+
+        build_aac(&bin, framing, tracks, &config).expect("pipeline should still build");
+        assert_eq!(
+            pipeline
+                .by_name("pay1")
+                .and_then(|e| e.factory().map(|f| f.name().to_string()))
+                .as_deref(),
+            Some("rtpL16pay"),
+            "the surviving track must be pay1, not pay2"
+        );
+        assert!(
+            pipeline.by_name("pay2").is_none(),
+            "no second track was built, so pay2 must not exist"
         );
 
         pipeline.set_state(State::Null).unwrap();
@@ -1793,11 +1985,12 @@ mod tests {
         let bin = pipeline.clone().upcast::<Element>();
         let config = test_stream_config(AudioFormat::Pcm);
 
-        assert!(
-            !can_use_latm(&[], MP4_FRAMING, &config),
+        assert_eq!(
+            decide_audio_tracks(&[], MP4_FRAMING, &config),
+            AudioTracks::Pcm,
             "`audio_format = \"pcm\"` should never take the LATM path"
         );
-        build_aac(&bin, MP4_FRAMING, false, &config).expect("PCM pipeline should build");
+        build_aac(&bin, MP4_FRAMING, AudioTracks::Pcm, &config).expect("PCM pipeline should build");
 
         let payloader = pipeline.by_name("pay1").expect("pay1 should exist");
         assert_eq!(

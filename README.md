@@ -133,11 +133,46 @@ name = "Camera01"
 username = "admin"
 password = "password"
 uid = "ABCDEF0123456789"
-audio_format = "pcm"   # "latm" (default) or "pcm"
+audio_format = "pcm"   # "latm" (default), "pcm" or "both"
 ```
 
 ADPCM cameras have no RTP passthrough format available and are always decoded
 to `L16`; `audio_format` has no effect on them.
+
+#### Letting the client choose: `audio_format = "both"`
+
+RTSP has no codec negotiation — the server has to commit to a format in the
+SDP before the client has said anything about what it can decode. What a
+client *can* do is set up only the tracks it wants, so `both` offers two audio
+tracks and lets it pick:
+
+```toml
+[[cameras]]
+name = "Camera01"
+username = "admin"
+password = "password"
+uid = "ABCDEF0123456789"
+audio_format = "both"
+```
+
+The SDP then advertises `MP4A-LATM` and `L16` alongside the video, and a
+client that negotiates — go2rtc, and so Home Assistant and Frigate — sets up
+just one of them.
+
+This is opt-in for a reason. Plenty of clients do not negotiate: `rtspsrc`,
+and others like it, set up *every* track in the SDP, which means both audio
+streams on the wire at once and whatever the client makes of two audio tracks.
+Two further caveats apply even with a well-behaved client:
+
+- both branches run server-side regardless of what is subscribed, so the AAC
+  decode that `latm` exists to avoid is paid anyway;
+- the decode branch shares the fate of the mount. If the decoder fails on this
+  camera's audio, it takes the passthrough track and the video down with it,
+  which `latm` on its own would not.
+
+Use `both` when you have a mixed set of clients on one camera and a
+negotiating client is the one you care about. Otherwise `latm` is the better
+default and `pcm` the safer fallback.
 
 `latm` is a preference rather than a demand. Passthrough only works for MPEG-4
 AAC in ADTS framing, so before neolink serves a stream it checks that the

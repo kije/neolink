@@ -567,6 +567,19 @@ pub(crate) enum AudioFormat {
     /// before `audio_format` existed. ADPCM always uses this path.
     #[serde(alias = "pcm", alias = "l16", alias = "raw")]
     Pcm,
+    /// Offer both, as two separate audio tracks in the SDP.
+    ///
+    /// The client picks: one `MP4A-LATM` track and one `L16` track are
+    /// advertised, and a client that negotiates properly (go2rtc, and so
+    /// Home Assistant and Frigate) sets up only the one it wants.
+    ///
+    /// Opt-in, because plenty of clients do not negotiate — `rtspsrc` and
+    /// friends set up every track in the SDP, which means two audio streams
+    /// on the wire and whatever the client makes of that. Both branches
+    /// also run server-side regardless of what is subscribed, so the decode
+    /// that `latm` exists to avoid is paid anyway.
+    #[serde(alias = "both", alias = "dual", alias = "offer_both")]
+    Both,
 }
 
 impl std::fmt::Display for AudioFormat {
@@ -574,6 +587,7 @@ impl std::fmt::Display for AudioFormat {
         let s = match self {
             AudioFormat::Latm => "latm",
             AudioFormat::Pcm => "pcm",
+            AudioFormat::Both => "both",
         };
         write!(f, "{}", s)
     }
@@ -712,6 +726,13 @@ mod tests {
                 camera(&format!("audio_format = \"{spelling}\"")).audio_format,
                 AudioFormat::Pcm,
                 "{spelling} should select PCM"
+            );
+        }
+        for spelling in ["both", "Both", "dual", "offer_both"] {
+            assert_eq!(
+                camera(&format!("audio_format = \"{spelling}\"")).audio_format,
+                AudioFormat::Both,
+                "{spelling} should offer both tracks"
             );
         }
     }
