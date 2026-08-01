@@ -170,16 +170,36 @@ uid = "ABCDEF0123456789"
 max_fps = 5   # or fps_limit = 5
 ```
 
-Omitting the option, or setting it to `0`, means no limit. Each connected
-client is decimated independently, and the frames that do get through keep the
-camera's own capture timestamps, so the media timeline stays correct.
+The option is strictly opt-in: omitting it, or setting it to `0`, leaves the
+frame path exactly as it is without it — no limiter is constructed and no
+per-frame decision is made. Each connected client is decimated independently,
+and the frames that do get through keep the camera's own capture timestamps, so
+the media timeline stays correct.
 
-Note that neolink drops frames rather than re-encoding the stream. H.264 and
-H.265 P-frames are predicted from earlier frames, so removing some of them
-leaves the survivors referencing frames that never arrived, and a decoder will
-show artefacts until the next keyframe. Use `max_fps` where that is acceptable
-— periodic still grabs, motion snapshots, or a hard bandwidth ceiling — and
-leave it unset for normal live viewing.
+#### What the output looks like
+
+neolink drops frames rather than re-encoding the stream, and H.264/H.265
+P-frames are predicted from the frames before them. Dropping a frame from the
+middle of a group of pictures would leave the frames after it referencing data
+that never arrived, so neolink only ever drops a *tail* of each GOP: once a
+frame is withheld, the rest are withheld too until the next keyframe restarts
+the prediction chain. Everything the client receives is decodable.
+
+Two consequences follow from that:
+
+- **Output is bursty.** Frames arrive as a run at the camera's native rate
+  followed by a gap, rather than evenly spaced. Averaged over a keyframe
+  interval the rate is `max_fps`; instant to instant it is not. Expect visible
+  stutter on a live view.
+- **The keyframe rate is a floor.** Keyframes are never dropped, so if your
+  camera sends one every 2 s you cannot get below 0.5 fps, and asking for less
+  simply yields the keyframe rate. Dropping keyframes would blank the stream
+  rather than thin it.
+
+Smoothly spaced output at an arbitrary rate would require transcoding, which
+costs far more CPU than this option is meant to save. So `max_fps` is a good
+fit for bandwidth ceilings, periodic still grabs and motion snapshots, and a
+poor fit for a live view you intend to watch — leave it unset for that.
 
 ### Discovery
 

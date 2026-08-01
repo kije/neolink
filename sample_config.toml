@@ -133,14 +133,17 @@ address = "192.168.1.187:9000"
 
 # Cap the RTSP output at this many frames per second. Excess video frames are
 # dropped before they reach GStreamer, which cuts CPU and bandwidth. Audio is
-# never throttled. Omitted (or 0) means no limit. `fps_limit` is accepted as an
-# alias.
+# never throttled. Strictly opt-in: omitted (or 0) means no limit and no
+# limiting machinery runs at all. `fps_limit` is accepted as an alias.
 #
-# Frames are dropped, not re-encoded, so this only suits consumers that tolerate
-# a broken inter-frame chain (still grabs, motion snapshots, bandwidth caps).
-# Dropping P-frames leaves the frames that referenced them incomplete, so a
-# decoder playing the stream back will show artefacts until the next keyframe.
-# Leave this unset for normal live viewing.
+# Frames are dropped, not re-encoded, so neolink only ever drops the tail of a
+# group of pictures — once a frame is withheld the rest are too, until the next
+# keyframe. Everything the client receives stays decodable, at the price of
+# bursty output (a run of frames at full rate, then a gap) and a floor at the
+# camera's keyframe rate, since keyframes are never dropped.
+#
+# Good for bandwidth caps, still grabs and motion snapshots. Leave unset for a
+# live view you actually intend to watch.
 #
 # max_fps = 5
 
