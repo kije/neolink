@@ -1,5 +1,6 @@
 use gstreamer::ClockTime;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{
@@ -270,6 +271,120 @@ impl StreamConfig {
     }
 }
 
+/// How long a learned stream profile is trusted before it is learned again.
+///
+/// Long enough that reconnect churn never re-learns, short enough that
+/// changing the camera's encoder settings takes effect without restarting
+/// neolink.
+const PROFILE_TTL: Duration = Duration::from_secs(300);
+
+/// How many AAC frames a profile keeps for the negotiation probe.
+///
+/// Only needed so that a client arriving on a warm cache can still probe a
+/// payload format nobody has tried yet. Four is what the probe uses.
+const PROFILE_SAMPLES: usize = 4;
+
+/// What has been learned about one camera stream, so that the next client
+/// does not have to learn it again.
+///
+/// Everything here is a property of the *camera*, not of the client or its
+/// `audio_format`: the codecs it sends, the frame rate and bitrate tables
+/// read off it, and which RTP payload formats its AAC was actually able to
+/// negotiate. The per-client fields (`queue_time`, `audio_format`) are
+/// applied over the top on the way out.
+#[derive(Clone, Debug)]
+struct StreamProfile {
+    stream_config: StreamConfig,
+    /// A few of the camera's own AAC frames, for probing a payload format
+    /// this profile has no verdict for yet.
+    aac_samples: Vec<Vec<u8>>,
+    /// Probe verdicts, filled in lazily as clients ask for formats. A
+    /// `pcm` client measures nothing and so records nothing.
+    passthrough: Vec<(AacPayload, bool)>,
+}
+
+/// The [`StreamProfile`] for one camera stream, shared by every client of it.
+///
+/// This exists to keep the camera off the DESCRIBE path. Building a media
+/// used to mean a `get_stream_info` round trip, up to ten seconds of
+/// waiting for frames to learn the codecs from, and a negotiation probe per
+/// passthrough format — all while the client's DESCRIBE was blocked.
+/// go2rtc gives every RTSP request five seconds and re-DESCRIBEs whenever a
+/// consumer needs a track it has not set up yet, so that budget was being
+/// blown routinely rather than exceptionally, and each failed attempt
+/// started another camera subscription.
+///
+/// A `std::sync::Mutex` rather than tokio's: the critical sections are
+/// field copies with no await in them, and [`decide_audio_tracks`] consults
+/// this from inside `spawn_blocking`.
+#[derive(Clone, Default)]
+struct ProfileCache(Arc<StdMutex<Option<(Instant, StreamProfile)>>>);
+
+impl ProfileCache {
+    /// The profile, if one has been learned and has not aged out.
+    fn get(&self) -> Option<StreamProfile> {
+        let cached = self.0.lock().ok()?;
+        let (learned_at, profile) = cached.as_ref()?;
+        (learned_at.elapsed() < PROFILE_TTL).then(|| profile.clone())
+    }
+
+    /// Record what a cold client learned.
+    ///
+    /// A profile that learned no video type is not stored: it means the
+    /// camera never delivered, and caching that would keep the next client
+    /// on the "Stream not Ready" splash for the whole TTL instead of
+    /// letting it try again.
+    fn store(&self, stream_config: &StreamConfig, buffer: &[BcMedia]) {
+        if stream_config.vid_type.is_none() {
+            return;
+        }
+        let aac_samples = buffer
+            .iter()
+            .filter_map(|media| match media {
+                BcMedia::Aac(aac) => Some(aac.data.clone()),
+                _ => None,
+            })
+            .take(PROFILE_SAMPLES)
+            .collect::<Vec<_>>();
+        if let Ok(mut cached) = self.0.lock() {
+            // Keep any verdicts already recorded against this profile
+            // rather than making the next client re-probe.
+            let passthrough = cached
+                .as_ref()
+                .map(|(_, profile)| profile.passthrough.clone())
+                .unwrap_or_default();
+            *cached = Some((
+                Instant::now(),
+                StreamProfile {
+                    stream_config: stream_config.clone(),
+                    aac_samples,
+                    passthrough,
+                },
+            ));
+        }
+    }
+
+    /// Remember whether `payload` negotiated, so it is probed once per
+    /// stream rather than once per client.
+    fn record_passthrough(&self, payload: AacPayload, ok: bool) {
+        if let Ok(mut cached) = self.0.lock() {
+            if let Some((_, profile)) = cached.as_mut() {
+                profile.passthrough.retain(|(seen, _)| *seen != payload);
+                profile.passthrough.push((payload, ok));
+            }
+        }
+    }
+}
+
+/// A profile's verdict on one payload format, if it has one.
+fn cached_verdict(profile: Option<&StreamProfile>, payload: AacPayload) -> Option<bool> {
+    profile?
+        .passthrough
+        .iter()
+        .find(|(seen, _)| *seen == payload)
+        .map(|(_, ok)| *ok)
+}
+
 pub(super) async fn make_dummy_factory(
     use_splash: bool,
     pattern: String,
@@ -304,6 +419,8 @@ pub(super) async fn make_factory(
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
         let name = camera.config().await?.borrow().name.clone();
+        // One profile per (camera, stream), shared by every client of it.
+        let profile_cache = ProfileCache::default();
 
         while let Some(msg) = client_rx.recv().await {
             match msg {
@@ -315,6 +432,7 @@ pub(super) async fn make_factory(
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
+                    let profile_cache = profile_cache.clone();
                     tokio::task::spawn(async move {
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
@@ -323,44 +441,60 @@ pub(super) async fn make_factory(
                         let config = camera.config().await?.borrow().clone();
                         let mut media_rx = camera.stream_while_live(stream).await?;
 
-                        log::trace!("{name}::{stream}: Learning camera stream type");
-                        // Learn the camera data type
-                        let mut buffer = vec![];
-                        let mut frame_count = 0usize;
-
                         // A `?audio=` on the client's URL applies to that
                         // client only; every other client on this camera
                         // keeps the configured format. Each one gets its
                         // own media (the factory is not shared), so they
                         // can hold different formats at the same time.
                         let audio_format = audio_format.unwrap_or(config.audio_format);
-                        let mut stream_config = StreamConfig::new(
-                            &camera,
-                            stream,
-                            Duration::from_millis(config.buffer_duration),
-                            audio_format,
-                        )
-                        .await?;
-                        // Bound stream-type negotiation. A slow or flaky camera that
-                        // never delivers frames must not hang this per-client task
-                        // forever holding `media_rx` / `element`; on timeout we build
-                        // with whatever we have learned so far (falling back to the
-                        // "Stream not Ready" splash when the video type is still
-                        // unknown).
-                        let _ = tokio::time::timeout(Duration::from_secs(10), async {
-                            while let Some(media) = media_rx.recv().await {
-                                stream_config.update_from_media(&media);
-                                buffer.push(media);
-                                if frame_count > 10
-                                    || (stream_config.vid_type.is_some()
-                                        && stream_config.aud_type.is_some())
-                                {
-                                    break;
-                                }
-                                frame_count += 1;
+                        let queue_time = Duration::from_millis(config.buffer_duration);
+
+                        // Frames consumed while learning, replayed into the
+                        // pipeline once it is built so none are lost. A
+                        // client served from the cache learns nothing and
+                        // so buffers nothing.
+                        let mut buffer = vec![];
+                        let profile = profile_cache.get();
+                        let mut stream_config = match profile.as_ref() {
+                            Some(profile) => {
+                                log::trace!("{name}::{stream}: Using the learned stream profile");
+                                let mut stream_config = profile.stream_config.clone();
+                                // The profile is the camera's; these two are
+                                // this client's.
+                                stream_config.queue_time = clamp_queue_time(queue_time);
+                                stream_config.audio_format = audio_format;
+                                stream_config
                             }
-                        })
-                        .await;
+                            None => {
+                                log::trace!("{name}::{stream}: Learning camera stream type");
+                                let mut stream_config =
+                                    StreamConfig::new(&camera, stream, queue_time, audio_format)
+                                        .await?;
+                                let mut frame_count = 0usize;
+                                // Bound stream-type negotiation. A slow or flaky camera that
+                                // never delivers frames must not hang this per-client task
+                                // forever holding `media_rx` / `element`; on timeout we build
+                                // with whatever we have learned so far (falling back to the
+                                // "Stream not Ready" splash when the video type is still
+                                // unknown).
+                                let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                                    while let Some(media) = media_rx.recv().await {
+                                        stream_config.update_from_media(&media);
+                                        buffer.push(media);
+                                        if frame_count > 10
+                                            || (stream_config.vid_type.is_some()
+                                                && stream_config.aud_type.is_some())
+                                        {
+                                            break;
+                                        }
+                                        frame_count += 1;
+                                    }
+                                })
+                                .await;
+                                profile_cache.store(&stream_config, &buffer);
+                                stream_config
+                            }
+                        };
 
                         log::trace!("{name}::{stream}: Building the pipeline");
                         // Build the right video pipeline
@@ -383,20 +517,26 @@ pub(super) async fn make_factory(
                         let aud_src = match stream_config.aud_type.as_ref() {
                             Some(AudioType::Aac(framing)) => {
                                 // The frames we learned the stream from are
-                                // also what the LATM negotiation probe gets
-                                // to try, so the decision is made against
-                                // this camera's real audio.
-                                let samples = buffer
-                                    .iter()
-                                    .filter_map(|media| match media {
-                                        BcMedia::Aac(aac) => Some(aac.data.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>();
+                                // also what the negotiation probe gets to
+                                // try, so the decision is made against this
+                                // camera's real audio. A client served from
+                                // the cache learned none of its own, and
+                                // takes the ones the profile kept.
+                                let samples = match profile.as_ref() {
+                                    Some(profile) => profile.aac_samples.clone(),
+                                    None => buffer
+                                        .iter()
+                                        .filter_map(|media| match media {
+                                            BcMedia::Aac(aac) => Some(aac.data.clone()),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>(),
+                                };
                                 let tracks = decide_audio_tracks_off_thread(
                                     samples,
                                     *framing,
                                     stream_config.clone(),
+                                    profile_cache.clone(),
                                 )
                                 .await;
                                 let src = build_aac(&element, *framing, tracks, &stream_config)?;
@@ -1411,13 +1551,20 @@ fn decide_audio_tracks(
     samples: &[Vec<u8>],
     framing: AacFraming,
     stream_config: &StreamConfig,
+    cache: &ProfileCache,
 ) -> AudioTracks {
     let tracks = match stream_config.audio_format {
         AudioFormat::Pcm => AudioTracks::pcm_only(),
-        AudioFormat::Mpeg4Generic => {
-            single_passthrough(AacPayload::Mpeg4Generic, samples, framing, stream_config)
+        AudioFormat::Mpeg4Generic => single_passthrough(
+            AacPayload::Mpeg4Generic,
+            samples,
+            framing,
+            stream_config,
+            cache,
+        ),
+        AudioFormat::Latm => {
+            single_passthrough(AacPayload::Latm, samples, framing, stream_config, cache)
         }
-        AudioFormat::Latm => single_passthrough(AacPayload::Latm, samples, framing, stream_config),
         AudioFormat::All => {
             // Every passthrough this camera can actually do, then L16 for
             // the clients that can take none of them — notably go2rtc's
@@ -1425,7 +1572,9 @@ fn decide_audio_tracks(
             let mut tracks = AacPayload::ALL
                 .iter()
                 .copied()
-                .filter(|payload| can_pass_through(*payload, samples, framing, stream_config))
+                .filter(|payload| {
+                    can_pass_through(*payload, samples, framing, stream_config, cache)
+                })
                 .map(AudioTrack::Passthrough)
                 .collect::<Vec<_>>();
             tracks.push(AudioTrack::Pcm);
@@ -1442,8 +1591,9 @@ fn single_passthrough(
     samples: &[Vec<u8>],
     framing: AacFraming,
     stream_config: &StreamConfig,
+    cache: &ProfileCache,
 ) -> AudioTracks {
-    if can_pass_through(payload, samples, framing, stream_config) {
+    if can_pass_through(payload, samples, framing, stream_config, cache) {
         AudioTracks(vec![AudioTrack::Passthrough(payload)])
     } else {
         AudioTracks::pcm_only()
@@ -1460,9 +1610,16 @@ fn can_pass_through(
     samples: &[Vec<u8>],
     framing: AacFraming,
     stream_config: &StreamConfig,
+    cache: &ProfileCache,
 ) -> bool {
     if matches!(stream_config.audio_format, AudioFormat::Pcm) {
         return false;
+    }
+    // Probed once per stream, not once per client: the answer is a property
+    // of the camera's audio, and the probe is the most expensive thing on
+    // the DESCRIBE path.
+    if let Some(verdict) = cached_verdict(cache.get().as_ref(), payload) {
+        return verdict;
     }
     let name = payload.encoding_name();
     if !has_payloader(payload) {
@@ -1485,7 +1642,7 @@ fn can_pass_through(
         // against.
         return true;
     }
-    match passthrough_negotiates(samples, framing, payload, stream_config) {
+    let verdict = match passthrough_negotiates(samples, framing, payload, stream_config) {
         Ok(()) => true,
         Err(e) => {
             log::warn!(
@@ -1496,7 +1653,9 @@ fn can_pass_through(
             );
             false
         }
-    }
+    };
+    cache.record_passthrough(payload, verdict);
+    verdict
 }
 
 /// [`decide_audio_tracks`] off the async runtime.
@@ -1507,9 +1666,12 @@ async fn decide_audio_tracks_off_thread(
     samples: Vec<Vec<u8>>,
     framing: AacFraming,
     stream_config: StreamConfig,
+    cache: ProfileCache,
 ) -> AudioTracks {
-    tokio::task::spawn_blocking(move || decide_audio_tracks(&samples, framing, &stream_config))
-        .await
+    tokio::task::spawn_blocking(move || {
+        decide_audio_tracks(&samples, framing, &stream_config, &cache)
+    })
+    .await
         .unwrap_or_else(|e| {
             log::warn!("Could not check whether the audio can be passed through ({e:?}); decoding it to L16 instead");
             AudioTracks::pcm_only()
@@ -1871,6 +2033,159 @@ mod tests {
         }
     }
 
+    /// A `StreamConfig` that looks like something was actually learned
+    /// from a camera, so the cache will agree to store it.
+    fn learned_stream_config(audio_format: AudioFormat) -> StreamConfig {
+        let mut config = test_stream_config(audio_format);
+        config.vid_type = Some(VideoType::H264);
+        config.aud_type = Some(AudioType::Aac(MP4_FRAMING));
+        config
+    }
+
+    /// A cold client learns; every client after it is served from the
+    /// profile. This is what keeps the camera off the DESCRIBE path.
+    #[test]
+    fn a_learned_profile_is_reused() {
+        let cache = ProfileCache::default();
+        assert!(cache.get().is_none(), "nothing learned yet");
+
+        let config = learned_stream_config(AudioFormat::All);
+        let buffer = vec![BcMedia::Aac(BcMediaAac {
+            data: adts_frame(64),
+        })];
+        cache.store(&config, &buffer);
+
+        let profile = cache.get().expect("the profile should have been kept");
+        assert!(matches!(
+            profile.stream_config.vid_type,
+            Some(VideoType::H264)
+        ));
+        assert_eq!(profile.aac_samples, vec![adts_frame(64)]);
+    }
+
+    /// A camera that never delivered taught us nothing. Caching that would
+    /// pin the next client to the "Stream not Ready" splash for the whole
+    /// TTL instead of letting it try again.
+    #[test]
+    fn a_failed_learn_is_not_cached() {
+        let cache = ProfileCache::default();
+        let config = test_stream_config(AudioFormat::All); // vid_type: None
+        cache.store(&config, &[]);
+        assert!(cache.get().is_none());
+    }
+
+    /// The probe is the most expensive thing on the DESCRIBE path, so its
+    /// verdict is per stream, not per client — and it must survive a
+    /// later client re-learning the stream types.
+    #[test]
+    fn probe_verdicts_are_remembered_across_clients() {
+        let cache = ProfileCache::default();
+        let config = learned_stream_config(AudioFormat::All);
+        cache.store(&config, &[]);
+
+        assert_eq!(
+            cached_verdict(cache.get().as_ref(), AacPayload::Mpeg4Generic),
+            None,
+            "nothing probed yet"
+        );
+
+        cache.record_passthrough(AacPayload::Mpeg4Generic, true);
+        cache.record_passthrough(AacPayload::Latm, false);
+
+        let profile = cache.get().unwrap();
+        assert_eq!(
+            cached_verdict(Some(&profile), AacPayload::Mpeg4Generic),
+            Some(true)
+        );
+        assert_eq!(
+            cached_verdict(Some(&profile), AacPayload::Latm),
+            Some(false)
+        );
+
+        // Re-learning the stream types must not throw the verdicts away.
+        cache.store(&config, &[]);
+        let profile = cache.get().unwrap();
+        assert_eq!(
+            cached_verdict(Some(&profile), AacPayload::Mpeg4Generic),
+            Some(true)
+        );
+        assert_eq!(
+            cached_verdict(Some(&profile), AacPayload::Latm),
+            Some(false)
+        );
+    }
+
+    /// Verdicts are recorded against a payload format, not accumulated, so
+    /// a re-probe replaces rather than duplicates.
+    #[test]
+    fn a_re_probe_replaces_its_verdict() {
+        let cache = ProfileCache::default();
+        cache.store(&learned_stream_config(AudioFormat::All), &[]);
+
+        cache.record_passthrough(AacPayload::Latm, true);
+        cache.record_passthrough(AacPayload::Latm, false);
+
+        let profile = cache.get().unwrap();
+        assert_eq!(profile.passthrough.len(), 1);
+        assert_eq!(
+            cached_verdict(Some(&profile), AacPayload::Latm),
+            Some(false)
+        );
+    }
+
+    /// A stale profile is not served: changing the camera's encoder
+    /// settings has to take effect without restarting neolink.
+    #[test]
+    fn a_stale_profile_is_not_served() {
+        let cache = ProfileCache::default();
+        cache.store(&learned_stream_config(AudioFormat::All), &[]);
+        assert!(cache.get().is_some());
+
+        // Age it past the TTL by hand; the alternative is a five-minute test.
+        {
+            let mut cached = cache.0.lock().unwrap();
+            let (learned_at, _) = cached.as_mut().unwrap();
+            *learned_at = Instant::now() - PROFILE_TTL - Duration::from_secs(1);
+        }
+        assert!(cache.get().is_none());
+    }
+
+    /// The profile is the camera's; the queue depth and audio format are
+    /// the client's and must not be inherited from whoever learned first.
+    #[test]
+    fn per_client_settings_are_not_taken_from_the_profile() {
+        let cache = ProfileCache::default();
+        let mut learner = learned_stream_config(AudioFormat::Latm);
+        learner.queue_time = Duration::from_millis(3000);
+        cache.store(&learner, &[]);
+
+        // What the client path does with a hit.
+        let mut served = cache.get().unwrap().stream_config;
+        served.queue_time = clamp_queue_time(Duration::from_millis(200));
+        served.audio_format = AudioFormat::Pcm;
+
+        assert_eq!(served.queue_time, Duration::from_millis(200));
+        assert_eq!(served.audio_format, AudioFormat::Pcm);
+        // ...while the camera's own properties come from the profile.
+        assert!(matches!(served.vid_type, Some(VideoType::H264)));
+    }
+
+    /// Only the frames the probe needs are retained, however many the
+    /// learning window happened to buffer.
+    #[test]
+    fn only_a_few_samples_are_retained() {
+        let cache = ProfileCache::default();
+        let buffer = (0..20)
+            .map(|_| {
+                BcMedia::Aac(BcMediaAac {
+                    data: adts_frame(64),
+                })
+            })
+            .collect::<Vec<_>>();
+        cache.store(&learned_stream_config(AudioFormat::All), &buffer);
+        assert_eq!(cache.get().unwrap().aac_samples.len(), PROFILE_SAMPLES);
+    }
+
     /// Build one ADTS-framed AAC-LC frame: 16kHz, mono, 1024 samples.
     ///
     /// The payload is filler. `aacparse` derives the `AudioSpecificConfig`
@@ -1968,7 +2283,8 @@ mod tests {
             let config = test_stream_config(format);
 
             let samples = vec![adts_frame(64); 4];
-            let tracks = decide_audio_tracks(&samples, MP4_FRAMING, &config);
+            let tracks =
+                decide_audio_tracks(&samples, MP4_FRAMING, &config, &ProfileCache::default());
             assert_eq!(
                 tracks,
                 AudioTracks(vec![AudioTrack::Passthrough(payload)]),
@@ -2105,7 +2421,7 @@ mod tests {
         };
 
         let samples = vec![adts_frame_versioned(64, 2)];
-        let tracks = decide_audio_tracks(&samples, framing, &config);
+        let tracks = decide_audio_tracks(&samples, framing, &config, &ProfileCache::default());
         assert_eq!(
             tracks,
             AudioTracks::pcm_only(),
@@ -2158,7 +2474,7 @@ mod tests {
         let config = test_stream_config(AudioFormat::All);
 
         let samples = vec![adts_frame(64); 4];
-        let tracks = decide_audio_tracks(&samples, MP4_FRAMING, &config);
+        let tracks = decide_audio_tracks(&samples, MP4_FRAMING, &config, &ProfileCache::default());
         assert_eq!(
             tracks,
             AudioTracks(vec![
@@ -2217,7 +2533,12 @@ mod tests {
             mpegversion: Some(2),
         };
 
-        let tracks = decide_audio_tracks(&[adts_frame_versioned(64, 2)], framing, &config);
+        let tracks = decide_audio_tracks(
+            &[adts_frame_versioned(64, 2)],
+            framing,
+            &config,
+            &ProfileCache::default(),
+        );
         assert_eq!(
             tracks,
             AudioTracks::pcm_only(),
@@ -2290,7 +2611,7 @@ mod tests {
         let config = test_stream_config(AudioFormat::Pcm);
 
         assert_eq!(
-            decide_audio_tracks(&[], MP4_FRAMING, &config),
+            decide_audio_tracks(&[], MP4_FRAMING, &config, &ProfileCache::default()),
             AudioTracks::pcm_only(),
             "`audio_format = \"pcm\"` should never take a passthrough path"
         );

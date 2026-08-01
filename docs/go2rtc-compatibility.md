@@ -3,10 +3,12 @@
 *Investigation and design proposal for a compatibility mode.*
 
 Status: **partly implemented.** Stages 0 and 1 of §5 have landed on this
-branch — the misleading documentation is corrected and
-`audio_format = "mpeg4-generic"` exists, so `all` now offers a track go2rtc
-can use. §2.1 and §3.1 are marked resolved below and kept for the record.
-Everything else is still a proposal.
+branch, along with the caching half of §3.2 — the misleading documentation is
+corrected, `audio_format = "mpeg4-generic"` exists so `all` offers a track
+go2rtc can use, and a learned stream profile now keeps the camera off the
+DESCRIBE path. §2.1, §2.2 and §3.1 are marked resolved below and kept for the
+record, and §3.2 is reduced to its remaining half. Everything else is still a
+proposal.
 
 Revised against `master` at `a09634b` (PRs #34 and #35), which landed a large
 rework of the audio path and the FPS limiter while this was being written.
@@ -149,7 +151,7 @@ sets `latm` for their go2rtc camera gets silence and no error.
 All three now say what is true, and `AudioFormat::Latm`'s own doc comment
 points at `mpeg4-generic` instead.
 
-### 2.2 The passthrough probe lands on the most contended path — **new**
+### 2.2 The passthrough probe lands on the most contended path — **fixed on this branch**
 
 `decide_audio_tracks_off_thread` is called at `src/rtsp/factory.rs:396`, which
 is **before** `reply.send(element)` at line 429 — i.e. inside the window where
@@ -161,11 +163,12 @@ formats. But it stacks on top of the pre-existing 10-second learning window on
 a budget that is already over-spent (§3.2) — and `all` now probes two formats,
 so the worst case is camera connect + 10 s + 4 s against go2rtc's fixed 5 s.
 
-Two ways out, both worth doing: skip the remaining probes once one passthrough
-has been ruled out by the shared `aacparse` stage (the framing checks already
-short-circuit the common case), and cache the verdict per `(camera, stream)`
-alongside the `StreamConfig` (§3.2), which removes it from the steady-state
-path entirely.
+Fixed by the §3.2 caching: verdicts are now recorded per `(stream, payload)`
+in the shared profile and consulted before any probe runs, so each format is
+probed at most once per stream per TTL rather than once per client. The
+profile keeps a few of the camera's own AAC frames so that a client arriving
+on a warm cache can still probe a format nobody has asked for yet, rather than
+guessing.
 
 ---
 
@@ -257,11 +260,22 @@ the factory is not shared (`src/rtsp/gst/factory.rs:39`), each cycle runs the
 learning window again and opens another `start_video` subscription
 (`src/common/instance/gst.rs:208`) on a camera with a small connection limit.
 
-**Fixes:** cache the learned `StreamConfig` *and* the LATM probe verdict per
-`(camera, stream)` so the second and subsequent DESCRIBEs are instant; shorten
-the learning window in the mode and build from the cached profile when it
-expires; keep the media prepared between clients (§3.5) so DESCRIBE need not
-touch the camera at all.
+**Half fixed on this branch.** `ProfileCache` holds one `StreamProfile` per
+`(camera, stream)`, shared by every client of it: the learned `StreamConfig`
+(so no `get_stream_info` round trip and no learning window), a few AAC frames,
+and the per-payload probe verdicts. A cold client learns as before and stores
+what it found; every client after it — including every one of go2rtc's routine
+re-DESCRIBEs — is served from the profile. A five-minute TTL means changing
+the camera's encoder settings still takes effect without restarting neolink,
+and a learn that found no video type is deliberately *not* stored, so a camera
+that was simply not ready gets retried rather than pinned to the splash.
+
+**Still open:** the first frame. gst-rtsp-server prerolls the media before it
+can describe it, so even a warm DESCRIBE waits for the camera to deliver one
+buffer. That is far inside go2rtc's 5 s budget where the camera is already
+streaming, but a battery camera waking from idle can still exceed it. Keeping
+the media prepared between clients (§3.5) is what removes the camera from the
+DESCRIBE path completely.
 
 ### 3.3 The stream must never go silent for more than 5 seconds
 
@@ -469,7 +483,7 @@ move again.
 | *new* `stable_sdp` | false | **true** (silence fallback, fixed track set) | 3.6 |
 | *new* `start_on_keyframe` | false | **true** | 3.7 |
 | *new* `rtsp_protocols` | any | `tcp` | 3.8 |
-| *new* `stream_learn_timeout` | 10 s | 2 s, backed by a cached per-stream profile | 3.2 |
+| *new* `stream_learn_timeout` | 10 s | 2 s (the cached profile makes this a cold-start-only cost) | 3.2 |
 
 ### New `audio_format` variant
 
@@ -496,10 +510,11 @@ worth anything to a go2rtc user (§3.1).
 (`shared`, `stop_on_disconnect`, `protocols`), and add the H265 warning. The
 smallest change that makes a default go2rtc install work well.
 
-**Stage 3 — the structural work.** Cached per-stream `StreamConfig` *and*
-probe verdict so DESCRIBE never blocks on the camera (§3.2); deterministic SDP
-with the silence fallback (§3.6); keyframe gating in the frame pump (§3.7);
-pause keep-alive by I-frame re-push (§3.3). Each is independently testable.
+**Stage 3 — the structural work.** The cached per-stream profile is **done**
+(§3.2). Remaining: keeping the media prepared between clients so DESCRIBE need
+not touch the camera at all (§3.2/§3.5); deterministic SDP with the silence
+fallback (§3.6); keyframe gating in the frame pump (§3.7); pause keep-alive by
+I-frame re-push (§3.3). Each is independently testable.
 
 Also worth resolving on its own: either implement `pause.mode`,
 `pause.on_disconnect` and `pause.motion_timeout` or delete them from the docs.
