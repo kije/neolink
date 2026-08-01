@@ -557,7 +557,6 @@ pub(crate) enum AudioFormat {
     ///
     /// Understood by ffmpeg/ffprobe, VLC, go2rtc (and therefore Home
     /// Assistant and Frigate) and Blue Iris.
-    #[default]
     #[serde(alias = "latm", alias = "aac", alias = "passthrough")]
     Latm,
     /// Decode the audio to raw samples and send it as `L16` (RFC 3551).
@@ -567,19 +566,27 @@ pub(crate) enum AudioFormat {
     /// before `audio_format` existed. ADPCM always uses this path.
     #[serde(alias = "pcm", alias = "l16", alias = "raw")]
     Pcm,
-    /// Offer both, as two separate audio tracks in the SDP.
+    /// Offer everything we can, as separate audio tracks in the SDP, and
+    /// let the client decide. This is the default.
     ///
-    /// The client picks: one `MP4A-LATM` track and one `L16` track are
-    /// advertised, and a client that negotiates properly (go2rtc, and so
-    /// Home Assistant and Frigate) sets up only the one it wants.
+    /// One `MP4A-LATM` track and one `L16` track are advertised, and a
+    /// client that negotiates (go2rtc, and so Home Assistant and Frigate)
+    /// sets up only the one it wants.
     ///
-    /// Opt-in, because plenty of clients do not negotiate — `rtspsrc` and
-    /// friends set up every track in the SDP, which means two audio streams
-    /// on the wire and whatever the client makes of that. Both branches
-    /// also run server-side regardless of what is subscribed, so the decode
-    /// that `latm` exists to avoid is paid anyway.
-    #[serde(alias = "both", alias = "dual", alias = "offer_both")]
-    Both,
+    /// Clients that do not negotiate set up every track in the SDP and so
+    /// receive both audio streams; point those at `?audio=latm` (or `pcm`)
+    /// to narrow the offer for that client alone. Both branches also run
+    /// server-side regardless of what is subscribed, so the decode that
+    /// `latm` avoids is paid anyway.
+    #[default]
+    #[serde(
+        alias = "all",
+        alias = "auto",
+        alias = "both",
+        alias = "dual",
+        alias = "offer_both"
+    )]
+    All,
 }
 
 impl std::fmt::Display for AudioFormat {
@@ -587,9 +594,25 @@ impl std::fmt::Display for AudioFormat {
         let s = match self {
             AudioFormat::Latm => "latm",
             AudioFormat::Pcm => "pcm",
-            AudioFormat::Both => "both",
+            AudioFormat::All => "all",
         };
         write!(f, "{}", s)
+    }
+}
+
+impl AudioFormat {
+    /// Parse the `?audio=` parameter a client put on its RTSP URL.
+    ///
+    /// Accepts the same spellings as the config file, case-insensitively,
+    /// and returns `None` for anything it does not recognise so the caller
+    /// can say so and carry on with the camera's configured format.
+    pub(crate) fn from_request(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "latm" | "aac" | "passthrough" => Some(Self::Latm),
+            "pcm" | "l16" | "raw" => Some(Self::Pcm),
+            "all" | "auto" | "both" | "dual" | "offer_both" => Some(Self::All),
+            _ => None,
+        }
     }
 }
 
@@ -708,8 +731,8 @@ mod tests {
     }
 
     #[test]
-    fn audio_format_defaults_to_latm() {
-        assert_eq!(camera("").audio_format, AudioFormat::Latm);
+    fn audio_format_defaults_to_offering_everything() {
+        assert_eq!(camera("").audio_format, AudioFormat::All);
     }
 
     #[test]
@@ -728,13 +751,31 @@ mod tests {
                 "{spelling} should select PCM"
             );
         }
-        for spelling in ["both", "Both", "dual", "offer_both"] {
+        for spelling in ["all", "All", "auto", "both", "dual", "offer_both"] {
             assert_eq!(
                 camera(&format!("audio_format = \"{spelling}\"")).audio_format,
-                AudioFormat::Both,
-                "{spelling} should offer both tracks"
+                AudioFormat::All,
+                "{spelling} should offer every format"
             );
         }
+    }
+
+    /// What a client can put on its URL, which has to line up with what the
+    /// config file accepts or the two would disagree about the same word.
+    #[test]
+    fn a_client_can_ask_for_a_format_by_name() {
+        for spelling in ["latm", "LATM", "aac", " passthrough "] {
+            assert_eq!(AudioFormat::from_request(spelling), Some(AudioFormat::Latm));
+        }
+        for spelling in ["pcm", "PCM", "l16", "raw"] {
+            assert_eq!(AudioFormat::from_request(spelling), Some(AudioFormat::Pcm));
+        }
+        for spelling in ["all", "auto", "both", "dual"] {
+            assert_eq!(AudioFormat::from_request(spelling), Some(AudioFormat::All));
+        }
+        // Unknown asks are ignored rather than guessed at.
+        assert_eq!(AudioFormat::from_request("opus"), None);
+        assert_eq!(AudioFormat::from_request(""), None);
     }
 
     #[test]

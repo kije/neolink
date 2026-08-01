@@ -227,7 +227,7 @@ pub(super) async fn make_dummy_factory(
     use_splash: bool,
     pattern: String,
 ) -> AnyResult<NeoMediaFactory> {
-    NeoMediaFactory::new_with_callback(move |element| {
+    NeoMediaFactory::new_with_callback(move |element, _audio_format| {
         clear_bin(&element)?;
         if !use_splash {
             Ok(None)
@@ -242,6 +242,9 @@ pub(super) async fn make_dummy_factory(
 enum ClientMsg {
     NewClient {
         element: Element,
+        /// The format this client asked for on its URL, overriding the
+        /// camera's configured one for this client alone.
+        audio_format: Option<AudioFormat>,
         reply: tokio::sync::oneshot::Sender<Element>,
     },
 }
@@ -257,7 +260,11 @@ pub(super) async fn make_factory(
 
         while let Some(msg) = client_rx.recv().await {
             match msg {
-                ClientMsg::NewClient { element, reply } => {
+                ClientMsg::NewClient {
+                    element,
+                    audio_format,
+                    reply,
+                } => {
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
@@ -274,11 +281,17 @@ pub(super) async fn make_factory(
                         let mut buffer = vec![];
                         let mut frame_count = 0usize;
 
+                        // A `?audio=` on the client's URL applies to that
+                        // client only; every other client on this camera
+                        // keeps the configured format. Each one gets its
+                        // own media (the factory is not shared), so they
+                        // can hold different formats at the same time.
+                        let audio_format = audio_format.unwrap_or(config.audio_format);
                         let mut stream_config = StreamConfig::new(
                             &camera,
                             stream,
                             Duration::from_millis(config.buffer_duration),
-                            config.audio_format,
+                            audio_format,
                         )
                         .await?;
                         // Bound stream-type negotiation. A slow or flaky camera that
@@ -441,9 +454,13 @@ pub(super) async fn make_factory(
     });
 
     // Now setup the factory
-    let factory = NeoMediaFactory::new_with_callback(move |element| {
+    let factory = NeoMediaFactory::new_with_callback(move |element, audio_format| {
         let (reply, new_element) = tokio::sync::oneshot::channel();
-        client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
+        client_tx.blocking_send(ClientMsg::NewClient {
+            element,
+            audio_format,
+            reply,
+        })?;
 
         let element = new_element.blocking_recv()?;
         Ok(Some(element))
@@ -1202,7 +1219,7 @@ fn decide_audio_tracks(
                 AudioTracks::Pcm
             }
         }
-        AudioFormat::Both => {
+        AudioFormat::All => {
             if can_use_latm(samples, framing, stream_config) {
                 AudioTracks::Both
             } else {
@@ -1874,7 +1891,7 @@ mod tests {
 
         let pipeline = Pipeline::new();
         let bin = pipeline.clone().upcast::<Element>();
-        let config = test_stream_config(AudioFormat::Both);
+        let config = test_stream_config(AudioFormat::All);
 
         let samples = vec![adts_frame(64); 4];
         let tracks = decide_audio_tracks(&samples, MP4_FRAMING, &config);
@@ -1922,7 +1939,7 @@ mod tests {
 
         let pipeline = Pipeline::new();
         let bin = pipeline.clone().upcast::<Element>();
-        let config = test_stream_config(AudioFormat::Both);
+        let config = test_stream_config(AudioFormat::All);
         let framing = AacFraming {
             adts: true,
             mpegversion: Some(2),

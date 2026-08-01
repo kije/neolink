@@ -111,28 +111,31 @@ address = "192.168.1.187:9000"
 
 # How the camera's audio is delivered over RTSP.
 #
-# "latm" (the default) passes AAC through untouched as MP4A-LATM (RFC 6416).
-#        No decoding happens, so there is no codec latency and the audio uses
-#        the camera's own bitrate rather than ~256kbps of raw samples.
-#        Understood by ffmpeg, VLC, go2rtc (Home Assistant, Frigate) and
-#        Blue Iris.
+# "all"  (the default) offers both formats below as separate audio tracks and
+#        lets the client set up the one it wants. Clients that negotiate
+#        (go2rtc, and so Home Assistant and Frigate) take one; clients that do
+#        not subscribe to every track and receive both at once — point those
+#        at "?audio=latm" (see below) or set this to a single format.
+# "latm" passes AAC through untouched as MP4A-LATM (RFC 6416). No decoding
+#        happens, so there is no codec latency and the audio uses the camera's
+#        own bitrate rather than ~256kbps of raw samples. Understood by
+#        ffmpeg, VLC, go2rtc (Home Assistant, Frigate) and Blue Iris.
 # "pcm"  decodes the audio and sends raw L16 samples. Slower and much larger,
 #        but understood by everything. Use this if your client cannot play
 #        MP4A-LATM.
-# "both" offers both as separate audio tracks in the SDP and lets the client
-#        set up the one it wants. Only useful for clients that negotiate
-#        (go2rtc, and so Home Assistant and Frigate): others subscribe to
-#        every track and get both audio streams at once. The decode branch
-#        also runs either way, and a decoder failure on this camera's audio
-#        takes the whole mount down with it, video included.
+#
+# A client can override this for itself by adding ?audio= to its URL:
+#     rtsp://neolink:8554/driveway/mainStream?audio=pcm
+# Each client gets its own pipeline, so two clients can hold different formats
+# on the same camera at once.
 #
 # ADPCM cameras are always decoded to L16 and ignore this setting.
 #
-# "latm" is a preference: passthrough needs MPEG-4 AAC in ADTS framing, and
-# neolink falls back to "pcm" (logging why) for cameras whose audio cannot
-# be payloaded that way.
+# Passthrough needs MPEG-4 AAC in ADTS framing. Where a camera cannot provide
+# it, the MP4A-LATM track is dropped and only L16 is offered, with a warning
+# in the log saying why.
 #
-# audio_format = "latm"
+# audio_format = "all"
 
 # How much media the server side queues may hold, in milliseconds.
 # This bounds how far behind live a client can drift when it stops keeping
