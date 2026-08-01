@@ -300,7 +300,16 @@ pub(super) async fn make_factory(
                         // Run blocking code on a separate thread
                         // This is not an async thread
                         let pump_handle = tokio::runtime::Handle::current();
-                        let mut fps_limiter = FpsLimiter::new(stream_config.fps, config.max_fps);
+                        // Opt-in only: with `max_fps` unset (or 0) this is None,
+                        // no limiter state exists, and every frame is forwarded
+                        // exactly as it was before the option existed.
+                        let mut fps_limiter = GopLimiter::for_config(config.max_fps);
+                        if fps_limiter.is_some() {
+                            log::debug!(
+                                "{name}::{stream}: limiting video to {:?} fps (GOP-aligned)",
+                                config.max_fps
+                            );
+                        }
                         std::thread::spawn(move || {
                             let mut tracker = TimestampTracker::new();
 
@@ -311,7 +320,7 @@ pub(super) async fn make_factory(
                                     &vid_src,
                                     &aud_src,
                                     &mut tracker,
-                                    &mut fps_limiter,
+                                    fps_limiter.as_mut(),
                                 )?;
                             }
 
@@ -333,7 +342,7 @@ pub(super) async fn make_factory(
                                             &vid_src,
                                             &aud_src,
                                             &mut tracker,
-                                            &mut fps_limiter,
+                                            fps_limiter.as_mut(),
                                         );
                                         if let Err(r) = &r {
                                             log::info!("Failed to send to source: {r:?}");
@@ -386,7 +395,7 @@ fn send_to_sources(
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     tracker: &mut TimestampTracker,
-    fps_limiter: &mut FpsLimiter,
+    fps_limiter: Option<&mut GopLimiter>,
 ) -> AnyResult<()> {
     match data {
         BcMedia::Aac(aac) => {
@@ -417,7 +426,7 @@ fn send_to_sources(
             // ones, so that its camera-clock baseline stays correct and the
             // surviving frames keep their true capture times.
             let ts_us = tracker.next_video_us(microseconds);
-            let send = fps_limiter.take();
+            let send = fps_limiter.is_none_or(|l| l.admit(ts_us, true));
             if let Some(posix) = time {
                 log::trace!(
                     "IFrame: pts={:?} camera_us={} posix={} send={}",
@@ -444,7 +453,7 @@ fn send_to_sources(
             data, microseconds, ..
         }) => {
             let ts_us = tracker.next_video_us(microseconds);
-            let send = fps_limiter.take();
+            let send = fps_limiter.is_none_or(|l| l.admit(ts_us, false));
             log::trace!(
                 "PFrame: pts={:?} camera_us={} send={}",
                 Duration::from_micros(ts_us),
@@ -462,49 +471,115 @@ fn send_to_sources(
     Ok(())
 }
 
-/// Per-client video frame decimator backing the `max_fps` camera option.
+/// Upper bound on the send allowance [`GopLimiter`] will bank, in
+/// microseconds.
 ///
+/// Allowance accrues while the tail of a GOP is being dropped and is spent
+/// on the head of the next one, so this has to cover a whole GOP interval
+/// for the limiter to reach its target rate — Reolink keyframe intervals
+/// are typically 1-4 s. The cap is what stops a long stall (camera asleep,
+/// motion-gated stream) from banking minutes of allowance and then
+/// releasing it as one enormous burst.
+const BURST_CAP_US: i64 = 5_000_000;
+
+/// Per-client video decimator backing the `max_fps` camera option.
+///
+/// Constructed only when the option is set — see [`GopLimiter::for_config`].
 /// One instance lives in each client's blocking frame-pump thread, so two
 /// clients on the same camera decimate independently. Audio is never
 /// throttled and never reaches this type.
-struct FpsLimiter {
-    camera_fps: u32,
-    max_fps: Option<u32>,
-    frame_count: u64,
+///
+/// # Why this is GOP-aligned
+///
+/// H.264/H.265 P-frames are predicted from the frames before them, so a
+/// decimator that drops frames from the *middle* of a group of pictures
+/// leaves the survivors referencing frames that never arrived, and the
+/// decoder shows artefacts until the next keyframe. This limiter therefore
+/// only ever drops a *suffix* of a GOP: once a frame is withheld, every
+/// remaining frame is withheld until the next keyframe restarts the
+/// prediction chain. Everything that reaches the client is decodable.
+///
+/// Two consequences fall out of that, both intended:
+///
+/// * **Output is bursty.** Frames arrive as a run at the camera's native
+///   rate followed by a gap, rather than smoothly spaced. Averaged over a
+///   GOP the rate is `max_fps`; instantaneously it is not.
+/// * **Keyframes set a floor.** They are never dropped, so a stream whose
+///   keyframe rate alone already exceeds `max_fps` is passed through at
+///   that keyframe rate. Dropping keyframes would blank the stream rather
+///   than thin it.
+///
+/// Smoothly spaced output at an arbitrary rate would require re-encoding,
+/// which is far more expensive than the CPU this option is meant to save.
+struct GopLimiter {
+    /// Allowance consumed by one forwarded frame, in microseconds.
+    interval_us: i64,
+    /// PTS of the previous video frame, used to accrue allowance.
+    last_pts_us: Option<u64>,
+    /// Allowance banked so far, in microseconds. Capped at [`BURST_CAP_US`].
+    credit_us: i64,
+    /// Cleared once a frame has been withheld in the current GOP; the next
+    /// keyframe sets it again.
+    chain_intact: bool,
 }
 
-impl FpsLimiter {
-    fn new(camera_fps: u32, max_fps: Option<u32>) -> Self {
-        Self {
-            camera_fps,
-            max_fps,
-            frame_count: 0,
-        }
+impl GopLimiter {
+    /// Build a limiter for a camera's `max_fps` setting, or `None` when the
+    /// option is not in use.
+    ///
+    /// An unset option and an explicit `0` both mean "no limit", and both
+    /// return `None` so that the frame path stays exactly as it is for
+    /// everyone who has not opted in.
+    fn for_config(max_fps: Option<u32>) -> Option<Self> {
+        let max_fps = max_fps.filter(|fps| *fps > 0)?;
+        Some(Self {
+            // max_fps is non-zero, so this cannot divide by zero, and the
+            // result fits an i64 comfortably (1 fps → 1_000_000).
+            interval_us: (1_000_000 / max_fps as u64) as i64,
+            last_pts_us: None,
+            credit_us: 0,
+            chain_intact: false,
+        })
     }
 
-    /// Account for one video frame, returning whether it should be forwarded.
+    /// Account for one video frame, returning whether to forward it.
     ///
     /// Must be called exactly once per video frame — including frames that
-    /// end up dropped — or the decimation ratio drifts.
-    fn take(&mut self) -> bool {
-        let send = should_send_frame(self.frame_count, self.camera_fps, self.max_fps);
-        self.frame_count = self.frame_count.wrapping_add(1);
-        send
-    }
-}
-
-/// Returns `true` if this video frame should be forwarded to the GStreamer pipeline.
-///
-/// The timestamp tracker is advanced for dropped frames too; only the payload
-/// is withheld. `limit = 0` or `limit >= camera_fps` means no frames are dropped.
-fn should_send_frame(vid_frame_count: u64, camera_fps: u32, max_fps: Option<u32>) -> bool {
-    match max_fps {
-        Some(limit) if limit > 0 && camera_fps > limit => {
-            // Ceiling-integer skip factor: 15 fps / 5 limit → skip 3
-            let frame_skip = (camera_fps as u64).div_ceil(limit as u64);
-            vid_frame_count.is_multiple_of(frame_skip)
+    /// end up dropped — since the elapsed time between frames is what funds
+    /// the allowance. `pts_us` is the monotonic presentation timestamp from
+    /// [`TimestampTracker`], not the raw camera value, so it is already
+    /// free of wrap and restart artefacts.
+    fn admit(&mut self, pts_us: u64, is_keyframe: bool) -> bool {
+        if let Some(last) = self.last_pts_us {
+            let elapsed = pts_us.saturating_sub(last).min(i64::MAX as u64) as i64;
+            self.credit_us = self.credit_us.saturating_add(elapsed).min(BURST_CAP_US);
         }
-        _ => true,
+        self.last_pts_us = Some(pts_us);
+
+        if is_keyframe {
+            // Always forwarded: a keyframe is what makes the frames after it
+            // decodable. Clamping the charge at zero rather than letting it
+            // go negative means a stream whose keyframe rate already exceeds
+            // max_fps settles at that rate instead of running up a debt it
+            // would repay by starving the P-frames of later GOPs.
+            self.chain_intact = true;
+            self.credit_us = (self.credit_us - self.interval_us).max(0);
+            return true;
+        }
+
+        if !self.chain_intact {
+            return false;
+        }
+
+        if self.credit_us >= self.interval_us {
+            self.credit_us -= self.interval_us;
+            true
+        } else {
+            // Withholding this frame orphans every later frame in the GOP,
+            // so stop forwarding until the next keyframe.
+            self.chain_intact = false;
+            false
+        }
     }
 }
 
@@ -512,73 +587,127 @@ fn should_send_frame(vid_frame_count: u64, camera_fps: u32, max_fps: Option<u32>
 mod fps_limit_tests {
     use super::*;
 
-    #[test]
-    fn fps_15_to_5() {
-        // skip=3 → frames 0,3,6,9,12 pass out of 15
-        let sent: Vec<u64> = (0..15)
-            .filter(|&i| should_send_frame(i, 15, Some(5)))
-            .collect();
-        assert_eq!(sent, vec![0, 3, 6, 9, 12]);
+    /// Feed `gops` groups of `gop_len` frames at `camera_fps`, returning one
+    /// entry per frame recording whether it was forwarded.
+    fn run(limiter: &mut GopLimiter, camera_fps: u64, gop_len: usize, gops: usize) -> Vec<bool> {
+        let step = 1_000_000 / camera_fps;
+        (0..gops * gop_len)
+            .map(|i| limiter.admit(i as u64 * step, i % gop_len == 0))
+            .collect()
     }
 
     #[test]
-    fn fps_no_limit() {
-        for i in 0..100 {
-            assert!(should_send_frame(i, 15, None));
+    fn unset_option_builds_no_limiter() {
+        assert!(GopLimiter::for_config(None).is_none());
+    }
+
+    #[test]
+    fn zero_means_no_limiter() {
+        assert!(GopLimiter::for_config(Some(0)).is_none());
+    }
+
+    #[test]
+    fn set_option_builds_a_limiter() {
+        assert!(GopLimiter::for_config(Some(5)).is_some());
+    }
+
+    #[test]
+    fn keyframes_are_never_dropped() {
+        // 1 fps against a 15 fps camera with a 1 s GOP: the keyframe rate
+        // alone is above the limit, so every keyframe still goes out.
+        let mut limiter = GopLimiter::for_config(Some(1)).unwrap();
+        let sent = run(&mut limiter, 15, 15, 6);
+        for (i, sent) in sent.iter().enumerate() {
+            if i % 15 == 0 {
+                assert!(sent, "keyframe {} was dropped", i);
+            }
         }
     }
 
     #[test]
-    fn fps_limit_equals_camera() {
-        for i in 0..15 {
-            assert!(should_send_frame(i, 15, Some(15)));
+    fn drops_only_gop_suffixes() {
+        // The invariant that makes the output decodable: within any GOP,
+        // forwarded frames form a prefix — no frame is forwarded after one
+        // has been withheld.
+        let mut limiter = GopLimiter::for_config(Some(5)).unwrap();
+        let sent = run(&mut limiter, 15, 30, 8);
+        for gop in sent.chunks(30) {
+            let dropped_at = gop.iter().position(|s| !s);
+            if let Some(first_drop) = dropped_at {
+                assert!(
+                    gop[first_drop..].iter().all(|s| !s),
+                    "frame forwarded after a drop within the same GOP: {:?}",
+                    gop
+                );
+            }
         }
     }
 
     #[test]
-    fn fps_camera_zero_no_panic() {
-        // camera_fps=0 means the condition `camera_fps > limit` is never true
-        for i in 0..10 {
-            assert!(should_send_frame(i, 0, Some(5)));
-        }
+    fn converges_on_the_requested_rate() {
+        // 15 fps camera, 2 s GOP, limited to 5 fps. Measured over the
+        // steady-state GOPs (the first is a warm-up, since no allowance has
+        // accrued yet) the output should sit at ~5 fps.
+        let mut limiter = GopLimiter::for_config(Some(5)).unwrap();
+        let sent = run(&mut limiter, 15, 30, 10);
+        let steady: usize = sent[30..].iter().filter(|s| **s).count();
+        let seconds = 9.0 * 30.0 / 15.0;
+        let rate = steady as f64 / seconds;
+        assert!(
+            (4.0..=6.0).contains(&rate),
+            "expected ~5 fps, measured {:.2} fps",
+            rate
+        );
     }
 
     #[test]
-    fn fps_limit_one() {
-        // 30fps → skip=30 → only frame 0 (and 30, 60, …) pass
-        assert!(should_send_frame(0, 30, Some(1)));
-        for i in 1..30 {
-            assert!(!should_send_frame(i, 30, Some(1)));
-        }
-        assert!(should_send_frame(30, 30, Some(1)));
+    fn limit_at_camera_rate_drops_nothing() {
+        let mut limiter = GopLimiter::for_config(Some(15)).unwrap();
+        let sent = run(&mut limiter, 15, 30, 5);
+        assert!(sent.iter().all(|s| *s), "frames dropped at the camera rate");
     }
 
     #[test]
-    fn fps_limit_zero_means_no_limit() {
-        for i in 0..15 {
-            assert!(should_send_frame(i, 15, Some(0)));
-        }
+    fn limit_above_camera_rate_drops_nothing() {
+        let mut limiter = GopLimiter::for_config(Some(30)).unwrap();
+        let sent = run(&mut limiter, 15, 30, 5);
+        assert!(sent.iter().all(|s| *s), "frames dropped below the limit");
     }
 
     #[test]
-    fn fps_near_u64_max_no_panic() {
-        let near_max = u64::MAX - 1;
-        let _ = should_send_frame(near_max, 15, Some(5));
+    fn stall_does_not_bank_an_unbounded_burst() {
+        // A camera that goes quiet must not bank allowance for the whole
+        // silence and then release it: the catch-up burst has to be bounded
+        // by BURST_CAP_US, not by how long the stream was idle.
+        let burst_after = |stall_us: u64| {
+            let mut limiter = GopLimiter::for_config(Some(5)).unwrap();
+            limiter.admit(0, true);
+            (0..600)
+                .filter(|i| limiter.admit(stall_us + i * 66_666, *i == 0))
+                .count()
+        };
+
+        let after_a_minute = burst_after(60_000_000);
+        let after_a_day = burst_after(86_400_000_000);
+        assert_eq!(
+            after_a_minute, after_a_day,
+            "burst length scaled with the stall: {} vs {}",
+            after_a_minute, after_a_day
+        );
+        assert!(
+            after_a_minute < 600,
+            "the whole run was forwarded, so nothing was actually capped"
+        );
     }
 
     #[test]
-    fn limiter_decimates_and_advances() {
-        let mut limiter = FpsLimiter::new(15, Some(5));
-        let sent: Vec<bool> = (0..15).map(|_| limiter.take()).collect();
-        assert_eq!(sent.iter().filter(|s| **s).count(), 5);
-        assert!(sent[0] && sent[3] && sent[6] && sent[9] && sent[12]);
-        assert_eq!(limiter.frame_count, 15);
-    }
-
-    #[test]
-    fn limiter_without_limit_sends_everything() {
-        let mut limiter = FpsLimiter::new(15, None);
-        assert!((0..50).all(|_| limiter.take()));
+    fn non_monotonic_pts_does_not_panic() {
+        // TimestampTracker guarantees monotonic PTS, but the limiter must
+        // not panic on overflow if that ever changes.
+        let mut limiter = GopLimiter::for_config(Some(5)).unwrap();
+        limiter.admit(u64::MAX, true);
+        limiter.admit(0, false);
+        limiter.admit(u64::MAX, false);
     }
 }
 

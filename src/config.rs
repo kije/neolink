@@ -303,12 +303,14 @@ pub(crate) struct CameraConfig {
     /// Limit the RTSP output to at most this many frames per second.
     /// When set, the ingest path drops excess video frames before they enter
     /// the GStreamer pipeline, reducing both CPU load and RTSP bandwidth.
-    /// Audio is never throttled. `null` / omitted (or `0`) means no limit.
+    /// Audio is never throttled. Strictly opt-in: `null` / omitted (or `0`)
+    /// means no limit, and no limiter is constructed at all.
     ///
-    /// Frames are dropped rather than re-encoded, so the inter-frame
-    /// prediction chain is broken and decoders will show artefacts until the
-    /// next keyframe. Intended for still grabs and bandwidth caps, not for
-    /// normal live viewing. See the README for the full caveat.
+    /// Frames are dropped rather than re-encoded, so only the tail of a group
+    /// of pictures is ever dropped and everything the client receives stays
+    /// decodable. The costs are bursty output and a floor at the camera's
+    /// keyframe rate. Intended for bandwidth caps and still grabs, not for a
+    /// live view. See `GopLimiter` and the README for the full picture.
     #[serde(default, alias = "fps_limit")]
     pub(crate) max_fps: Option<u32>,
 
