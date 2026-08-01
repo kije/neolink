@@ -139,6 +139,15 @@ audio_format = "pcm"   # "latm" (default) or "pcm"
 ADPCM cameras have no RTP passthrough format available and are always decoded
 to `L16`; `audio_format` has no effect on them.
 
+`latm` is a preference rather than a demand. Passthrough only works for MPEG-4
+AAC in ADTS framing, so before neolink serves a stream it checks that the
+camera's own audio really does reach the `MP4A-LATM` payloader, and falls back
+to `L16` (with a warning in the log saying why) when it does not. A camera
+sending MPEG-2 AAC, for instance, cannot be passed through at all. This check
+matters because an audio format the pipeline cannot negotiate does not merely
+mute the stream — it stops the whole RTSP media from being described, taking
+the video with it.
+
 The other latency control is `buffer_duration`, which caps how much media the
 server-side queues may hold, in milliseconds:
 

@@ -122,6 +122,10 @@ address = "192.168.1.187:9000"
 #
 # ADPCM cameras are always decoded to L16 and ignore this setting.
 #
+# "latm" is a preference: passthrough needs MPEG-4 AAC in ADTS framing, and
+# neolink falls back to "pcm" (logging why) for cameras whose audio cannot
+# be payloaded that way.
+#
 # audio_format = "latm"
 
 # How much media the server side queues may hold, in milliseconds.
