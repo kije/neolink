@@ -302,12 +302,14 @@ pub(crate) struct CameraConfig {
     /// Limit the RTSP output to at most this many frames per second.
     /// When set, the ingest path drops excess video frames before they enter
     /// the GStreamer pipeline, reducing both CPU load and RTSP bandwidth.
-    /// Audio is never throttled. `null` / omitted (or `0`) means no limit.
+    /// Audio is never throttled. Strictly opt-in: `null` / omitted (or `0`)
+    /// means no limit, and no limiter is constructed at all.
     ///
-    /// Frames are dropped rather than re-encoded, so the inter-frame
-    /// prediction chain is broken and decoders will show artefacts until the
-    /// next keyframe. Intended for still grabs and bandwidth caps, not for
-    /// normal live viewing. See the README for the full caveat.
+    /// Frames are dropped rather than re-encoded, so only the tail of a group
+    /// of pictures is ever dropped and everything the client receives stays
+    /// decodable. The costs are bursty output and a floor at the camera's
+    /// keyframe rate. Intended for bandwidth caps and still grabs, not for a
+    /// live view. See `GopLimiter` and the README for the full picture.
     #[serde(default, alias = "fps_limit")]
     pub(crate) max_fps: Option<u32>,
 
@@ -557,16 +559,37 @@ pub(crate) enum AudioFormat {
     ///
     /// Understood by ffmpeg/ffprobe, VLC, go2rtc (and therefore Home
     /// Assistant and Frigate) and Blue Iris.
-    #[default]
     #[serde(alias = "latm", alias = "aac", alias = "passthrough")]
     Latm,
     /// Decode the audio to raw samples and send it as `L16` (RFC 3551).
     ///
-    /// Maximum client compatibility at the cost of decode latency and a
-    /// much larger RTP bitrate. This is what neolink did unconditionally
-    /// before `audio_format` existed. ADPCM always uses this path.
+    /// The default, and what neolink did unconditionally before
+    /// `audio_format` existed: one track, in a format every RTSP client
+    /// understands, at the cost of decode latency and a much larger RTP
+    /// bitrate. ADPCM always uses this path.
+    #[default]
     #[serde(alias = "pcm", alias = "l16", alias = "raw")]
     Pcm,
+    /// Offer everything we can, as separate audio tracks in the SDP, and
+    /// let the client decide.
+    ///
+    /// One `MP4A-LATM` track and one `L16` track are advertised, and a
+    /// client that negotiates (go2rtc, and so Home Assistant and Frigate)
+    /// sets up only the one it wants.
+    ///
+    /// Opt-in, because a client that does not negotiate sets up every
+    /// track in the SDP and so receives both audio streams at once. Both
+    /// branches also run server-side regardless of what is subscribed, so
+    /// the decode that `latm` avoids is paid anyway, and a decoder failure
+    /// takes the passthrough track and the video with it.
+    #[serde(
+        alias = "all",
+        alias = "auto",
+        alias = "both",
+        alias = "dual",
+        alias = "offer_both"
+    )]
+    All,
 }
 
 impl std::fmt::Display for AudioFormat {
@@ -574,8 +597,25 @@ impl std::fmt::Display for AudioFormat {
         let s = match self {
             AudioFormat::Latm => "latm",
             AudioFormat::Pcm => "pcm",
+            AudioFormat::All => "all",
         };
         write!(f, "{}", s)
+    }
+}
+
+impl AudioFormat {
+    /// Parse the `?audio=` parameter a client put on its RTSP URL.
+    ///
+    /// Accepts the same spellings as the config file, case-insensitively,
+    /// and returns `None` for anything it does not recognise so the caller
+    /// can say so and carry on with the camera's configured format.
+    pub(crate) fn from_request(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "latm" | "aac" | "passthrough" => Some(Self::Latm),
+            "pcm" | "l16" | "raw" => Some(Self::Pcm),
+            "all" | "auto" | "both" | "dual" | "offer_both" => Some(Self::All),
+            _ => None,
+        }
     }
 }
 
@@ -693,9 +733,11 @@ mod tests {
         toml::from_str(&toml).expect("camera config should parse")
     }
 
+    /// The default has to be the one every RTSP client can play: anything
+    /// else is a stream some client cannot hear, chosen on its behalf.
     #[test]
-    fn audio_format_defaults_to_latm() {
-        assert_eq!(camera("").audio_format, AudioFormat::Latm);
+    fn audio_format_defaults_to_the_universally_understood_one() {
+        assert_eq!(camera("").audio_format, AudioFormat::Pcm);
     }
 
     #[test]
@@ -714,6 +756,31 @@ mod tests {
                 "{spelling} should select PCM"
             );
         }
+        for spelling in ["all", "All", "auto", "both", "dual", "offer_both"] {
+            assert_eq!(
+                camera(&format!("audio_format = \"{spelling}\"")).audio_format,
+                AudioFormat::All,
+                "{spelling} should offer every format"
+            );
+        }
+    }
+
+    /// What a client can put on its URL, which has to line up with what the
+    /// config file accepts or the two would disagree about the same word.
+    #[test]
+    fn a_client_can_ask_for_a_format_by_name() {
+        for spelling in ["latm", "LATM", "aac", " passthrough "] {
+            assert_eq!(AudioFormat::from_request(spelling), Some(AudioFormat::Latm));
+        }
+        for spelling in ["pcm", "PCM", "l16", "raw"] {
+            assert_eq!(AudioFormat::from_request(spelling), Some(AudioFormat::Pcm));
+        }
+        for spelling in ["all", "auto", "both", "dual"] {
+            assert_eq!(AudioFormat::from_request(spelling), Some(AudioFormat::All));
+        }
+        // Unknown asks are ignored rather than guessed at.
+        assert_eq!(AudioFormat::from_request("opus"), None);
+        assert_eq!(AudioFormat::from_request(""), None);
     }
 
     #[test]
