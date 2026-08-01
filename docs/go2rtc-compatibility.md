@@ -2,13 +2,14 @@
 
 *Investigation and design proposal for a compatibility mode.*
 
-Status: **partly implemented.** Stages 0 and 1 of §5 have landed on this
+Status: **mostly implemented.** Stages 0, 1 and 2 of §5 have landed on this
 branch, along with the caching half of §3.2 — the misleading documentation is
 corrected, `audio_format = "mpeg4-generic"` exists so `all` offers a track
 go2rtc can use, and a learned stream profile now keeps the camera off the
 DESCRIBE path. §2.1, §2.2 and §3.1 are marked resolved below and kept for the
-record, and §3.2 is reduced to its remaining half. Everything else is still a
-proposal.
+record, §3.2 is reduced to its remaining half, and §3.4/§3.8 are carried by
+the `compat = "go2rtc"` profile. What is left is §3.3 (silence), §3.5
+(shared media), §3.6 (deterministic SDP) and §3.7 (keyframe start).
 
 Revised against `master` at `a09634b` (PRs #34 and #35), which landed a large
 rework of the audio path and the FPS limiter while this was being written.
@@ -322,9 +323,9 @@ re-pushes the last I-frame on a timer well inside 5 s. The latter is the
 better answer — it makes pausing usable with go2rtc instead of merely
 forbidden.
 
-### 3.4 The "Stream not Ready" splash is actively harmful here
+### 3.4 The "Stream not Ready" splash is actively harmful here — **carried by the profile**
 
-Unchanged. While the camera is being set up, and whenever pipeline
+While the camera is being set up, and whenever pipeline
 construction fails, neolink serves a placeholder built from `videotestsrc !
 textoverlay ! jpegenc ! rtpjpegpay` (`build_unknown`,
 `src/rtsp/factory.rs:895`), mounted at every path up front
@@ -342,8 +343,9 @@ up permanently on a 404. For go2rtc it is the wrong trade:
   Reconnect, get another 20 s of JPEG, repeat.
 
 go2rtc, unlike Blue Iris, retries a failed DESCRIBE with backoff perfectly
-happily. **In the mode, `use_splash` should default to off** and DESCRIBE
-should fail cleanly instead.
+happily. `compat = "go2rtc"` therefore defaults `use_splash` to off, and a
+DESCRIBE that cannot be served fails cleanly instead. Anyone who wants the
+placeholder back can still set `use_splash = true` alongside the profile.
 
 ### 3.5 Session lifecycle: one client's churn shouldn't cost N camera sessions
 
@@ -370,10 +372,15 @@ being shared, so that two clients can hold different `?audio=` formats on the
 same camera at once. Sharing would have to be keyed on the resolved format
 (one shared media per distinct format) rather than switched on wholesale.
 
-**Fixes:** `set_shared(true)` per resolved audio format in the mode — one
-pipeline serving go2rtc, snapshots and any second consumer, which is strictly
-better when the camera is the scarce resource. Where sharing is not wanted,
-`set_stop_on_disconnect(true)` at least releases the camera promptly.
+**Half done.** `compat = "go2rtc"` now sets `set_stop_on_disconnect(true)`,
+which releases the camera as soon as the client goes rather than at the
+session timeout — the cheap half, and it needs no design change.
+
+**Still open:** `set_shared(true)`, keyed per resolved audio format, so one
+pipeline serves go2rtc, snapshots and any second consumer. That is strictly
+better when the camera is the scarce resource, but it reworks the per-client
+model `367b9aa` just landed, so it wants deciding on its own rather than
+riding in on a profile.
 
 ### 3.6 The SDP shape must be identical across reconnects
 
@@ -426,15 +433,16 @@ pump is the portable answer.
 
 The payloader tuning is right and `max_fps` is now safe (§1.2). What is left:
 
-- **`buffer_duration` still defaults to 3000 ms** (`src/config.rs:683`), and
-  it is the dominant term in neolink's own contribution to glass-to-glass
-  delay (`make_queue`, `src/rtsp/factory.rs:1729`). Three seconds is a
-  sensible ride-out-congestion default for a recorder; it is far too much in
-  front of a WebRTC consumer. ~250 ms is the right order for the mode.
+Both now carried by the profile:
+
+- **`buffer_duration`** is the dominant term in neolink's own contribution to
+  glass-to-glass delay (`make_queue`). Three seconds is a sensible
+  ride-out-congestion default for a recorder; it is far too much in front of a
+  WebRTC consumer. `compat = "go2rtc"` defaults it to 250 ms.
 - **Transport.** go2rtc dials RTSP over **TCP interleaved by default**
   (`pkg/rtsp/client.go` sets `Protocol = "rtsp+tcp"` unless `?transport=udp`),
-  so `set_protocols(RTSPLowerTrans::TCP)` costs go2rtc nothing and removes UDP
-  packet loss as a failure mode for everyone else on that mount.
+  so restricting the factory to `RTSPLowerTrans::TCP` costs go2rtc nothing and
+  removes UDP packet loss as a failure mode for everyone else on that mount.
 
 ### 3.9 H265 is a real limitation, and not one neolink can fix
 
@@ -474,15 +482,15 @@ move again.
 
 | setting | today | `compat = "go2rtc"` | § |
 |---|---|---|---|
-| `audio_format` | `pcm` | `all` | 3.1 |
-| `buffer_duration` | 3000 ms | 250 ms | 3.8 |
-| `use_splash` | true | **false** | 3.4 |
+| `audio_format` | `pcm` | `all` (done) | 3.1 |
+| `buffer_duration` | 3000 ms | 250 ms (done) | 3.8 |
+| `use_splash` | true | **false** (done) | 3.4 |
 | `pause.on_motion` | false | warn if set (until keep-alive exists) | 3.3 |
 | `max_fps` | unset | warn if the camera's GOP approaches 5 s | 3.3 |
-| *new* `shared` | false | **true**, keyed per resolved audio format | 3.5 |
+| *new* `shared` | false | **true**, keyed per resolved audio format (open) | 3.5 |
 | *new* `stable_sdp` | false | **true** (silence fallback, fixed track set) | 3.6 |
 | *new* `start_on_keyframe` | false | **true** | 3.7 |
-| *new* `rtsp_protocols` | any | `tcp` | 3.8 |
+| *new* `rtsp_protocols` | any | `tcp` (done, not a config key — the profile sets it) | 3.8 |
 | *new* `stream_learn_timeout` | 10 s | 2 s (the cached profile makes this a cold-start-only cost) | 3.2 |
 
 ### New `audio_format` variant
@@ -505,10 +513,11 @@ for `MP4A-LATM` now say what is true (§2.1).
 (`rtpmp4gpay`), included in `all`, which is what makes `all` and `?audio=`
 worth anything to a go2rtc user (§3.1).
 
-**Stage 2 — the profile.** Introduce `compat`, wire it to the existing keys
-(`audio_format`, `buffer_duration`, `use_splash`) plus the factory flags
-(`shared`, `stop_on_disconnect`, `protocols`), and add the H265 warning. The
-smallest change that makes a default go2rtc install work well.
+**Stage 2 — the profile. Done**, except for shared media. `compat` moves the
+defaults of `audio_format`, `buffer_duration` and `use_splash`, sets
+`stop_on_disconnect` and TCP-only transports on the factory, and warns on
+H265. Anything set explicitly still wins. Shared media was deliberately left
+out — see §3.5.
 
 **Stage 3 — the structural work.** The cached per-stream profile is **done**
 (§3.2). Remaining: keeping the media prepared between clients so DESCRIBE need

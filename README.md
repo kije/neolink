@@ -113,6 +113,49 @@ using the terminal in the same folder the neolink binary is in.
 ./neolink rtsp --config=neolink.toml
 ```
 
+### Tuning for a consumer
+
+neolink's defaults suit the clients it has historically been pointed at —
+Blue Iris, VLC, ffmpeg, Home Assistant's generic camera. Those are lenient:
+they retry, they wait, and they decode almost any RTP payload format.
+
+go2rtc is neither lenient nor the end consumer. It terminates neolink's RTSP
+once and republishes to browsers over WebRTC and MSE, which means a narrow
+codec set, a fixed five-second timeout on every RTSP request, and reconnects
+as a matter of routine rather than of failure. It wants close to the opposite
+settings.
+
+Rather than make everyone find each knob separately, `compat` picks a
+coherent set of **defaults**:
+
+```toml
+[[cameras]]
+name = "Camera01"
+username = "admin"
+password = "password"
+uid = "ABCDEF0123456789"
+compat = "go2rtc"          # "default" (what neolink has always done) or "go2rtc"
+```
+
+| setting | `"default"` | `"go2rtc"` | why |
+| --- | --- | --- | --- |
+| `audio_format` | `pcm` | `all` | go2rtc's MP4/HLS output wants the AAC untouched; its WebRTC output cannot decode AAC at all and needs the `L16` track |
+| `buffer_duration` | 3000 ms | 250 ms | queue depth rides out congestion for a recorder; in front of a live viewer it is just delay |
+| `use_splash` | on | **off** | the placeholder is MJPEG, which browsers cannot play, and it ends after ~20s — go2rtc then reconnects, forever |
+| RTSP transports | any | TCP only | go2rtc dials TCP anyway, so this costs it nothing and takes UDP packet loss off the table |
+| media on disconnect | held until the session times out | torn down at once | go2rtc drops the connection without a TEARDOWN when its read deadline fires; holding the pipeline open just stacks up camera subscriptions |
+
+**It only moves defaults.** Anything you set explicitly still wins, so
+`compat = "go2rtc"` with `buffer_duration = 1000` gives you the go2rtc
+profile with a one-second queue. `profile` and `tuned_for` are accepted as
+aliases for the key, and `webrtc` and `frigate` for the value.
+
+The profile also warns, once per stream, when the camera is sending H265 —
+browsers are far pickier about it than about H264, and neolink cannot change
+the camera's encoder. See the note at the end of this section.
+
+`docs/go2rtc-compatibility.md` has the reasoning, and what is still open.
+
 ### Audio and Latency
 
 Reolink cameras send audio either as AAC or as DVI4 ADPCM.

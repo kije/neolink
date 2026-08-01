@@ -259,13 +259,10 @@ pub(crate) struct CameraConfig {
         message = "Invalid buffer duration (it's in ms)",
         code = "buffer_duration"
     ))]
-    /// Buffer duration in ms
-    #[serde(
-        default = "default_buffer_duration",
-        alias = "duration",
-        alias = "buffer"
-    )]
-    pub(crate) buffer_duration: u64,
+    /// Buffer duration in ms. Unset takes the [`Compat`] profile's answer.
+    /// Read through [`CameraConfig::buffer_duration`].
+    #[serde(default, alias = "duration", alias = "buffer")]
+    buffer_duration: Option<u64>,
 
     #[serde(default = "default_true", alias = "enable")]
     pub(crate) enabled: bool,
@@ -273,18 +270,24 @@ pub(crate) struct CameraConfig {
     #[serde(default = "default_false", alias = "verbose")]
     pub(crate) debug: bool,
 
-    #[serde(default = "default_true", alias = "splash")]
-    pub(crate) use_splash: bool,
+    /// Whether to serve the "Stream not Ready" placeholder while the
+    /// camera is being set up. Unset takes the [`Compat`] profile's answer.
+    /// Read through [`CameraConfig::use_splash`].
+    #[serde(default, alias = "splash")]
+    use_splash: Option<bool>,
 
     #[serde(default = "default_splash", alias = "pattern")]
     pub(crate) splash_pattern: SplashPattern,
 
     /// How AAC audio is delivered over RTSP. See [`AudioFormat`].
     ///
+    /// Unset takes the [`Compat`] profile's answer. Read through
+    /// [`CameraConfig::audio_format`].
+    ///
     /// Ignored for ADPCM cameras, which have no RTP passthrough format and
     /// are always decoded to L16.
     #[serde(default, alias = "audio", alias = "aud_format")]
-    pub(crate) audio_format: AudioFormat,
+    audio_format: Option<AudioFormat>,
 
     #[serde(
         default = "default_max_discovery_retries",
@@ -313,9 +316,124 @@ pub(crate) struct CameraConfig {
     #[serde(default, alias = "fps_limit")]
     pub(crate) max_fps: Option<u32>,
 
+    /// Which downstream consumer this camera is being tuned for. Changes
+    /// the *defaults* of the settings above; anything set explicitly still
+    /// wins. See [`Compat`].
+    #[serde(default, alias = "profile", alias = "tuned_for")]
+    pub(crate) compat: Compat,
+
     #[validate(nested)]
     #[serde(default)]
     pub(crate) onvif: OnvifCameraConfig,
+}
+
+/// Which downstream consumer a camera is being tuned for.
+///
+/// neolink's defaults suit lenient end consumers — Blue Iris, VLC, ffmpeg —
+/// which retry a 404, sit on a stalled socket for a minute and decode almost
+/// any RTP payload format. A republisher like go2rtc is neither lenient nor
+/// the end consumer, and wants close to the opposite settings. Rather than
+/// make every such user find each knob separately, this picks a coherent set
+/// of *defaults* for them. Every individual setting still overrides it.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq, Default)]
+pub(crate) enum Compat {
+    /// What neolink has always done.
+    #[default]
+    #[serde(alias = "default", alias = "none", alias = "standard")]
+    Default,
+    /// Tuned for go2rtc, and so for Home Assistant and Frigate through it.
+    ///
+    /// Offers every audio format so go2rtc's MP4/HLS output can take the
+    /// AAC untouched while its WebRTC output takes the `L16` track it needs;
+    /// keeps the server-side queues short, because a WebRTC viewer is not a
+    /// recorder and three seconds of buffer is three seconds of delay; and
+    /// drops the MJPEG placeholder, which advertises a codec browsers cannot
+    /// play and then ends, sending go2rtc into a reconnect loop.
+    #[serde(alias = "go2rtc", alias = "webrtc", alias = "frigate")]
+    Go2rtc,
+}
+
+impl Compat {
+    /// The default audio format for this profile.
+    fn audio_format(&self) -> AudioFormat {
+        match self {
+            // One L16 track: understood by every RTSP client.
+            Self::Default => AudioFormat::Pcm,
+            // go2rtc's two outputs want different things from one camera.
+            Self::Go2rtc => AudioFormat::All,
+        }
+    }
+
+    /// The default server-side queue depth, in milliseconds.
+    fn buffer_duration(&self) -> u64 {
+        match self {
+            // Rides out congestion; the right trade for a recorder.
+            Self::Default => 3000,
+            // Ahead of a WebRTC consumer, queue depth is just delay.
+            Self::Go2rtc => 250,
+        }
+    }
+
+    /// Whether to serve the placeholder stream while the camera starts.
+    fn use_splash(&self) -> bool {
+        match self {
+            // Blue Iris gives up permanently on a 404, so it needs this.
+            Self::Default => true,
+            // go2rtc retries a failed DESCRIBE happily, and would otherwise
+            // cache an MJPEG-only media list its consumers cannot use.
+            Self::Go2rtc => false,
+        }
+    }
+
+    /// Whether to restrict RTSP to TCP interleaved.
+    ///
+    /// go2rtc dials TCP by default (`Protocol = "rtsp+tcp"` unless
+    /// `?transport=udp`), so this costs it nothing and takes UDP packet loss
+    /// off the table for anything else sharing the mount.
+    pub(crate) fn tcp_only(&self) -> bool {
+        matches!(self, Self::Go2rtc)
+    }
+
+    /// Whether to tear a media down as soon as its client disconnects.
+    ///
+    /// go2rtc drops the TCP connection without a TEARDOWN when its read
+    /// deadline fires. Waiting out the session timeout leaves the pipeline —
+    /// and its camera subscription — alive, and under reconnect churn those
+    /// stack up on a device with few connections to spare.
+    pub(crate) fn stop_on_disconnect(&self) -> bool {
+        matches!(self, Self::Go2rtc)
+    }
+}
+
+impl std::fmt::Display for Compat {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let s = match self {
+            Compat::Default => "default",
+            Compat::Go2rtc => "go2rtc",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl CameraConfig {
+    /// How this camera's audio is delivered, resolving the profile default.
+    pub(crate) fn audio_format(&self) -> AudioFormat {
+        self.audio_format
+            .unwrap_or_else(|| self.compat.audio_format())
+    }
+
+    /// How much media the server-side queues may hold, in milliseconds,
+    /// resolving the profile default.
+    pub(crate) fn buffer_duration(&self) -> u64 {
+        self.buffer_duration
+            .unwrap_or_else(|| self.compat.buffer_duration())
+    }
+
+    /// Whether to serve the placeholder stream, resolving the profile
+    /// default.
+    pub(crate) fn use_splash(&self) -> bool {
+        self.use_splash.unwrap_or_else(|| self.compat.use_splash())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
@@ -709,10 +827,6 @@ fn default_pause() -> PauseConfig {
     }
 }
 
-fn default_buffer_duration() -> u64 {
-    3000
-}
-
 fn default_max_discovery_retries() -> usize {
     10
 }
@@ -766,7 +880,7 @@ mod tests {
     /// else is a stream some client cannot hear, chosen on its behalf.
     #[test]
     fn audio_format_defaults_to_the_universally_understood_one() {
-        assert_eq!(camera("").audio_format, AudioFormat::Pcm);
+        assert_eq!(camera("").audio_format(), AudioFormat::Pcm);
     }
 
     #[test]
@@ -781,28 +895,28 @@ mod tests {
             "generic",
         ] {
             assert_eq!(
-                camera(&format!("audio_format = \"{spelling}\"")).audio_format,
+                camera(&format!("audio_format = \"{spelling}\"")).audio_format(),
                 AudioFormat::Mpeg4Generic,
                 "{spelling} should select MPEG4-GENERIC"
             );
         }
         for spelling in ["latm", "Latm", "aac", "passthrough"] {
             assert_eq!(
-                camera(&format!("audio_format = \"{spelling}\"")).audio_format,
+                camera(&format!("audio_format = \"{spelling}\"")).audio_format(),
                 AudioFormat::Latm,
                 "{spelling} should select LATM"
             );
         }
         for spelling in ["pcm", "Pcm", "l16", "raw"] {
             assert_eq!(
-                camera(&format!("audio_format = \"{spelling}\"")).audio_format,
+                camera(&format!("audio_format = \"{spelling}\"")).audio_format(),
                 AudioFormat::Pcm,
                 "{spelling} should select PCM"
             );
         }
         for spelling in ["all", "All", "auto", "both", "dual", "offer_both"] {
             assert_eq!(
-                camera(&format!("audio_format = \"{spelling}\"")).audio_format,
+                camera(&format!("audio_format = \"{spelling}\"")).audio_format(),
                 AudioFormat::All,
                 "{spelling} should offer every format"
             );
@@ -836,17 +950,99 @@ mod tests {
     #[test]
     fn audio_format_has_the_documented_aliases() {
         // Documented in sample_config.toml / README.
-        assert_eq!(camera("audio = \"pcm\"").audio_format, AudioFormat::Pcm);
+        assert_eq!(camera("audio = \"pcm\"").audio_format(), AudioFormat::Pcm);
         assert_eq!(
-            camera("aud_format = \"pcm\"").audio_format,
+            camera("aud_format = \"pcm\"").audio_format(),
             AudioFormat::Pcm
         );
     }
 
     #[test]
     fn buffer_duration_defaults_to_three_seconds() {
-        assert_eq!(camera("").buffer_duration, 3000);
-        assert_eq!(camera("buffer_duration = 250").buffer_duration, 250);
+        assert_eq!(camera("").buffer_duration(), 3000);
+        assert_eq!(camera("buffer_duration = 250").buffer_duration(), 250);
+    }
+
+    /// The whole point of the profile: it moves *defaults*, and anything
+    /// set explicitly still wins.
+    #[test]
+    fn compat_moves_defaults_but_never_overrides() {
+        let plain = camera("");
+        assert_eq!(plain.compat, Compat::Default);
+        assert_eq!(plain.audio_format(), AudioFormat::Pcm);
+        assert_eq!(plain.buffer_duration(), 3000);
+        assert!(plain.use_splash());
+
+        let go2rtc = camera("compat = \"go2rtc\"");
+        assert_eq!(go2rtc.audio_format(), AudioFormat::All);
+        assert_eq!(go2rtc.buffer_duration(), 250);
+        assert!(!go2rtc.use_splash());
+
+        // Explicit settings survive the profile, in both directions.
+        let overridden = camera(
+            "compat = \"go2rtc\"\n             audio_format = \"pcm\"\n             buffer_duration = 1500\n             use_splash = true",
+        );
+        assert_eq!(overridden.audio_format(), AudioFormat::Pcm);
+        assert_eq!(overridden.buffer_duration(), 1500);
+        assert!(overridden.use_splash());
+
+        let overridden = camera("audio_format = \"all\"\nbuffer_duration = 100");
+        assert_eq!(overridden.audio_format(), AudioFormat::All);
+        assert_eq!(overridden.buffer_duration(), 100);
+    }
+
+    #[test]
+    fn compat_accepts_its_spellings() {
+        for spelling in ["go2rtc", "Go2rtc", "webrtc", "frigate"] {
+            assert_eq!(
+                camera(&format!("compat = \"{spelling}\"")).compat,
+                Compat::Go2rtc,
+                "{spelling} should select the go2rtc profile"
+            );
+        }
+        for spelling in ["default", "Default", "none", "standard"] {
+            assert_eq!(
+                camera(&format!("compat = \"{spelling}\"")).compat,
+                Compat::Default
+            );
+        }
+        // Documented aliases for the key itself.
+        assert_eq!(camera("profile = \"go2rtc\"").compat, Compat::Go2rtc);
+        assert_eq!(camera("tuned_for = \"go2rtc\"").compat, Compat::Go2rtc);
+    }
+
+    /// These two are read straight by the RTSP factory rather than through
+    /// a resolver, so they get their own check.
+    #[test]
+    fn compat_carries_the_factory_settings() {
+        assert!(!Compat::Default.tcp_only());
+        assert!(!Compat::Default.stop_on_disconnect());
+        assert!(Compat::Go2rtc.tcp_only());
+        assert!(Compat::Go2rtc.stop_on_disconnect());
+    }
+
+    #[test]
+    fn an_unknown_compat_profile_is_rejected() {
+        let toml = r#"
+            name = "Camera01"
+            username = "admin"
+            password = "password"
+            uid = "ABCDEF0123456789"
+            compat = "blueiris"
+        "#;
+        assert!(toml::from_str::<CameraConfig>(toml).is_err());
+    }
+
+    /// `buffer_duration` became an Option; its range validation has to
+    /// still bite.
+    #[test]
+    fn buffer_duration_is_still_range_checked() {
+        use validator::Validate;
+        assert!(camera("buffer_duration = 250").validate().is_ok());
+        assert!(camera("buffer_duration = 0").validate().is_err());
+        assert!(camera("buffer_duration = 20000").validate().is_err());
+        // Unset means "take the profile default", not "out of range".
+        assert!(camera("").validate().is_ok());
     }
 
     #[test]

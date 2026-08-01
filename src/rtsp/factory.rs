@@ -17,7 +17,7 @@ use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
 use crate::{
     common::NeoInstance,
-    config::AudioFormat,
+    config::{AudioFormat, Compat},
     rtsp::{gst::NeoMediaFactory, timestamps::TimestampTracker},
     AnyResult,
 };
@@ -386,10 +386,11 @@ fn cached_verdict(profile: Option<&StreamProfile>, payload: AacPayload) -> Optio
 }
 
 pub(super) async fn make_dummy_factory(
+    compat: Compat,
     use_splash: bool,
     pattern: String,
 ) -> AnyResult<NeoMediaFactory> {
-    NeoMediaFactory::new_with_callback(move |element, _audio_format| {
+    NeoMediaFactory::new_with_callback(compat, move |element, _audio_format| {
         clear_bin(&element)?;
         if !use_splash {
             Ok(None)
@@ -415,6 +416,7 @@ pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
+    let compat = camera.config().await?.borrow().compat;
     let (client_tx, mut client_rx) = mpsc(100);
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
@@ -446,8 +448,8 @@ pub(super) async fn make_factory(
                         // keeps the configured format. Each one gets its
                         // own media (the factory is not shared), so they
                         // can hold different formats at the same time.
-                        let audio_format = audio_format.unwrap_or(config.audio_format);
-                        let queue_time = Duration::from_millis(config.buffer_duration);
+                        let audio_format = audio_format.unwrap_or_else(|| config.audio_format());
+                        let queue_time = Duration::from_millis(config.buffer_duration());
 
                         // Frames consumed while learning, replayed into the
                         // pipeline once it is built so none are lost. A
@@ -504,6 +506,20 @@ pub(super) async fn make_factory(
                                 AnyResult::Ok(Some(src))
                             }
                             Some(VideoType::H265) => {
+                                // Nothing neolink can do about this — the
+                                // Baichuan protocol has no way to ask the
+                                // camera for a different encoder — but
+                                // silent "works in Chrome, not in Firefox"
+                                // is the worst way to find out.
+                                if matches!(config.compat, Compat::Go2rtc) {
+                                    log::warn!(
+                                        "{name}::{stream}: this stream is H265. Browsers \
+                                         are far pickier about it than about H264 — no \
+                                         desktop Firefox at all, and WebRTC needs Chrome \
+                                         136+ or Safari 18+. Consider the substream, \
+                                         which is usually H264, or transcoding in go2rtc"
+                                    );
+                                }
                                 let src = build_h265(&element, &stream_config)?;
                                 AnyResult::Ok(Some(src))
                             }
@@ -650,7 +666,7 @@ pub(super) async fn make_factory(
     });
 
     // Now setup the factory
-    let factory = NeoMediaFactory::new_with_callback(move |element, audio_format| {
+    let factory = NeoMediaFactory::new_with_callback(compat, move |element, audio_format| {
         let (reply, new_element) = tokio::sync::oneshot::channel();
         client_tx.blocking_send(ClientMsg::NewClient {
             element,
