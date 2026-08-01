@@ -561,24 +561,25 @@ pub(crate) enum AudioFormat {
     Latm,
     /// Decode the audio to raw samples and send it as `L16` (RFC 3551).
     ///
-    /// Maximum client compatibility at the cost of decode latency and a
-    /// much larger RTP bitrate. This is what neolink did unconditionally
-    /// before `audio_format` existed. ADPCM always uses this path.
+    /// The default, and what neolink did unconditionally before
+    /// `audio_format` existed: one track, in a format every RTSP client
+    /// understands, at the cost of decode latency and a much larger RTP
+    /// bitrate. ADPCM always uses this path.
+    #[default]
     #[serde(alias = "pcm", alias = "l16", alias = "raw")]
     Pcm,
     /// Offer everything we can, as separate audio tracks in the SDP, and
-    /// let the client decide. This is the default.
+    /// let the client decide.
     ///
     /// One `MP4A-LATM` track and one `L16` track are advertised, and a
     /// client that negotiates (go2rtc, and so Home Assistant and Frigate)
     /// sets up only the one it wants.
     ///
-    /// Clients that do not negotiate set up every track in the SDP and so
-    /// receive both audio streams; point those at `?audio=latm` (or `pcm`)
-    /// to narrow the offer for that client alone. Both branches also run
-    /// server-side regardless of what is subscribed, so the decode that
-    /// `latm` avoids is paid anyway.
-    #[default]
+    /// Opt-in, because a client that does not negotiate sets up every
+    /// track in the SDP and so receives both audio streams at once. Both
+    /// branches also run server-side regardless of what is subscribed, so
+    /// the decode that `latm` avoids is paid anyway, and a decoder failure
+    /// takes the passthrough track and the video with it.
     #[serde(
         alias = "all",
         alias = "auto",
@@ -730,9 +731,11 @@ mod tests {
         toml::from_str(&toml).expect("camera config should parse")
     }
 
+    /// The default has to be the one every RTSP client can play: anything
+    /// else is a stream some client cannot hear, chosen on its behalf.
     #[test]
-    fn audio_format_defaults_to_offering_everything() {
-        assert_eq!(camera("").audio_format, AudioFormat::All);
+    fn audio_format_defaults_to_the_universally_understood_one() {
+        assert_eq!(camera("").audio_format, AudioFormat::Pcm);
     }
 
     #[test]

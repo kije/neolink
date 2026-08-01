@@ -117,15 +117,15 @@ using the terminal in the same folder the neolink binary is in.
 
 Reolink cameras send audio either as AAC or as DVI4 ADPCM.
 
-For AAC cameras neolink can pass the compressed audio straight through to the
-RTSP client as `MP4A-LATM` (RFC 6416). Nothing is decoded, resampled or
-re-encoded, so the audio adds no codec latency and costs the camera's own
-bitrate (typically 16-32kbps) instead of the ~256kbps that raw 16kHz mono
-samples need. The alternative is `L16` (RFC 3551), decoded raw samples, which
-every client understands.
+By default neolink decodes the audio and sends raw `L16` samples (RFC 3551).
+Every RTSP client understands that, so the default works everywhere without
+anyone having to know what their client supports.
 
-By default neolink does not choose between them: it offers **both**, as two
-audio tracks in the SDP, and lets the client take the one it wants.
+For AAC cameras there is a faster option. `MP4A-LATM` (RFC 6416) passes the
+compressed audio straight through: nothing is decoded, resampled or re-encoded,
+so the audio adds no codec latency and costs the camera's own bitrate
+(typically 16-32kbps) instead of the ~256kbps raw 16kHz mono samples need. Ask
+for it per camera:
 
 ```toml
 [[cameras]]
@@ -133,43 +133,46 @@ name = "Camera01"
 username = "admin"
 password = "password"
 uid = "ABCDEF0123456789"
-audio_format = "all"   # "all" (default), "latm" or "pcm"
+audio_format = "latm"   # "pcm" (default), "latm" or "all"
 ```
+
+`MP4A-LATM` is understood by ffmpeg/ffprobe, VLC, go2rtc (and so Home Assistant
+and Frigate) and Blue Iris — but not by everything, which is why it is opt-in.
 
 ADPCM cameras have no RTP passthrough format available and are always decoded
 to `L16`; `audio_format` has no effect on them.
 
 #### Per-client selection
 
-RTSP has no codec negotiation: the server must commit to the formats in the
-SDP before the client has said anything about what it can decode. Two things
-partly make up for that.
+RTSP has no codec negotiation: the server must commit to the formats in the SDP
+before the client has said anything about what it can decode. Two things partly
+make up for that.
 
-The first is that a client can set up only the tracks it wants. That is what
-`all` relies on — a client that negotiates (go2rtc, and so Home Assistant and
-Frigate) sets up one audio track and ignores the other.
-
-The second is that a client can ask for a different *resource*, which RTSP does
+The first is that a client can ask for a different *resource*, which RTSP does
 support. Add `?audio=` to the URL and that client alone gets that format:
 
 ```text
-rtsp://neolink:8554/Camera01/mainStream              # both tracks (default)
-rtsp://neolink:8554/Camera01/mainStream?audio=latm   # passthrough only
-rtsp://neolink:8554/Camera01/mainStream?audio=pcm    # decoded L16 only
+rtsp://neolink:8554/Camera01/mainStream              # the configured format
+rtsp://neolink:8554/Camera01/mainStream?audio=latm   # passthrough, this client only
+rtsp://neolink:8554/Camera01/mainStream?audio=pcm    # decoded L16, this client only
+rtsp://neolink:8554/Camera01/mainStream?audio=all    # offer both, this client only
 ```
 
 It takes the same spellings as the config file, and an unrecognised one is
 logged and ignored rather than guessed at. Each client gets its own pipeline,
-so two clients can hold different formats on the same camera at the same time,
-and neither needs the config changed.
+so two clients can hold different formats on the same camera at the same time —
+one NVR on `?audio=latm` and one legacy viewer on the default, say — and
+neither needs the config changed.
 
-Reach for `?audio=` when a client does *not* negotiate. Those clients —
-`rtspsrc` and others like it — set up every track in the SDP, so under the
-default they receive both audio streams at once; `?audio=latm` or `?audio=pcm`
-narrows the offer to one. Setting `audio_format` in the config does the same
-thing for every client of that camera.
+The second is that a client can set up only the tracks it wants. That is what
+`audio_format = "all"` is for: it advertises an `MP4A-LATM` track *and* an `L16`
+track, and a client that negotiates (go2rtc, and so Home Assistant and Frigate)
+sets up one and ignores the other.
 
-Two costs come with offering both, and apply even to a well-behaved client:
+`all` is opt-in because it is only safe for clients that do negotiate. Clients
+that do not — `rtspsrc` and others like it — set up every track in the SDP and
+so receive both audio streams at once. Two further costs apply even to a
+well-behaved client:
 
 - both branches run server-side regardless of what is subscribed, so the AAC
   decode that `latm` exists to avoid is paid anyway;
@@ -177,8 +180,9 @@ Two costs come with offering both, and apply even to a well-behaved client:
   camera's audio it takes the passthrough track and the video down with it,
   which `latm` on its own would not.
 
-If every client on a camera speaks `MP4A-LATM`, `audio_format = "latm"` is
-leaner than the default. `pcm` remains the maximum-compatibility setting.
+So: leave it alone and everything works; set `latm` when you know your clients;
+set `all` when one camera serves a mix and the negotiating client is the one
+whose latency you care about.
 
 Passthrough is offered only where it can work. It needs MPEG-4 AAC in ADTS
 framing, so before serving a stream neolink checks that this camera's own audio

@@ -1263,8 +1263,9 @@ fn can_use_latm(samples: &[Vec<u8>], framing: AacFraming, stream_config: &Stream
         Err(e) => {
             log::warn!(
                 "The LATM audio pipeline would not negotiate with this camera's AAC \
-                 ({e:#}); decoding the audio to L16 instead. \
-                 Set `audio_format = \"pcm\"` for this camera to skip this check"
+                 ({e:#}); decoding the audio to L16 instead. This camera cannot do \
+                 passthrough, so `audio_format` can be left at its default (\"pcm\") \
+                 for it and this check skipped"
             );
             false
         }
