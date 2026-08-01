@@ -117,15 +117,15 @@ using the terminal in the same folder the neolink binary is in.
 
 Reolink cameras send audio either as AAC or as DVI4 ADPCM.
 
-For AAC cameras neolink passes the compressed audio straight through to the
-RTSP client as `MP4A-LATM` (RFC 6416). Nothing is decoded, resampled or
-re-encoded, so the audio adds no codec latency and costs the camera's own
-bitrate (typically 16-32kbps) instead of the ~256kbps that raw 16kHz mono
-samples need.
+By default neolink decodes the audio and sends raw `L16` samples (RFC 3551).
+Every RTSP client understands that, so the default works everywhere without
+anyone having to know what their client supports.
 
-If you have a client that cannot handle `MP4A-LATM` you can ask neolink to
-decode the audio and send raw `L16` samples instead, which is what it always
-used to do:
+For AAC cameras there is a faster option. `MP4A-LATM` (RFC 6416) passes the
+compressed audio straight through: nothing is decoded, resampled or re-encoded,
+so the audio adds no codec latency and costs the camera's own bitrate
+(typically 16-32kbps) instead of the ~256kbps raw 16kHz mono samples need. Ask
+for it per camera:
 
 ```toml
 [[cameras]]
@@ -133,11 +133,65 @@ name = "Camera01"
 username = "admin"
 password = "password"
 uid = "ABCDEF0123456789"
-audio_format = "pcm"   # "latm" (default) or "pcm"
+audio_format = "latm"   # "pcm" (default), "latm" or "all"
 ```
+
+`MP4A-LATM` is understood by ffmpeg/ffprobe, VLC, go2rtc (and so Home Assistant
+and Frigate) and Blue Iris — but not by everything, which is why it is opt-in.
 
 ADPCM cameras have no RTP passthrough format available and are always decoded
 to `L16`; `audio_format` has no effect on them.
+
+#### Per-client selection
+
+RTSP has no codec negotiation: the server must commit to the formats in the SDP
+before the client has said anything about what it can decode. Two things partly
+make up for that.
+
+The first is that a client can ask for a different *resource*, which RTSP does
+support. Add `?audio=` to the URL and that client alone gets that format:
+
+```text
+rtsp://neolink:8554/Camera01/mainStream              # the configured format
+rtsp://neolink:8554/Camera01/mainStream?audio=latm   # passthrough, this client only
+rtsp://neolink:8554/Camera01/mainStream?audio=pcm    # decoded L16, this client only
+rtsp://neolink:8554/Camera01/mainStream?audio=all    # offer both, this client only
+```
+
+It takes the same spellings as the config file, and an unrecognised one is
+logged and ignored rather than guessed at. Each client gets its own pipeline,
+so two clients can hold different formats on the same camera at the same time —
+one NVR on `?audio=latm` and one legacy viewer on the default, say — and
+neither needs the config changed.
+
+The second is that a client can set up only the tracks it wants. That is what
+`audio_format = "all"` is for: it advertises an `MP4A-LATM` track *and* an `L16`
+track, and a client that negotiates (go2rtc, and so Home Assistant and Frigate)
+sets up one and ignores the other.
+
+`all` is opt-in because it is only safe for clients that do negotiate. Clients
+that do not — `rtspsrc` and others like it — set up every track in the SDP and
+so receive both audio streams at once. Two further costs apply even to a
+well-behaved client:
+
+- both branches run server-side regardless of what is subscribed, so the AAC
+  decode that `latm` exists to avoid is paid anyway;
+- the decode branch shares the fate of the mount. If the decoder fails on this
+  camera's audio it takes the passthrough track and the video down with it,
+  which `latm` on its own would not.
+
+So: leave it alone and everything works; set `latm` when you know your clients;
+set `all` when one camera serves a mix and the negotiating client is the one
+whose latency you care about.
+
+Passthrough is offered only where it can work. It needs MPEG-4 AAC in ADTS
+framing, so before serving a stream neolink checks that this camera's own audio
+really does reach the `MP4A-LATM` payloader; when it does not — a camera
+sending MPEG-2 AAC, for instance — the LATM track is dropped and only `L16` is
+offered, with a warning in the log saying why. This holds however the format
+was asked for, in the config or on the URL. The check matters because an audio
+format the pipeline cannot negotiate does not merely mute the stream: it stops
+the whole RTSP media from being described, taking the video with it.
 
 The other latency control is `buffer_duration`, which caps how much media the
 server-side queues may hold, in milliseconds:
