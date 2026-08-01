@@ -2,7 +2,11 @@
 
 *Investigation and design proposal for a compatibility mode.*
 
-Status: **proposal** — no code changes in this branch.
+Status: **partly implemented.** Stages 0 and 1 of §5 have landed on this
+branch — the misleading documentation is corrected and
+`audio_format = "mpeg4-generic"` exists, so `all` now offers a track go2rtc
+can use. §2.1 and §3.1 are marked resolved below and kept for the record.
+Everything else is still a proposal.
 
 Revised against `master` at `a09634b` (PRs #34 and #35), which landed a large
 rework of the audio path and the FPS limiter while this was being written.
@@ -49,8 +53,8 @@ silent streams**. `06364df` changed the default back to `pcm` (L16). go2rtc
 understands `L16` (`CodecPCM`), so out of the box audio now reaches both
 outputs: WebRTC via the G.711 resample path, MSE via FLAC.
 
-This is the right default for go2rtc. The remaining audio problem (§3.1) is
-that the *good* path is still unreachable.
+This is the right default for go2rtc. The remaining audio problem — that the
+*good* path was unreachable — is §3.1, closed on this branch.
 
 ### 1.2 `max_fps` no longer corrupts the stream — **resolved**
 
@@ -93,17 +97,17 @@ go2rtc specifically — go2rtc passes an RTSP source URL through verbatim, so
 `rtsp://neolink:8554/Cam/mainStream?audio=…` can go straight in its config
 with no neolink-side change.
 
-Both features are, however, currently pointed at a track go2rtc cannot use
-(§3.1).
+Both features were, however, pointed at a track go2rtc cannot use. §3.1 gives
+them one it can.
 
 ---
 
 ## 2. What master introduced that needs attention
 
-### 2.1 The documentation now actively misleads go2rtc users — **new, and the cheapest fix here**
+### 2.1 The documentation actively misled go2rtc users — **fixed on this branch**
 
 The default moved, but the claim that motivated the old default did not. Three
-places still tell a go2rtc user to reach for a format that will mute them:
+places told a go2rtc user to reach for a format that would mute them:
 
 - `src/config.rs:560` — LATM is "Understood by ffmpeg/ffprobe, VLC, **go2rtc**
   (and therefore Home Assistant and Frigate) and Blue Iris."
@@ -142,31 +146,35 @@ LATM one, and set up L16 — while neolink runs and pays for a passthrough
 branch nobody will ever subscribe to. Worse, a user who reads the README and
 sets `latm` for their go2rtc camera gets silence and no error.
 
-Correcting these three strings is a five-minute change and should not wait for
-anything else in this document.
+All three now say what is true, and `AudioFormat::Latm`'s own doc comment
+points at `mpeg4-generic` instead.
 
-### 2.2 The LATM probe lands on the most contended path — **new**
+### 2.2 The passthrough probe lands on the most contended path — **new**
 
-`decide_audio_tracks_off_thread` runs at `src/rtsp/factory.rs:349`, which is
-**before** `reply.send(element)` at line 379 — i.e. inside the window where
-the client's DESCRIBE is blocked. It is bounded by `LATM_PROBE_TIMEOUT`
-(2 s, `src/rtsp/factory.rs:1229`).
+`decide_audio_tracks_off_thread` is called at `src/rtsp/factory.rs:396`, which
+is **before** `reply.send(element)` at line 429 — i.e. inside the window where
+the client's DESCRIBE is blocked. Each probe is bounded by
+`LATM_PROBE_TIMEOUT` (2 s, `src/rtsp/factory.rs:1268`).
 
-That is a sound design in isolation, and it only runs when `latm` or `all` is
-selected. But it stacks on top of the pre-existing 10-second learning window
-on a budget that is already over-spent (§3.2): worst case is now camera
-connect + 10 s + 2 s against go2rtc's fixed 5 s. Caching the probe verdict
-per `(camera, stream)` alongside the `StreamConfig` (§3.2) removes it from the
-steady-state path entirely.
+That is a sound design in isolation, and it only runs for the passthrough
+formats. But it stacks on top of the pre-existing 10-second learning window on
+a budget that is already over-spent (§3.2) — and `all` now probes two formats,
+so the worst case is camera connect + 10 s + 4 s against go2rtc's fixed 5 s.
+
+Two ways out, both worth doing: skip the remaining probes once one passthrough
+has been ruled out by the shared `aacparse` stage (the framing checks already
+short-circuit the common case), and cache the verdict per `(camera, stream)`
+alongside the `StreamConfig` (§3.2), which removes it from the steady-state
+path entirely.
 
 ---
 
 ## 3. What remains open
 
-### 3.1 There is still no AAC format go2rtc can use
+### 3.1 There was no AAC format go2rtc could use — **fixed on this branch**
 
-Neither AAC nor L16 serves both go2rtc outputs, and neolink currently offers
-no AAC framing go2rtc can name at all:
+Neither AAC nor L16 serves both go2rtc outputs, and neolink offered no AAC
+framing go2rtc could name at all:
 
 | go2rtc output | video | audio it can use | what it does with ours |
 |---|---|---|---|
@@ -178,25 +186,31 @@ L16. Today's `pcm` default is the best available compromise — WebRTC is
 correct, MSE pays an FLAC re-encode, and recording never gets the camera's
 own AAC.
 
-**The fix is now smaller than it was**, because `5b4d5c8` already built the
-multi-track machinery:
+**What landed.** `5b4d5c8` had already built the multi-track machinery, so
+the fix was small:
 
-- **(a) Add `audio_format = "mpeg4-generic"` via `rtpmp4gpay`.** It accepts
-  exactly the caps the existing LATM chain already produces —
-  `audio/mpeg, mpegversion=4, stream-format=raw`, built by `aac_to_raw` at
-  `src/rtsp/factory.rs:1129` — and emits `encoding-name=MPEG4-GENERIC`
-  (RFC 3640 AAC-hbr). Structurally it is `attach_payloader(bin, &out,
-  "rtpmp4gpay", "payN")` alongside the two existing calls at
-  `src/rtsp/factory.rs:1455-1484`. Same passthrough, same zero decode cost,
-  and the existing MPEG-2/framing guards and the negotiation probe apply
-  unchanged.
-- **(b) Include it in `all`.** With three tracks — `MPEG4-GENERIC`, `L16`,
-  and optionally `MP4A-LATM` for the clients that prefer it — go2rtc finally
-  has a real choice: passthrough AAC for MSE and recording, L16 for WebRTC,
-  from one connection. That is what `all` was built for; it just needs a track
-  go2rtc can name. Note the existing constraint that payloader indices must
-  stay contiguous (`5b4d5c8`), so the ordering needs care when a track is
-  ruled out.
+- `audio_format = "mpeg4-generic"` payloads with `rtpmp4gpay`, which accepts
+  exactly the caps the existing passthrough chain already produced —
+  `audio/mpeg, mpegversion=4, stream-format=raw` — and emits
+  `encoding-name=MPEG4-GENERIC` (RFC 3640, `mode=AAC-hbr`). Same passthrough,
+  same zero decode cost. The framing guards and the negotiation probe are now
+  parameterised by payload format and apply to it unchanged.
+- `all` offers `MPEG4-GENERIC`, then `MP4A-LATM`, then `L16`. go2rtc finally
+  has a real choice from one connection: passthrough AAC for what it muxes
+  into MP4/HLS, `L16` for the WebRTC output that cannot take AAC at all.
+  `AudioTracks` became an ordered list so the payloader indices stay
+  contiguous however many formats a given camera is ruled out of.
+
+Verified against a real gst-rtsp-server: a four-payloader bin describes as
+four `m=` lines, the AAC one as
+
+```text
+a=rtpmap:96 MPEG4-GENERIC/16000/1
+a=fmtp:96 streamtype=5;profile-level-id=2;mode=AAC-hbr;config=140856e500;sizelength=13;indexlength=3;indexdeltalength=3
+```
+
+which is the shape go2rtc's `pkg/aac` depayloader documents as its supported
+case (`sizelength=13;indexlength=3` gives the 2-byte AU headers it requires).
 
 ### 3.2 go2rtc's 5-second deadlines vs. neolink's blocking DESCRIBE
 
@@ -446,7 +460,7 @@ move again.
 
 | setting | today | `compat = "go2rtc"` | § |
 |---|---|---|---|
-| `audio_format` | `pcm` | `all`, once `all` includes `MPEG4-GENERIC` | 3.1 |
+| `audio_format` | `pcm` | `all` | 3.1 |
 | `buffer_duration` | 3000 ms | 250 ms | 3.8 |
 | `use_splash` | true | **false** | 3.4 |
 | `pause.on_motion` | false | warn if set (until keep-alive exists) | 3.3 |
@@ -460,9 +474,9 @@ move again.
 ### New `audio_format` variant
 
 ```
-latm            → rtpmp4apay   MP4A-LATM       (existing; not usable by go2rtc)
-pcm             → rtpL16pay    L16             (existing default; WebRTC)
-mpeg4-generic   → rtpmp4gpay   MPEG4-GENERIC   (new — MSE/HLS/recording)
+mpeg4-generic   → rtpmp4gpay   MPEG4-GENERIC   (MSE/HLS/recording passthrough)
+latm            → rtpmp4apay   MP4A-LATM       (not usable by go2rtc)
+pcm             → rtpL16pay    L16             (default; WebRTC)
 all             → all of the above as separate tracks, contiguous payN
 ```
 
@@ -470,15 +484,12 @@ all             → all of the above as separate tracks, contiguous payN
 
 ## 5. Suggested sequencing
 
-**Stage 0 — documentation, today.** Correct the three places that tell go2rtc
-users to use `MP4A-LATM` (`src/config.rs:560`, `README.md:139`,
-`README.md:169` plus the `AudioFormat::All` doc comment). Independent of
-everything else and currently costing people their audio (§2.1).
+**Stage 0 — documentation. Done.** The places that told go2rtc users to reach
+for `MP4A-LATM` now say what is true (§2.1).
 
-**Stage 1 — the missing codec.** Add `audio_format = "mpeg4-generic"`
-(`rtpmp4gpay`) and include it in `all`. Small now that the multi-track
-plumbing exists, and it is what makes `all` and `?audio=` worth anything to a
-go2rtc user (§3.1).
+**Stage 1 — the missing codec. Done.** `audio_format = "mpeg4-generic"`
+(`rtpmp4gpay`), included in `all`, which is what makes `all` and `?audio=`
+worth anything to a go2rtc user (§3.1).
 
 **Stage 2 — the profile.** Introduce `compat`, wire it to the existing keys
 (`audio_format`, `buffer_duration`, `use_splash`) plus the factory flags
@@ -505,5 +516,9 @@ missing. The same pattern covers the new work directly: assert
 payloader indices stay contiguous when a track is ruled out, assert the
 factory flags per profile, and unit-test keyframe gating on the pump.
 
-This checkout has no GStreamer installed, so those tests skip here; they need
-to run somewhere with `gst-plugins-good`/`-bad` present.
+The Stage 0/1 work was developed with GStreamer 1.24 installed, so those
+tests ran rather than skipping — including the new
+`each_passthrough_format_negotiates_its_own_encoding_name`, which asserts the
+`encoding-name` each payloader actually negotiates. On a machine without
+`gst-plugins-good`/`-bad` they skip silently, so a green run there proves
+less than it appears to.

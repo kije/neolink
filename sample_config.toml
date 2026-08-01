@@ -114,28 +114,38 @@ address = "192.168.1.187:9000"
 # "pcm"  (the default) decodes the audio and sends raw L16 samples. Larger and
 #        slower than passing it through, but understood by every RTSP client,
 #        so it is the setting that always works.
-# "latm" passes AAC through untouched as MP4A-LATM (RFC 6416). No decoding
-#        happens, so there is no codec latency and the audio uses the camera's
-#        own bitrate rather than ~256kbps of raw samples. Understood by
-#        ffmpeg, VLC, go2rtc (Home Assistant, Frigate) and Blue Iris, but not
-#        by everything — which is why it is opt-in.
-# "all"  offers both as separate audio tracks and lets the client set up the
-#        one it wants. Only for clients that negotiate (go2rtc, and so Home
-#        Assistant and Frigate); others subscribe to every track and receive
-#        both audio streams at once. The decode branch also runs whether or
-#        not anyone listens to it, and a decoder failure on this camera's
-#        audio takes the whole mount down, video included.
+# "mpeg4-generic"
+#        passes AAC through untouched as MPEG4-GENERIC (RFC 3640, AAC-hbr).
+#        No decoding happens, so there is no codec latency and the audio uses
+#        the camera's own bitrate rather than ~256kbps of raw samples. This is
+#        the payload format native RTSP cameras almost always use for AAC, so
+#        it has the broadest client support of the passthrough options:
+#        ffmpeg, VLC, go2rtc (Home Assistant, Frigate) and Blue Iris.
+# "latm" the same passthrough, payloaded as MP4A-LATM (RFC 6416) instead.
+#        Understood by ffmpeg, VLC and Blue Iris.
+#        NOT understood by go2rtc: it recognises AAC only under the
+#        MPEG4-GENERIC name, so a LATM track is dropped without an error.
+#        Use "mpeg4-generic" or "all" if go2rtc is downstream.
+# "all"  offers every format above as separate audio tracks, MPEG4-GENERIC
+#        first, and lets the client set up the one it wants. Only for clients
+#        that negotiate; others subscribe to every track and receive all the
+#        audio streams at once. Every branch also runs whether or not anyone
+#        listens to it, and a decoder failure on this camera's audio takes the
+#        whole mount down, video included.
+#        go2rtc does negotiate, and is the clearest case for "all": what it
+#        muxes into MP4/HLS takes the AAC untouched, while its WebRTC output
+#        cannot decode AAC at all and needs the L16 track.
 #
 # A client can override this for itself by adding ?audio= to its URL:
-#     rtsp://neolink:8554/driveway/mainStream?audio=latm
+#     rtsp://neolink:8554/driveway/mainStream?audio=mpeg4-generic
 # Each client gets its own pipeline, so two clients can hold different formats
 # on the same camera at once, without either changing this file.
 #
 # ADPCM cameras are always decoded to L16 and ignore this setting.
 #
 # Passthrough needs MPEG-4 AAC in ADTS framing. Where a camera cannot provide
-# it, the MP4A-LATM track is dropped and only L16 is offered, with a warning
-# in the log saying why.
+# it, the passthrough tracks are dropped and only L16 is offered, with a
+# warning in the log saying why.
 #
 # audio_format = "pcm"
 

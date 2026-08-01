@@ -121,11 +121,18 @@ By default neolink decodes the audio and sends raw `L16` samples (RFC 3551).
 Every RTSP client understands that, so the default works everywhere without
 anyone having to know what their client supports.
 
-For AAC cameras there is a faster option. `MP4A-LATM` (RFC 6416) passes the
-compressed audio straight through: nothing is decoded, resampled or re-encoded,
-so the audio adds no codec latency and costs the camera's own bitrate
-(typically 16-32kbps) instead of the ~256kbps raw 16kHz mono samples need. Ask
-for it per camera:
+For AAC cameras there are faster options. Passthrough sends the compressed
+audio straight through: nothing is decoded, resampled or re-encoded, so the
+audio adds no codec latency and costs the camera's own bitrate (typically
+16-32kbps) instead of the ~256kbps raw 16kHz mono samples need. Two RTP payload
+formats carry the same frames, differing only in how RTP frames them:
+
+| `audio_format` | SDP `rtpmap` | RFC | understood by |
+| --- | --- | --- | --- |
+| `"mpeg4-generic"` | `MPEG4-GENERIC` | 3640, `mode=AAC-hbr` | ffmpeg/ffprobe, VLC, **go2rtc**, Blue Iris |
+| `"latm"` | `MP4A-LATM` | 6416 | ffmpeg/ffprobe, VLC, Blue Iris |
+
+Ask for one per camera:
 
 ```toml
 [[cameras]]
@@ -133,11 +140,17 @@ name = "Camera01"
 username = "admin"
 password = "password"
 uid = "ABCDEF0123456789"
-audio_format = "latm"   # "pcm" (default), "latm" or "all"
+audio_format = "mpeg4-generic"   # "pcm" (default), "mpeg4-generic", "latm" or "all"
 ```
 
-`MP4A-LATM` is understood by ffmpeg/ffprobe, VLC, go2rtc (and so Home Assistant
-and Frigate) and Blue Iris — but not by everything, which is why it is opt-in.
+`MPEG4-GENERIC` is the passthrough to reach for: it is what native RTSP
+cameras almost universally emit for AAC, so client support is the broadest.
+In particular **go2rtc does not understand `MP4A-LATM`** — it identifies AAC
+solely by the `MPEG4-GENERIC` rtpmap name, so a LATM track is parsed as an
+unknown codec and dropped without an error. If go2rtc (and so Home Assistant
+or Frigate) is downstream, use `"mpeg4-generic"` or `"all"`, never `"latm"`.
+
+Neither is the default, because neither is understood by *everything*.
 
 ADPCM cameras have no RTP passthrough format available and are always decoded
 to `L16`; `audio_format` has no effect on them.
@@ -152,46 +165,54 @@ The first is that a client can ask for a different *resource*, which RTSP does
 support. Add `?audio=` to the URL and that client alone gets that format:
 
 ```text
-rtsp://neolink:8554/Camera01/mainStream              # the configured format
-rtsp://neolink:8554/Camera01/mainStream?audio=latm   # passthrough, this client only
-rtsp://neolink:8554/Camera01/mainStream?audio=pcm    # decoded L16, this client only
-rtsp://neolink:8554/Camera01/mainStream?audio=all    # offer both, this client only
+rtsp://neolink:8554/Camera01/mainStream                        # the configured format
+rtsp://neolink:8554/Camera01/mainStream?audio=mpeg4-generic   # RFC 3640 passthrough, this client only
+rtsp://neolink:8554/Camera01/mainStream?audio=latm            # RFC 6416 passthrough, this client only
+rtsp://neolink:8554/Camera01/mainStream?audio=pcm             # decoded L16, this client only
+rtsp://neolink:8554/Camera01/mainStream?audio=all             # offer every format, this client only
 ```
 
 It takes the same spellings as the config file, and an unrecognised one is
 logged and ignored rather than guessed at. Each client gets its own pipeline,
 so two clients can hold different formats on the same camera at the same time —
-one NVR on `?audio=latm` and one legacy viewer on the default, say — and
-neither needs the config changed.
+one NVR on `?audio=mpeg4-generic` and one legacy viewer on the default, say —
+and neither needs the config changed.
 
 The second is that a client can set up only the tracks it wants. That is what
-`audio_format = "all"` is for: it advertises an `MP4A-LATM` track *and* an `L16`
-track, and a client that negotiates (go2rtc, and so Home Assistant and Frigate)
-sets up one and ignores the other.
+`audio_format = "all"` is for: it advertises a `MPEG4-GENERIC` track, a
+`MP4A-LATM` track and an `L16` track, in that order, and a client that
+negotiates sets up one and ignores the rest.
+
+go2rtc does negotiate — it issues `SETUP` per track, on demand — and it is the
+case `all` most clearly helps, because its two outputs want different things
+from the same camera: what it muxes into MP4/HLS takes the AAC untouched,
+while its WebRTC output cannot decode AAC in any framing and needs the `L16`
+track. One mount serves both.
 
 `all` is opt-in because it is only safe for clients that do negotiate. Clients
 that do not — `rtspsrc` and others like it — set up every track in the SDP and
-so receive both audio streams at once. Two further costs apply even to a
+so receive all the audio streams at once. Two further costs apply even to a
 well-behaved client:
 
-- both branches run server-side regardless of what is subscribed, so the AAC
-  decode that `latm` exists to avoid is paid anyway;
+- every branch runs server-side regardless of what is subscribed, so the AAC
+  decode that passthrough exists to avoid is paid anyway;
 - the decode branch shares the fate of the mount. If the decoder fails on this
-  camera's audio it takes the passthrough track and the video down with it,
-  which `latm` on its own would not.
+  camera's audio it takes the passthrough tracks and the video down with it,
+  which a passthrough format on its own would not.
 
-So: leave it alone and everything works; set `latm` when you know your clients;
-set `all` when one camera serves a mix and the negotiating client is the one
-whose latency you care about.
+So: leave it alone and everything works; name a single format when you know
+your clients; set `all` when one camera serves a mix and the negotiating client
+is the one whose latency you care about.
 
 Passthrough is offered only where it can work. It needs MPEG-4 AAC in ADTS
 framing, so before serving a stream neolink checks that this camera's own audio
-really does reach the `MP4A-LATM` payloader; when it does not — a camera
-sending MPEG-2 AAC, for instance — the LATM track is dropped and only `L16` is
-offered, with a warning in the log saying why. This holds however the format
-was asked for, in the config or on the URL. The check matters because an audio
-format the pipeline cannot negotiate does not merely mute the stream: it stops
-the whole RTSP media from being described, taking the video with it.
+really does reach the payloader; when it does not — a camera sending MPEG-2
+AAC, for instance — that track is dropped and the remaining ones are renumbered
+so the SDP has no gap, with a warning in the log saying why. This holds however
+the format was asked for, in the config or on the URL. The check matters
+because an audio format the pipeline cannot negotiate does not merely mute the
+stream: it stops the whole RTSP media from being described, taking the video
+with it.
 
 The other latency control is `buffer_duration`, which caps how much media the
 server-side queues may hold, in milliseconds:

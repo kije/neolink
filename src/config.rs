@@ -550,15 +550,38 @@ impl std::fmt::Display for SplashPattern {
 /// for it, but AAC can be forwarded to the client untouched.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq, Default)]
 pub(crate) enum AudioFormat {
+    /// Pass AAC through untouched, payloaded as `MPEG4-GENERIC`
+    /// (RFC 3640, `mode=AAC-hbr`).
+    ///
+    /// The passthrough to reach for. No decode, no resample and no
+    /// re-encode, so the only work done on the audio is RTP framing, and
+    /// the bandwidth is whatever the camera encoded at (typically
+    /// 16-32kbps) rather than ~256kbps of raw L16.
+    ///
+    /// This is the payload format native RTSP cameras overwhelmingly use
+    /// for AAC, so client support is the broadest of the passthrough
+    /// options: ffmpeg/ffprobe, VLC, Blue Iris — and go2rtc, which
+    /// recognises AAC *only* under this name (see [`AudioFormat::Latm`]).
+    #[serde(
+        alias = "mpeg4-generic",
+        alias = "mpeg4_generic",
+        alias = "mpeg4generic",
+        alias = "rfc3640",
+        alias = "aac-hbr",
+        alias = "generic"
+    )]
+    Mpeg4Generic,
     /// Pass AAC through untouched, payloaded as `MP4A-LATM` (RFC 6416).
     ///
-    /// This is the low latency option: no decode, no resample and no
-    /// re-encode, so the only work done on the audio is RTP framing.
-    /// It also cuts the audio bandwidth from ~256kbps (16kHz mono L16) to
-    /// whatever the camera encoded at (typically 16-32kbps).
+    /// The same passthrough as [`AudioFormat::Mpeg4Generic`] — same
+    /// frames, same absence of any decode — differing only in how RTP
+    /// frames them. Understood by ffmpeg/ffprobe, VLC and Blue Iris.
     ///
-    /// Understood by ffmpeg/ffprobe, VLC, go2rtc (and therefore Home
-    /// Assistant and Frigate) and Blue Iris.
+    /// **Not understood by go2rtc**, and therefore not by Home Assistant
+    /// or Frigate through it: go2rtc identifies AAC solely by the rtpmap
+    /// name `MPEG4-GENERIC`, so a `MP4A-LATM` track is parsed as an
+    /// unknown codec and dropped without an error. Use
+    /// [`AudioFormat::Mpeg4Generic`] (or `all`) for those.
     #[serde(alias = "latm", alias = "aac", alias = "passthrough")]
     Latm,
     /// Decode the audio to raw samples and send it as `L16` (RFC 3551).
@@ -573,15 +596,18 @@ pub(crate) enum AudioFormat {
     /// Offer everything we can, as separate audio tracks in the SDP, and
     /// let the client decide.
     ///
-    /// One `MP4A-LATM` track and one `L16` track are advertised, and a
-    /// client that negotiates (go2rtc, and so Home Assistant and Frigate)
-    /// sets up only the one it wants.
+    /// A `MPEG4-GENERIC` track, a `MP4A-LATM` track and an `L16` track are
+    /// advertised, in that order, and a client that negotiates sets up only
+    /// the one it wants. go2rtc does — it issues `SETUP` per track, on
+    /// demand — so this lets one camera serve passthrough AAC to whatever
+    /// go2rtc muxes into MP4/HLS and `L16` to its WebRTC output, which
+    /// cannot take AAC in any framing.
     ///
     /// Opt-in, because a client that does not negotiate sets up every
-    /// track in the SDP and so receives both audio streams at once. Both
-    /// branches also run server-side regardless of what is subscribed, so
-    /// the decode that `latm` avoids is paid anyway, and a decoder failure
-    /// takes the passthrough track and the video with it.
+    /// track in the SDP and so receives all of them at once. Every branch
+    /// also runs server-side regardless of what is subscribed, so the
+    /// decode that the passthrough formats avoid is paid anyway, and a
+    /// decoder failure takes the passthrough tracks and the video with it.
     #[serde(
         alias = "all",
         alias = "auto",
@@ -595,6 +621,7 @@ pub(crate) enum AudioFormat {
 impl std::fmt::Display for AudioFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let s = match self {
+            AudioFormat::Mpeg4Generic => "mpeg4-generic",
             AudioFormat::Latm => "latm",
             AudioFormat::Pcm => "pcm",
             AudioFormat::All => "all",
@@ -611,6 +638,8 @@ impl AudioFormat {
     /// can say so and carry on with the camera's configured format.
     pub(crate) fn from_request(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "mpeg4-generic" | "mpeg4_generic" | "mpeg4generic" | "rfc3640" | "aac-hbr"
+            | "generic" => Some(Self::Mpeg4Generic),
             "latm" | "aac" | "passthrough" => Some(Self::Latm),
             "pcm" | "l16" | "raw" => Some(Self::Pcm),
             "all" | "auto" | "both" | "dual" | "offer_both" => Some(Self::All),
@@ -742,6 +771,21 @@ mod tests {
 
     #[test]
     fn audio_format_accepts_its_spellings() {
+        for spelling in [
+            "mpeg4-generic",
+            "Mpeg4Generic",
+            "mpeg4_generic",
+            "mpeg4generic",
+            "rfc3640",
+            "aac-hbr",
+            "generic",
+        ] {
+            assert_eq!(
+                camera(&format!("audio_format = \"{spelling}\"")).audio_format,
+                AudioFormat::Mpeg4Generic,
+                "{spelling} should select MPEG4-GENERIC"
+            );
+        }
         for spelling in ["latm", "Latm", "aac", "passthrough"] {
             assert_eq!(
                 camera(&format!("audio_format = \"{spelling}\"")).audio_format,
@@ -769,6 +813,12 @@ mod tests {
     /// config file accepts or the two would disagree about the same word.
     #[test]
     fn a_client_can_ask_for_a_format_by_name() {
+        for spelling in ["mpeg4-generic", "MPEG4-Generic", " rfc3640 ", "aac-hbr"] {
+            assert_eq!(
+                AudioFormat::from_request(spelling),
+                Some(AudioFormat::Mpeg4Generic)
+            );
+        }
         for spelling in ["latm", "LATM", "aac", " passthrough "] {
             assert_eq!(AudioFormat::from_request(spelling), Some(AudioFormat::Latm));
         }

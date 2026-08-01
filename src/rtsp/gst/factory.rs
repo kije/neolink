@@ -192,7 +192,7 @@ fn requested_audio_format(url: &RTSPUrl) -> Option<AudioFormat> {
         None => {
             log::warn!(
                 "Ignoring unknown `?audio={requested}` on the request URL; \
-                 expected one of latm, pcm or all"
+                 expected one of mpeg4-generic, latm, pcm or all"
             );
             None
         }
