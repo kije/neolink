@@ -111,18 +111,33 @@ address = "192.168.1.187:9000"
 
 # How the camera's audio is delivered over RTSP.
 #
-# "latm" (the default) passes AAC through untouched as MP4A-LATM (RFC 6416).
-#        No decoding happens, so there is no codec latency and the audio uses
-#        the camera's own bitrate rather than ~256kbps of raw samples.
-#        Understood by ffmpeg, VLC, go2rtc (Home Assistant, Frigate) and
-#        Blue Iris.
-# "pcm"  decodes the audio and sends raw L16 samples. Slower and much larger,
-#        but understood by everything. Use this if your client cannot play
-#        MP4A-LATM.
+# "pcm"  (the default) decodes the audio and sends raw L16 samples. Larger and
+#        slower than passing it through, but understood by every RTSP client,
+#        so it is the setting that always works.
+# "latm" passes AAC through untouched as MP4A-LATM (RFC 6416). No decoding
+#        happens, so there is no codec latency and the audio uses the camera's
+#        own bitrate rather than ~256kbps of raw samples. Understood by
+#        ffmpeg, VLC, go2rtc (Home Assistant, Frigate) and Blue Iris, but not
+#        by everything — which is why it is opt-in.
+# "all"  offers both as separate audio tracks and lets the client set up the
+#        one it wants. Only for clients that negotiate (go2rtc, and so Home
+#        Assistant and Frigate); others subscribe to every track and receive
+#        both audio streams at once. The decode branch also runs whether or
+#        not anyone listens to it, and a decoder failure on this camera's
+#        audio takes the whole mount down, video included.
+#
+# A client can override this for itself by adding ?audio= to its URL:
+#     rtsp://neolink:8554/driveway/mainStream?audio=latm
+# Each client gets its own pipeline, so two clients can hold different formats
+# on the same camera at once, without either changing this file.
 #
 # ADPCM cameras are always decoded to L16 and ignore this setting.
 #
-# audio_format = "latm"
+# Passthrough needs MPEG-4 AAC in ADTS framing. Where a camera cannot provide
+# it, the MP4A-LATM track is dropped and only L16 is offered, with a warning
+# in the log saying why.
+#
+# audio_format = "pcm"
 
 # How much media the server side queues may hold, in milliseconds.
 # This bounds how far behind live a client can drift when it stops keeping

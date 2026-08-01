@@ -4,6 +4,7 @@
 //! expect issues
 
 use super::AnyResult;
+use crate::config::AudioFormat;
 use gstreamer::glib::object_subclass;
 use gstreamer::Element;
 use gstreamer::{
@@ -47,7 +48,7 @@ impl NeoMediaFactory {
 
     pub(crate) async fn new_with_callback<F>(callback: F) -> AnyResult<Self>
     where
-        F: Fn(Element) -> AnyResult<Option<Element>> + Send + Sync + 'static,
+        F: Fn(Element, Option<AudioFormat>) -> AnyResult<Option<Element>> + Send + Sync + 'static,
     {
         let factory = Self::new();
         factory.imp().set_callback(callback).await;
@@ -97,9 +98,19 @@ impl NeoMediaFactory {
 unsafe impl Send for NeoMediaFactory {}
 unsafe impl Sync for NeoMediaFactory {}
 
+#[allow(clippy::type_complexity)]
 pub(crate) struct NeoMediaFactoryImpl {
-    #[allow(clippy::type_complexity)]
-    call_back: Arc<Mutex<Option<Arc<dyn Fn(Element) -> AnyResult<Option<Element>> + Send + Sync>>>>,
+    call_back: Arc<
+        Mutex<
+            Option<
+                Arc<
+                    dyn Fn(Element, Option<AudioFormat>) -> AnyResult<Option<Element>>
+                        + Send
+                        + Sync,
+                >,
+            >,
+        >,
+    >,
 }
 
 impl Default for NeoMediaFactoryImpl {
@@ -115,14 +126,18 @@ impl Default for NeoMediaFactoryImpl {
 impl NeoMediaFactoryImpl {
     async fn set_callback<F>(&self, callback: F)
     where
-        F: Fn(Element) -> AnyResult<Option<Element>> + Send + Sync + 'static,
+        F: Fn(Element, Option<AudioFormat>) -> AnyResult<Option<Element>> + Send + Sync + 'static,
     {
         self.call_back.lock().await.replace(Arc::new(callback));
     }
-    fn build_pipeline(&self, media: Element) -> AnyResult<Option<Element>> {
+    fn build_pipeline(
+        &self,
+        media: Element,
+        audio_format: Option<AudioFormat>,
+    ) -> AnyResult<Option<Element>> {
         match self.call_back.blocking_lock().as_ref() {
             Some(call) => {
-                let new_media = call(media);
+                let new_media = call(media, audio_format);
                 match new_media {
                     Ok(new_media) => Ok(new_media),
                     Err(e) => {
@@ -153,11 +168,45 @@ impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
         // connected and simply sees the placeholder until the real stream
         // becomes available.
         let orig = self.parent_create_element(url)?;
-        self.build_pipeline(orig)
+        self.build_pipeline(orig, requested_audio_format(url))
             .ok()
             .flatten()
             .or_else(|| self.parent_create_element(url))
     }
+}
+
+/// The audio format this client asked for with `?audio=` on its URL, if it
+/// asked for one we understand.
+///
+/// This is the only per-client negotiation RTSP really offers: the protocol
+/// has no way for a client to say what it can decode, but it can ask for a
+/// different resource. The mount is matched on the path alone, so the query
+/// rides along without disturbing it.
+fn requested_audio_format(url: &RTSPUrl) -> Option<AudioFormat> {
+    let requested = audio_query_param(url.request_uri().as_str())?;
+    match AudioFormat::from_request(&requested) {
+        Some(format) => {
+            log::debug!("Client asked for audio_format={format}");
+            Some(format)
+        }
+        None => {
+            log::warn!(
+                "Ignoring unknown `?audio={requested}` on the request URL; \
+                 expected one of latm, pcm or all"
+            );
+            None
+        }
+    }
+}
+
+/// Pull the `audio` parameter out of a request URI's query string.
+fn audio_query_param(uri: &str) -> Option<String> {
+    let (_, query) = uri.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        key.eq_ignore_ascii_case("audio")
+            .then(|| value.trim().to_string())
+    })
 }
 
 #[object_subclass]
@@ -165,4 +214,77 @@ impl ObjectSubclass for NeoMediaFactoryImpl {
     const NAME: &'static str = "NeoMediaFactory";
     type Type = super::NeoMediaFactory;
     type ParentType = RTSPMediaFactory;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// The whole path a client's `?audio=` takes: RTSP URL in, pipeline
+    /// callback out. The parsing is tested below; this is the wiring.
+    #[test]
+    fn the_requested_format_reaches_the_pipeline_callback() {
+        gstreamer::init().expect("gstreamer should initialise");
+        if gstreamer::ElementFactory::find("videotestsrc").is_none() {
+            eprintln!("skipping: the placeholder pipeline needs videotestsrc");
+            return;
+        }
+
+        let seen: Arc<StdMutex<Vec<Option<AudioFormat>>>> = Arc::new(StdMutex::new(vec![]));
+        let recorder = seen.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime should build");
+        let factory = runtime
+            .block_on(NeoMediaFactory::new_with_callback(
+                move |element, audio_format| {
+                    recorder.lock().unwrap().push(audio_format);
+                    Ok(Some(element))
+                },
+            ))
+            .expect("factory should build");
+
+        let describe = |uri: &str| {
+            let (_, url) = RTSPUrl::parse(uri);
+            let url = url.expect("test url should parse");
+            let _ = factory.create_element(&url);
+        };
+
+        describe("rtsp://host:8554/Camera01/mainStream");
+        describe("rtsp://host:8554/Camera01/mainStream?audio=pcm");
+        describe("rtsp://host:8554/Camera01/mainStream?audio=latm");
+        // Unrecognised: fall back to whatever the camera is configured for
+        // rather than inventing a format.
+        describe("rtsp://host:8554/Camera01/mainStream?audio=opus");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![None, Some(AudioFormat::Pcm), Some(AudioFormat::Latm), None]
+        );
+    }
+
+    #[test]
+    fn the_audio_parameter_is_read_off_the_request_url() {
+        let param = |uri| audio_query_param(uri);
+
+        assert_eq!(param("rtsp://host/cam/mainStream"), None);
+        assert_eq!(
+            param("rtsp://host/cam/mainStream?audio=pcm").as_deref(),
+            Some("pcm")
+        );
+        // It need not be the only parameter, or the first.
+        assert_eq!(
+            param("rtsp://host/cam?foo=1&audio=latm&bar=2").as_deref(),
+            Some("latm")
+        );
+        // Keys are matched case-insensitively, values are handed on as
+        // written for `AudioFormat::from_request` to interpret.
+        assert_eq!(param("rtsp://host/cam?Audio=ALL").as_deref(), Some("ALL"));
+        // A stream path that merely contains the word must not count.
+        assert_eq!(param("rtsp://host/cam/audio=pcm"), None);
+        // Malformed queries are simply absent, not a panic.
+        assert_eq!(param("rtsp://host/cam?audio"), None);
+        assert_eq!(param("rtsp://host/cam?"), None);
+    }
 }
