@@ -16,9 +16,9 @@ use neolink_core::{
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
 use crate::{
-    common::NeoInstance,
+    common::{NeoInstance, TimestampTracker},
     config::{AudioFormat, Compat},
-    rtsp::{gst::NeoMediaFactory, timestamps::TimestampTracker},
+    rtsp::gst::NeoMediaFactory,
     AnyResult,
 };
 

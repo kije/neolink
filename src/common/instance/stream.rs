@@ -1,16 +1,22 @@
 use super::*;
 
-use crate::common::UseCounter;
-use futures::FutureExt;
 use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
-use tokio::task::JoinSet;
 
-#[cfg(feature = "pushnoti")]
+// Only `stream_while_live` pauses, and only the RTSP server needs that.
+#[cfg(feature = "gstreamer")]
+use {crate::common::UseCounter, futures::FutureExt, tokio::task::JoinSet};
+
+#[cfg(all(feature = "gstreamer", feature = "pushnoti"))]
 use crate::common::PushNoti;
 
 impl NeoInstance {
     /// Streams a camera source while not paused
+    ///
+    /// Only the RTSP server pauses: `neolink stream` is started and
+    /// stopped by whoever is reading its pipe, so it has no use for a
+    /// stream that stops delivering while the process stays alive.
+    #[cfg(feature = "gstreamer")]
     pub(crate) async fn stream_while_live(
         &self,
         stream: StreamKind,
