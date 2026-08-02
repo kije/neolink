@@ -4,7 +4,7 @@
 //! expect issues
 
 use super::AnyResult;
-use crate::config::AudioFormat;
+use crate::config::{AudioFormat, Compat};
 use gstreamer::glib::object_subclass;
 use gstreamer::Element;
 use gstreamer::{
@@ -35,10 +35,24 @@ impl Default for NeoMediaFactory {
 
 impl NeoMediaFactory {
     fn new() -> Self {
+        Self::with_compat(Compat::default())
+    }
+
+    /// Build a factory carrying the settings a [`Compat`] profile asks for.
+    fn with_compat(compat: Compat) -> Self {
         let factory = Object::new::<NeoMediaFactory>();
         factory.set_shared(false);
         factory.set_eos_shutdown(false);
-        factory.set_stop_on_disconnect(false);
+        // Under the default profile a media outlives its client until the
+        // session times out, which is what lets a client that dropped its
+        // connection pick the stream back up. go2rtc does not: it drops the
+        // TCP connection without a TEARDOWN whenever its read deadline
+        // fires, and reconnects fresh — so holding the pipeline (and its
+        // camera subscription) open just stacks them up.
+        factory.set_stop_on_disconnect(compat.stop_on_disconnect());
+        if compat.tcp_only() {
+            factory.set_protocols(gstreamer_rtsp::RTSPLowerTrans::TCP);
+        }
         // factory.set_publish_clock_mode(gstreamer_rtsp_server::RTSPPublishClockMode::Clock);
         factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::Reset);
         factory.set_launch("videotestsrc pattern=\"snow\" ! video/x-raw,width=896,height=512,framerate=25/1 ! textoverlay name=\"inittextoverlay\" text=\"Stream not Ready\" valignment=top halignment=left font-desc=\"Sans, 32\" ! jpegenc ! rtpjpegpay name=pay0");
@@ -46,11 +60,11 @@ impl NeoMediaFactory {
         factory
     }
 
-    pub(crate) async fn new_with_callback<F>(callback: F) -> AnyResult<Self>
+    pub(crate) async fn new_with_callback<F>(compat: Compat, callback: F) -> AnyResult<Self>
     where
         F: Fn(Element, Option<AudioFormat>) -> AnyResult<Option<Element>> + Send + Sync + 'static,
     {
-        let factory = Self::new();
+        let factory = Self::with_compat(compat);
         factory.imp().set_callback(callback).await;
         Ok(factory)
     }
@@ -192,7 +206,7 @@ fn requested_audio_format(url: &RTSPUrl) -> Option<AudioFormat> {
         None => {
             log::warn!(
                 "Ignoring unknown `?audio={requested}` on the request URL; \
-                 expected one of latm, pcm or all"
+                 expected one of mpeg4-generic, latm, pcm or all"
             );
             None
         }
@@ -238,6 +252,7 @@ mod tests {
             .expect("runtime should build");
         let factory = runtime
             .block_on(NeoMediaFactory::new_with_callback(
+                Compat::default(),
                 move |element, audio_format| {
                     recorder.lock().unwrap().push(audio_format);
                     Ok(Some(element))
@@ -261,6 +276,33 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             vec![None, Some(AudioFormat::Pcm), Some(AudioFormat::Latm), None]
+        );
+    }
+
+    /// The two profile settings that are properties of the factory rather
+    /// than of the pipeline, so nothing else would catch them going astray.
+    #[test]
+    fn the_profile_reaches_the_factory() {
+        gstreamer::init().expect("gstreamer should initialise");
+
+        let default = NeoMediaFactory::with_compat(Compat::Default);
+        assert!(!default.is_stop_on_disconnect());
+        assert!(
+            default
+                .protocols()
+                .contains(gstreamer_rtsp::RTSPLowerTrans::UDP),
+            "the default profile should leave every transport available"
+        );
+
+        let go2rtc = NeoMediaFactory::with_compat(Compat::Go2rtc);
+        assert!(
+            go2rtc.is_stop_on_disconnect(),
+            "go2rtc drops its connection without a TEARDOWN; the media must not linger"
+        );
+        assert_eq!(
+            go2rtc.protocols(),
+            gstreamer_rtsp::RTSPLowerTrans::TCP,
+            "go2rtc dials TCP anyway, so UDP is only a way to lose packets"
         );
     }
 
