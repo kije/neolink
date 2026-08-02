@@ -47,6 +47,7 @@ mod image;
 mod mpegts;
 mod mqtt;
 mod onvif;
+mod pipe;
 mod pir;
 mod ptz;
 mod reboot;
@@ -161,6 +162,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Stream(opts)) => {
             stream::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Pipe(opts)) => {
+            pipe::main(opts, neo_reactor.clone()).await?;
         }
     }
 
