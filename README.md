@@ -156,6 +156,83 @@ the camera's encoder. See the note at the end of this section.
 
 `docs/go2rtc-compatibility.md` has the reasoning, and what is still open.
 
+### Piping a camera straight into go2rtc
+
+Everything above tunes the RTSP server so that go2rtc can live with it. The
+`stream` subcommand takes the other route and removes the server from the
+picture: it writes one camera to standard output as MPEG-TS, and go2rtc runs
+it as an `exec:` source.
+
+```yaml
+streams:
+  front: exec:neolink stream --config=/etc/neolink.toml Front
+  drive: exec:neolink stream --config=/etc/neolink.toml Drive --stream sub
+```
+
+That is the whole configuration. There is no port to bind, no mount point to
+name, and no RTSP tuning to get right, because the things that make go2rtc
+awkward in front of an RTSP server are not present in a pipe:
+
+| what goes wrong over RTSP | over a pipe |
+| --- | --- |
+| go2rtc gives every RTSP request five seconds; a battery camera waking up can miss it and the DESCRIBE fails | go2rtc waits on the pipe indefinitely, so a slow camera costs startup time rather than the connection |
+| a media connection is dropped after five seconds of silence | there is no idle deadline on a pipe |
+| the media factory is unshared, so every RTSP client opens its own camera subscription, and a client that vanishes without a TEARDOWN holds it for another 30 s | go2rtc starts the process for the first viewer and stops it after the last, so the camera is connected on demand and exactly once |
+| whether the SDP has an audio track depends on what arrived during the learning window, and a reconnect that changes the track set breaks live viewers | the track list is settled before the first byte and cannot change under a viewer |
+| the "Stream not Ready" splash is MJPEG, which browsers cannot play, and it stops after ~20 s | nothing is written until there is a real keyframe to write |
+
+Output always starts on a keyframe, so the parameter sets a decoder needs are
+in front of the first frame a consumer sees.
+
+#### Options
+
+| flag | default | notes |
+| --- | --- | --- |
+| `-o`, `--output` | `-` | `-` is stdout. Anything else is a path; an existing FIFO works, and opening it blocks until a reader arrives |
+| `--stream` | `main` | `main`, `sub` or `extern` |
+| `--format` | `mpegts` | or `annexb` for a bare video elementary stream with no audio, for piping into ffmpeg |
+| `--audio` | `auto` | `auto`, `aac`, `pcma` or `none` |
+| `--audio-probe` | `2` | seconds to wait for an audio frame before deciding a camera is video only. Only the first frames are delayed; `--audio none` skips the wait |
+
+#### Audio
+
+| the camera sends | `--audio auto` writes | what go2rtc does with it |
+| --- | --- | --- |
+| AAC | the camera's AAC, untouched | named `MPEG4-GENERIC`, so MP4, HLS and recordings get it with no re-encode. WebRTC cannot use AAC in any framing, so a WebRTC viewer gets no sound |
+| ADPCM | G.711 A-law, decoded and re-encoded | WebRTC takes A-law with no transcode — **but only on a go2rtc newer than 1.9.14**, whose MPEG-TS reader does not look for it and will show the stream as video only |
+
+Both cases are cheap: AAC is copied, and A-law costs a table lookup per
+sample. Neither path decodes video.
+
+If you need audio in a browser from an AAC camera today, the RTSP server is
+still the way — `compat = "go2rtc"` gives go2rtc an `L16` track it can
+resample for WebRTC alongside the AAC it mixes into MP4.
+
+#### Why a pipe rather than a FIFO or a virtual camera
+
+A named FIFO is the same bytes with the good part removed. `--output` will
+write to one, but nothing then starts neolink when a viewer appears or stops
+it when they leave, a FIFO carries exactly one reader, and both ends have to
+be restarted in the right order after either dies. The `exec:` pipe is a FIFO
+that go2rtc also manages the lifetime of.
+
+A virtual video device (`v4l2loopback`) is worse again: it needs an
+out-of-tree kernel module and root, it carries raw frames, so the H264 or
+H265 the camera already produced has to be decoded and re-encoded, and V4L2
+has nowhere to put the audio.
+
+#### Notes
+
+- The `pause` settings do not apply. There is nothing to pause when nothing
+  runs unless someone is watching.
+- Logs go to stderr, so they land in go2rtc's log and never in the stream.
+  `RUST_LOG=debug` works as everywhere else.
+- This path does not use GStreamer, so it is available in builds without the
+  `gstreamer` feature.
+- H265 works, and is passed through as-is. The browser support caveat is
+  unchanged: no desktop Firefox, and WebRTC needs Chrome 136+ or Safari 18+.
+  `--stream sub` is usually H264.
+
 ### Audio and Latency
 
 Reolink cameras send audio either as AAC or as DVI4 ADPCM.

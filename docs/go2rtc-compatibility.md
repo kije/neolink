@@ -11,6 +11,14 @@ record, §3.2 is reduced to its remaining half, and §3.4/§3.8 are carried by
 the `compat = "go2rtc"` profile. What is left is §3.3 (silence), §3.5
 (shared media), §3.6 (deterministic SDP) and §3.7 (keyframe start).
 
+**§7 adds a second route.** `neolink stream` writes MPEG-TS to a pipe for
+go2rtc's `exec:` source instead of serving RTSP. Most of what is left open
+above is a property of the RTSP server rather than of neolink, and simply
+does not arise over a pipe: §3.2, §3.3, §3.5, §3.6 and §3.7 are all closed
+structurally there. It is an addition, not a replacement — the RTSP server
+remains the only path with an `L16` track, which is still the only way to get
+audio to a WebRTC viewer from an AAC camera.
+
 Revised against `master` at `a09634b` (PRs #34 and #35), which landed a large
 rework of the audio path and the FPS limiter while this was being written.
 §1 records what that changed. Findings about go2rtc are cited against
@@ -546,3 +554,115 @@ tests ran rather than skipping — including the new
 `encoding-name` each payloader actually negotiates. On a machine without
 `gst-plugins-good`/`-bad` they skip silently, so a green run there proves
 less than it appears to.
+
+
+---
+
+## 7. The `exec:` pipe
+
+Everything above treats go2rtc as an RTSP client and tries to make neolink a
+better RTSP server for it. go2rtc has a second way in: `exec:` runs a command
+and reads its stdout, autodetecting the container
+(`internal/exec/exec.go`, `pkg/magic/producer.go`).
+
+```yaml
+streams:
+  front: exec:neolink stream --config=/etc/neolink.toml Front
+```
+
+### 7.1 Why this closes so much of §3 at once
+
+The pipe path is not a workaround; it removes the machinery the findings are
+about.
+
+| finding | over RTSP | over a pipe |
+|---|---|---|
+| §3.2 five second DESCRIBE deadline | `Timeout = 5s` on every request/response round trip, and go2rtc re-DESCRIBEs whenever the consumer mix changes | `handlePipe` applies **no** timeout at all. `starttimeout` is read but used only by the RTSP branch. A cold camera costs startup time, not the connection |
+| §3.3 five second read deadline | flat 5 s on the media connection, refreshed only by inbound data | a pipe has no read deadline. A silent camera stalls the picture; it does not kill the source |
+| §3.5 one camera session per client | `set_shared(false)`, plus a 30 s session timeout for clients that vanish without a TEARDOWN | go2rtc starts the process for the first consumer and closes it after the last, so the camera is connected on demand and exactly once. `set_shared(true)` becomes unnecessary rather than unfinished |
+| §3.6 SDP shape must be identical across reconnects | the track set depends on what arrived inside the learning window | the PMT is written once, ahead of all output, from a completed probe. It cannot change mid-stream because there is no reconnect to change it on |
+| §3.7 start on a keyframe | buffered frames are replayed verbatim, so a client can begin mid-GOP | the pump drops everything before the newest keyframe. It has to: go2rtc derives the H264/H265 codec from the first access unit it sees (`h264.AVCCToCodec`), so `sprop-parameter-sets` would otherwise be empty |
+| §3.4 splash | mounted up front, MJPEG, ends after ~20 s | nothing is written until there is a real keyframe |
+| §3.8 latency | `buffer_duration` queue, plus payloader tuning | no queue. The muxer writes and flushes per frame |
+
+### 7.2 What the format has to be
+
+`magic.Open` peeks four bytes and dispatches on them. Of everything it
+accepts — Annex-B, WAV, Y4M, FLV, MJPEG, ADTS, multipart, MPEG-TS — only
+**MPEG-TS** carries video and audio together, and it is also the only one
+that carries H265.
+
+go2rtc's TS demuxer (`pkg/mpegts/producer.go`) creates a media for these
+stream types, and silently ignores every other one:
+
+| stream type | value | notes |
+|---|---|---|
+| H264 | `0x1B` | payload must be Annex-B; the demuxer converts to AVCC itself |
+| H265 | `0x24` | as above |
+| AAC | `0x0F` | payload must be ADTS framed, which is exactly what the camera sends |
+| Opus | `0xEB` | private type, keyed off a registration descriptor |
+| A-law | `0x90` | private type adopted from Tapo. **See §7.4** |
+
+Two of those are free. The camera's H264/H265 is already Annex-B and its AAC
+is already ADTS, so the video and the AAC are copied rather than converted —
+`src/mpegts` does not decode anything, and does not link GStreamer, which is
+why `neolink stream` works in a build without the `gstreamer` feature.
+
+### 7.3 The AAC track go2rtc actually wanted
+
+§3.1 went to some trouble to give go2rtc an AAC track it could name, because
+it identifies AAC solely by the rtpmap encoding name `MPEG4-GENERIC`. Over
+MPEG-TS that problem does not exist: the codec comes from the PMT stream
+type, and go2rtc constructs the codec as `CodecAAC` — which *is*
+`MPEG4-GENERIC` — from the ADTS header (`aac.RTPToCodec`).
+
+Confirmed against go2rtc 1.9.14, feeding it a program muxed by
+`src/mpegts`:
+
+```text
+"format_name": "mpegts", "protocol": "pipe",
+"medias": ["video, recvonly, H264", "audio, recvonly, MPEG4-GENERIC/16000/1"]
+```
+
+and an MP4 consumer attached to it took both tracks straight through, with
+the senders' codecs unchanged from the receivers' — no FLAC re-encode, which
+is what an `L16` track would have cost (§3.1).
+
+### 7.4 A-law works, but not on the released go2rtc
+
+The A-law stream type is the one thing here that is version dependent, and
+the difference was verified by running both builds against the same file:
+
+| go2rtc | what it reports |
+|---|---|
+| **1.9.14** (current release) | `medias: ["video, recvonly, H264"]` — the audio is absent |
+| **master** (`1.9.14+dev.c245815`) | `medias: ["video, recvonly, H264", "audio, recvonly, PCMA/8000"]` |
+
+The cause is not the muxing. `Producer.probe` only creates a media for the
+stream types named in its `switch`, and 1.9.14 lists H264, H265, AAC and
+Opus but not `StreamTypePCMATapo`; master adds it. The constant exists in
+both, for the Tapo-specific producer.
+
+The consequence is narrow but worth stating plainly: an ADPCM camera piped
+into a released go2rtc has no audio. An unlisted stream type is skipped
+rather than waited for, so emitting it costs nothing on an old version and
+starts working on an upgrade — but it is not something to rely on today.
+
+For an AAC camera — which is most of them — none of this applies, and the
+RTSP server with `compat = "go2rtc"` remains the answer for anyone who needs
+WebRTC audio from one.
+
+### 7.5 What is still on the RTSP side
+
+The pipe does not make §4's profile redundant.
+
+* **WebRTC audio from an AAC camera.** go2rtc cannot use AAC for WebRTC in
+  any framing, and MPEG-TS has no `L16` stream type, so the pipe cannot offer
+  the resample-friendly track that `audio_format = "pcm"` does. Closing this
+  needs an encoder in neolink: AAC decoded to A-law, or to Opus, which
+  `0xEB` would carry and which both of go2rtc's outputs take natively.
+* **Anything that wants RTSP.** Blue Iris, ZoneMinder and the rest are
+  unaffected by all of this and keep the server.
+* **§3.3's keep-alive.** `pause.on_motion` still stops frames, and while a
+  pipe will not be killed for it, a frozen picture is not much better. The
+  I-frame re-push idea stands on its own.
