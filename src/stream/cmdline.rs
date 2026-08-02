@@ -49,11 +49,42 @@ pub struct Opt {
     /// milliseconds. Irrelevant when `--audio none` is set.
     #[arg(long, default_value_t = 2.0)]
     pub audio_probe: f32,
+
+    /// How far behind the reader may fall before its backlog is thrown
+    /// away, in seconds. Zero never throws anything away
+    ///
+    /// Live video goes stale: if the reader stalls or dies, queuing what
+    /// it missed only means it plays the stall back afterwards, that far
+    /// behind for good. Past this much queued stream time, everything
+    /// waiting is dropped and the reader is restarted at the next
+    /// keyframe, so what it gets is current.
+    ///
+    /// Set it to zero when writing a file you intend to keep, where
+    /// falling behind is fine and losing frames is not.
+    #[arg(long, default_value_t = 2.0)]
+    pub max_backlog: f32,
+}
+
+impl Opt {
+    /// The settings that shape the stream rather than its destination.
+    pub(crate) fn settings(&self) -> crate::stream::pump::Settings {
+        crate::stream::pump::Settings {
+            format: self.format,
+            audio: self.audio,
+            audio_probe: self.audio_probe,
+        }
+    }
+
+    /// How much stream time a reader may have queued, or `None` to keep
+    /// everything however far behind it gets.
+    pub(crate) fn backlog(&self) -> Option<std::time::Duration> {
+        (self.max_backlog > 0.0).then(|| std::time::Duration::from_secs_f32(self.max_backlog))
+    }
 }
 
 /// Where the stream is written.
 #[derive(Clone, Debug)]
-pub enum Output {
+pub(crate) enum Output {
     /// Standard output.
     Stdout,
     /// A file or FIFO.
@@ -73,7 +104,7 @@ impl std::str::FromStr for Output {
 
 /// Which camera stream to pull.
 #[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum Stream {
+pub(crate) enum Stream {
     /// The HD stream
     Main,
     /// The SD stream
@@ -94,7 +125,7 @@ impl From<Stream> for StreamKind {
 
 /// The container written to the output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Format {
+pub(crate) enum Format {
     /// MPEG-TS, carrying video and audio together
     ///
     /// The only format here that can carry both, and the one go2rtc's
@@ -111,7 +142,7 @@ pub enum Format {
 
 /// Which audio track to publish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Audio {
+pub(crate) enum Audio {
     /// Publish whatever the camera sends, in the cheapest usable form
     ///
     /// AAC is passed through untouched; ADPCM, which nothing downstream
