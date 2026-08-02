@@ -35,4 +35,5 @@ pub enum Command {
     Users(super::users::Opt),
     Onvif(super::onvif::Opt),
     Ai(super::ai::Opt),
+    Stream(super::stream::Opt),
 }
