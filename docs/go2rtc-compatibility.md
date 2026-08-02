@@ -666,3 +666,48 @@ The pipe does not make §4's profile redundant.
 * **§3.3's keep-alive.** `pause.on_motion` still stops frames, and while a
   pipe will not be killed for it, a frozen picture is not much better. The
   I-frame re-push idea stands on its own.
+
+### 7.6 When `exec:` cannot reach neolink
+
+`exec:` runs its command inside go2rtc's own container, so it needs
+neolink, its config and a route to the cameras there. The common
+deployment where that fails is neolink on the host and Frigate or go2rtc
+in Docker.
+
+`neolink pipe` serves the same MPEG-TS over a FIFO or a unix socket in a
+directory, which a bind-mount carries across that boundary. It keeps the
+properties §7.1 credits to the pipe — on-demand camera connection, a track
+list fixed before the first byte, keyframe-aligned starts — because it is
+the same pump behind a different rendezvous.
+
+Verified against both consumers: go2rtc reads a FIFO through `exec:cat`
+and reports the same `mpegts`/`pipe` producer with `H264` and
+`MPEG4-GENERIC/16000/1` as it does over a direct pipe, and `ffprobe
+unix://…` reads the socket and finds H264 640x480 with AAC 16 kHz mono.
+
+One property is new, and it is the reason the fanout exists rather than a
+plain writer. A long-lived server has to survive its reader crashing,
+hanging or simply being slower than the camera, and the obvious handling —
+queue what it missed — is wrong for live video: the reader returns and
+plays the gap out, permanently that far behind. Each reader therefore has
+a queue bounded in *stream time*, and when it overruns the queue is
+discarded rather than trimmed, because the frames in it are deltas and a
+reader cannot simply be handed the newest one. It restarts at the next
+keyframe. Readers are measured independently, so a slow one cannot delay a
+fast one, and the producer never blocks on any of them.
+
+The visible cost is that a discarded backlog leaves a gap in the MPEG-TS
+continuity counters. go2rtc does not look at them at all
+(`readPacketHeader` discards the field); ffmpeg logs a continuity warning
+and resynchronises at the PAT/PMT that opens the next keyframe, which is
+why the muxer writes those tables in front of every random access point.
+
+Two things people ask for that are deliberately absent. **Shared memory**
+would be faster and would give the drop-the-stale-data behaviour for free,
+but nothing downstream can read it — go2rtc has no such source, ffmpeg has
+no such demuxer — so it would need a shim copying the ring into a pipe,
+leaving the pipe as the real interface. It also optimises a cost that is
+not being paid, at 500 KB/s for a 4 Mbps camera. **v4l2loopback** needs an
+out-of-tree kernel module and root, carries raw frames so the camera's
+already-compressed video would have to be decoded and re-encoded, and has
+nowhere to put audio.

@@ -233,6 +233,99 @@ has nowhere to put the audio.
   unchanged: no desktop Firefox, and WebRTC needs Chrome 136+ or Safari 18+.
   `--stream sub` is usually H264.
 
+### Neolink on the host, Frigate in a container
+
+`exec:` has one requirement that is easy to miss: go2rtc runs the command
+*inside its own container*, so neolink, its config and a route to the
+cameras all have to be there. If neolink runs on the host and Frigate or
+go2rtc runs in Docker, that does not hold.
+
+`neolink pipe` crosses that boundary with a path instead. It creates one
+endpoint per camera in a directory you bind-mount, and streams into
+whichever of them something opens:
+
+```bash
+neolink pipe --config=/etc/neolink.toml --dir=/run/neolink
+```
+
+```yaml
+# docker-compose.yml
+services:
+  frigate:
+    volumes:
+      - /run/neolink:/pipes
+```
+
+Then point either consumer at the path. go2rtc reads a FIFO through `cat`:
+
+```yaml
+streams:
+  front: exec:cat /pipes/Front.ts
+```
+
+and Frigate reads one as an ordinary ffmpeg input:
+
+```yaml
+cameras:
+  front:
+    ffmpeg:
+      inputs:
+        - path: /pipes/Front.ts
+          roles: [detect, record]
+```
+
+A camera is connected only while something is reading its endpoint, and
+released when the last reader goes — the same on-demand behaviour `exec:`
+gets from starting and stopping the process, without needing the process
+to be startable.
+
+#### Which endpoint
+
+`--endpoint` picks what gets created. Both carry the same MPEG-TS.
+
+| | `fifo` (default) | `socket` |
+| --- | --- | --- |
+| path | `<dir>/<Camera>.ts` | `<dir>/<Camera>.sock` |
+| readers | one at a time — two processes on one FIFO would each get a share of the bytes and neither a whole stream | as many as you like, each starting at its own keyframe |
+| go2rtc | `exec:cat /pipes/Front.ts` | `ffmpeg:unix:///pipes/Front.sock#video=copy#audio=copy` |
+| Frigate | `path: /pipes/Front.ts` | `path: unix:///pipes/Front.sock` |
+| a reader dying | noticed at the next write | noticed at once |
+
+Use `fifo` unless you need more than one reader on the same camera;
+`--endpoint both` creates each.
+
+#### A stalled reader never becomes a backlog
+
+If a reader crashes, hangs, or is simply slower than the camera, queuing
+what it missed is the wrong answer — it would come back and play the gap
+out, permanently that far behind. Past `--max-backlog` seconds of queued
+video, that reader's queue is dropped and it resumes at the next keyframe,
+so a recovered reader sees what the camera is doing *now*.
+
+Each reader is measured separately, so a slow one cannot hold up a fast
+one, and neither can hold up the camera. `--max-backlog 0` turns it off,
+which is what you want when writing a file you intend to keep and not
+what you want in front of anything live.
+
+The same applies to `neolink stream`, which has the flag too.
+
+#### Why not shared memory or a virtual camera
+
+Both come up, and neither is better here.
+
+A **shared-memory ring buffer** (`/dev/shm`, mmap) would be the fastest
+transport and would give the "always the newest data" behaviour for free.
+Nothing can read it: go2rtc has no shared-memory source and ffmpeg has no
+demuxer for one, so it would need a shim process to copy the ring into a
+pipe — and then the pipe is the interface and the shared memory bought
+nothing. It is also solving a cost that is not being paid: a 4 Mbps camera
+is 500 KB/s, which is a memcpy and a syscall per frame.
+
+A **virtual video device** (`v4l2loopback`) needs an out-of-tree kernel
+module and root on the host, carries raw frames — so the H264 or H265 the
+camera already produced has to be decoded and re-encoded — and V4L2 has
+nowhere to put the audio.
+
 ### Audio and Latency
 
 Reolink cameras send audio either as AAC or as DVI4 ADPCM.
