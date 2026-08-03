@@ -261,6 +261,38 @@ released when the last reader goes — the same on-demand behaviour `exec:`
 gets from starting and stopping the process, without needing the process
 to be startable.
 
+#### Running it
+
+It stays in the foreground and does not fork, write a PID file, or detach.
+Supervise it the way you would anything else — systemd on the host, or a
+container of its own:
+
+```ini
+# /etc/systemd/system/neolink-pipe.service
+[Unit]
+Description=Neolink camera pipes
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/neolink pipe --config=/etc/neolink.toml --dir=/run/neolink
+Restart=on-failure
+RuntimeDirectory=neolink
+
+[Install]
+WantedBy=multi-user.target
+```
+
+One process serves **every enabled camera in the config** — `enabled = false`
+cameras are skipped — and `--camera Front --camera Drive` narrows it to the
+ones you name. Endpoints are named after the camera, so a camera called
+`Front` becomes `Front.ts`.
+
+`--endpoint` decides which kind gets made, and it makes only that kind:
+`fifo` (the default) creates `Front.ts` alone, `socket` creates
+`Front.sock` alone, and `both` creates each. Endpoints left over from a
+previous run are reused rather than replaced, so a reader that is already
+attached to one is not disturbed by a restart.
+
 **Read each endpoint once.** A FIFO delivers each byte to exactly one
 reader, so two processes on the same one get a share each and neither a
 whole stream. That is not a limitation to work around so much as the thing
@@ -312,7 +344,7 @@ go2rtc:
 | | `fifo` (default) | `socket` |
 | --- | --- | --- |
 | path | `<dir>/<Camera>.ts` | `<dir>/<Camera>.sock` |
-| readers | one at a time — two processes on one FIFO would each get a share of the bytes and neither a whole stream | as many as you like, each starting at its own keyframe |
+| readers | one at a time — two processes on one FIFO would each get a share of the bytes and neither a whole stream | as many as you like, each with a complete stream of its own |
 | go2rtc | `exec:cat /pipes/Front.ts` | `ffmpeg:unix:///pipes/Front.sock#video=copy#audio=copy` |
 | Frigate | via its embedded go2rtc, then `rtsp://127.0.0.1:8554/front` | `path: unix:///pipes/Front.sock`, or via go2rtc |
 | a reader dying | noticed at the next write | noticed at once |
@@ -321,6 +353,16 @@ Use `fifo` unless you want several consumers each opening the camera
 independently; `--endpoint both` creates each. Note that "more readers"
 is rarely what you need — go2rtc already fans one connection out to
 every viewer, which is the cheaper arrangement for the camera too.
+
+#### Joining a stream already in progress
+
+A reader that connects part-way through a GOP would otherwise see nothing
+until the next keyframe — on a camera with a four second keyframe interval,
+four seconds of black. The GOP in progress is therefore kept and handed to
+a reader the moment it attaches, so it has a picture straight away and
+still starts on a keyframe. The catch-up burst is exempt from the backlog
+limit below, since it is old by construction and would otherwise look like
+a reader that had already fallen behind.
 
 #### A stalled reader never becomes a backlog
 

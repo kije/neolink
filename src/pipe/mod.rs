@@ -277,3 +277,150 @@ async fn serve_socket(path: PathBuf, name: String, fanout: Arc<Fanout>) -> Resul
 async fn serve_socket(_path: PathBuf, _name: String, _fanout: Arc<Fanout>) -> Result<()> {
     Err(anyhow!("Unix sockets are only supported on unix"))
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::stream::fanout::Chunk;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::UnixStream;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "neolink-pipe-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("could not make a scratch directory");
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Connect, and wait for the server to have registered us — otherwise
+    /// a push can race ahead of the accept and make the test flaky.
+    async fn join(path: &PathBuf, fanout: &Fanout, expect: usize) -> UnixStream {
+        let socket = UnixStream::connect(path).await.expect("should connect");
+        for _ in 0..200 {
+            if fanout.consumers() >= expect {
+                return socket;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the server never registered the reader");
+    }
+
+    async fn read_exactly(socket: &mut UnixStream, count: usize) -> Vec<u8> {
+        let mut got = vec![0u8; count];
+        tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut got))
+            .await
+            .expect("reader should not time out")
+            .expect("reader should not error");
+        got
+    }
+
+    #[tokio::test]
+    async fn the_socket_serves_several_readers_from_one_camera() {
+        let scratch = Scratch::new("multi");
+        let path = scratch.path("Front.sock");
+        let fanout = Arc::new(Fanout::new(None));
+
+        let server = tokio::spawn(serve_socket(
+            path.clone(),
+            "Front".to_string(),
+            fanout.clone(),
+        ));
+        for _ in 0..200 {
+            if path.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        // A GOP is already in flight before anybody connects.
+        fanout.push(&Chunk::new(vec![b'K'; 8], true, 0));
+        fanout.push(&Chunk::new(vec![b'a'; 8], false, 40_000));
+
+        // Three readers, joining at different points in that GOP.
+        let mut first = join(&path, &fanout, 1).await;
+        fanout.push(&Chunk::new(vec![b'b'; 8], false, 80_000));
+        let mut second = join(&path, &fanout, 2).await;
+        fanout.push(&Chunk::new(vec![b'c'; 8], false, 120_000));
+        let mut third = join(&path, &fanout, 3).await;
+        fanout.push(&Chunk::new(vec![b'd'; 8], false, 160_000));
+
+        // Each gets the whole GOP from its keyframe, not a slice of the
+        // bytes and not a wait for the next one.
+        let expected: Vec<u8> = b"KKKKKKKKaaaaaaaabbbbbbbbccccccccdddddddd".to_vec();
+        for (who, socket) in [
+            ("first", &mut first),
+            ("second", &mut second),
+            ("third", &mut third),
+        ] {
+            assert_eq!(
+                read_exactly(socket, expected.len()).await,
+                expected,
+                "{who} reader should get a complete stream of its own"
+            );
+        }
+
+        assert_eq!(fanout.consumers(), 3, "all three should still be attached");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_reader_leaving_does_not_disturb_the_others() {
+        let scratch = Scratch::new("leave");
+        let path = scratch.path("Front.sock");
+        let fanout = Arc::new(Fanout::new(None));
+
+        let server = tokio::spawn(serve_socket(
+            path.clone(),
+            "Front".to_string(),
+            fanout.clone(),
+        ));
+        for _ in 0..200 {
+            if path.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        fanout.push(&Chunk::new(vec![b'K'; 8], true, 0));
+        let mut stays = join(&path, &fanout, 1).await;
+        let leaves = join(&path, &fanout, 2).await;
+
+        assert_eq!(read_exactly(&mut stays, 8).await, vec![b'K'; 8]);
+        drop(leaves);
+
+        // The camera must stay connected for the reader still watching.
+        fanout.push(&Chunk::new(vec![b'e'; 8], false, 40_000));
+        assert_eq!(read_exactly(&mut stays, 8).await, vec![b'e'; 8]);
+
+        for _ in 0..200 {
+            if fanout.consumers() == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            fanout.consumers(),
+            1,
+            "the departed reader should be forgotten, the remaining one kept"
+        );
+        server.abort();
+    }
+}

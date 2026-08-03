@@ -55,6 +55,14 @@ struct Queue {
     /// Set while we are waiting for a keyframe: either the consumer has
     /// only just attached, or its backlog was dropped.
     awaiting_resync: bool,
+    /// How many chunks at the front are the catch-up burst handed over
+    /// at attach time.
+    ///
+    /// They are already old by definition — a whole GOP of them — so
+    /// measuring "how far behind" from there would declare a reader
+    /// stalled the moment it connected. The backlog check skips them and
+    /// starts from the first genuinely live chunk instead.
+    seeded: usize,
     /// Set when the producer has finished for good.
     closed: bool,
     /// How many times this consumer's backlog has been thrown away.
@@ -84,6 +92,7 @@ impl Consumer {
             {
                 let mut queue = self.lock();
                 if let Some(chunk) = queue.chunks.pop_front() {
+                    queue.seeded = queue.seeded.saturating_sub(1);
                     return Some(chunk);
                 }
                 if queue.closed {
@@ -105,9 +114,44 @@ impl Consumer {
     }
 }
 
+/// Most a cached GOP may occupy before we give up on caching it.
+///
+/// The cache exists so a reader joining an already-running stream can
+/// start now instead of waiting for the next keyframe, which on a camera
+/// with a four second GOP is four seconds of nothing. That is worth a few
+/// megabytes; it is not worth unbounded memory if a camera turns out to
+/// have an enormous keyframe interval, so past this we stop caching and
+/// the next reader waits as it used to.
+const GOP_CACHE_LIMIT: usize = 16 * 1024 * 1024;
+
+/// The most recent GOP, kept so a new reader can start immediately.
+#[derive(Default)]
+struct Gop {
+    chunks: Vec<Chunk>,
+    bytes: usize,
+    /// Whether what is held is a whole GOP from its keyframe. False after
+    /// the cap is hit, until the next keyframe starts a fresh one — a
+    /// partial GOP is worse than none, since it would hand a decoder
+    /// frames whose references it never saw.
+    whole: bool,
+}
+
+/// State that has to move together.
+///
+/// The consumer list and the cached GOP share one lock rather than
+/// having one each, because attaching has to read the cache and join the
+/// list as a single step. Split them and a chunk pushed in between would
+/// reach the existing readers and the cache but not the new reader,
+/// leaving it a gap exactly where it started.
+#[derive(Default)]
+struct State {
+    consumers: Vec<Weak<Inner>>,
+    gop: Gop,
+}
+
 /// The producer's end: one camera's muxed output, shared out to readers.
 pub(crate) struct Fanout {
-    consumers: Mutex<Vec<Weak<Inner>>>,
+    state: Mutex<State>,
     /// How much stream time a consumer may have queued before its
     /// backlog is discarded. `None` never discards, which is what a
     /// recording to a file wants and a live reader does not.
@@ -119,7 +163,7 @@ pub(crate) struct Fanout {
 impl Fanout {
     pub(crate) fn new(limit: Option<Duration>) -> Self {
         Self {
-            consumers: Mutex::new(Vec::new()),
+            state: Mutex::new(State::default()),
             limit_us: limit.map(|d| d.as_micros().min(u64::MAX as u128) as u64),
             attached: Notify::new(),
         }
@@ -127,20 +171,33 @@ impl Fanout {
 
     /// Attach a reader.
     ///
-    /// It starts out waiting for a keyframe, so attaching mid-stream is
-    /// safe: the first bytes it sees will be a PAT/PMT and an I-frame,
-    /// never the middle of a GOP.
+    /// Whatever it sees first is a PAT/PMT and an I-frame, never the
+    /// middle of a GOP. Where possible that is the GOP already in
+    /// progress, handed over at once so the reader has a picture
+    /// immediately; otherwise it waits for the next keyframe.
     pub(crate) fn attach(&self) -> Consumer {
+        let mut state = self.lock();
+
+        let seed: VecDeque<Chunk> = if state.gop.whole {
+            state.gop.chunks.iter().cloned().collect()
+        } else {
+            VecDeque::new()
+        };
+        let awaiting_resync = seed.is_empty();
+
         let inner = Arc::new(Inner {
             queue: Mutex::new(Queue {
-                chunks: VecDeque::new(),
-                awaiting_resync: true,
+                seeded: seed.len(),
+                chunks: seed,
+                awaiting_resync,
                 closed: false,
                 overruns: 0,
             }),
             wake: Notify::new(),
         });
-        self.lock().push(Arc::downgrade(&inner));
+        state.consumers.push(Arc::downgrade(&inner));
+        drop(state);
+
         self.attached.notify_waiters();
         Consumer { inner }
     }
@@ -148,10 +205,30 @@ impl Fanout {
     /// Hand a chunk to every attached reader, dropping backlogs that have
     /// grown past the limit. Never blocks and never awaits.
     pub(crate) fn push(&self, chunk: &Chunk) {
-        let mut consumers = self.lock();
+        let mut state = self.lock();
+
+        // Keep the GOP in progress, so the next reader to turn up does
+        // not have to wait for the keyframe after this one.
+        let gop = &mut state.gop;
+        if chunk.resync_point {
+            gop.chunks.clear();
+            gop.bytes = 0;
+            gop.whole = true;
+        }
+        if gop.whole {
+            gop.bytes += chunk.bytes.len();
+            if gop.bytes > GOP_CACHE_LIMIT {
+                gop.chunks.clear();
+                gop.bytes = 0;
+                gop.whole = false;
+            } else {
+                gop.chunks.push(chunk.clone());
+            }
+        }
+
         // Detached readers are pruned here rather than on drop, which is
         // what lets `Consumer` have no teardown of its own.
-        consumers.retain(|weak| {
+        state.consumers.retain(|weak| {
             let Some(inner) = weak.upgrade() else {
                 return false;
             };
@@ -165,9 +242,12 @@ impl Fanout {
             }
 
             if let Some(limit) = self.limit_us {
+                // Skip the catch-up burst: it is old on purpose, and
+                // counting it would declare a reader stalled the instant
+                // it connected.
                 let behind = queue
                     .chunks
-                    .front()
+                    .get(queue.seeded)
                     .map(|front| chunk.pts_us.saturating_sub(front.pts_us))
                     .unwrap_or(0);
                 if behind > limit {
@@ -176,6 +256,7 @@ impl Fanout {
                     // again at the next keyframe rather than making it
                     // replay the stall.
                     queue.chunks.clear();
+                    queue.seeded = 0;
                     queue.overruns += 1;
                     if !chunk.resync_point {
                         queue.awaiting_resync = true;
@@ -193,9 +274,9 @@ impl Fanout {
 
     /// How many readers are attached, pruning any that have gone.
     pub(crate) fn consumers(&self) -> usize {
-        let mut consumers = self.lock();
-        consumers.retain(|weak| weak.strong_count() > 0);
-        consumers.len()
+        let mut state = self.lock();
+        state.consumers.retain(|weak| weak.strong_count() > 0);
+        state.consumers.len()
     }
 
     /// Wait until at least one reader is attached.
@@ -215,7 +296,8 @@ impl Fanout {
     /// Tell every reader that no more chunks are coming, so their `next`
     /// returns `None` once they have drained what they have.
     pub(crate) fn close(&self) {
-        for weak in self.lock().drain(..) {
+        let drained: Vec<Weak<Inner>> = self.lock().consumers.drain(..).collect();
+        for weak in drained {
             if let Some(inner) = weak.upgrade() {
                 inner.queue.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
                 inner.wake.notify_one();
@@ -223,8 +305,8 @@ impl Fanout {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Weak<Inner>>> {
-        self.consumers.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -384,5 +466,105 @@ mod tests {
             "queued data survives close"
         );
         assert!(consumer.next().await.is_none(), "then the stream ends");
+    }
+
+    #[tokio::test]
+    async fn a_reader_joining_mid_stream_starts_at_once() {
+        // Without the cached GOP this reader would see nothing until the
+        // next keyframe — on a four second GOP, four seconds of black.
+        let fanout = Fanout::new(Some(Duration::from_millis(500)));
+
+        fanout.push(&chunk(0, true));
+        fanout.push(&chunk(40, false));
+        fanout.push(&chunk(80, false));
+
+        let latecomer = fanout.attach();
+        assert_eq!(
+            drain(&latecomer).await,
+            vec![0, 40, 80],
+            "a new reader should get the GOP in progress, from its keyframe"
+        );
+
+        // And then carries on live.
+        fanout.push(&chunk(120, false));
+        assert_eq!(drain(&latecomer).await, vec![120]);
+    }
+
+    #[tokio::test]
+    async fn the_catch_up_burst_is_not_mistaken_for_falling_behind() {
+        // The seeded GOP is older than the backlog limit by construction.
+        // Counting it would drop the reader's queue the instant it
+        // connected, which is the bug this guards.
+        let fanout = Fanout::new(Some(Duration::from_millis(100)));
+
+        fanout.push(&chunk(0, true));
+        for i in 1..=8u64 {
+            fanout.push(&chunk(i * 40, false));
+        }
+
+        let latecomer = fanout.attach();
+        fanout.push(&chunk(360, false));
+
+        assert_eq!(latecomer.overruns(), 0, "connecting is not falling behind");
+        assert_eq!(drain(&latecomer).await.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn a_reader_that_stalls_after_catching_up_is_still_caught() {
+        // The exemption must not be permanent.
+        let fanout = Fanout::new(Some(Duration::from_millis(100)));
+        fanout.push(&chunk(0, true));
+        fanout.push(&chunk(40, false));
+
+        let latecomer = fanout.attach();
+        // Drain the burst, then go quiet while the stream runs on.
+        assert_eq!(drain(&latecomer).await, vec![0, 40]);
+
+        fanout.push(&chunk(80, false));
+        fanout.push(&chunk(400, false));
+        assert_eq!(latecomer.overruns(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_gop_is_not_cached() {
+        // A camera with an enormous keyframe interval must not be able to
+        // grow the cache without bound; the reader waits instead.
+        let fanout = Fanout::new(None);
+
+        fanout.push(&Chunk::new(vec![0u8; 8], true, 0));
+        let big = GOP_CACHE_LIMIT + 1;
+        fanout.push(&Chunk::new(vec![0u8; big], false, 40_000));
+
+        let latecomer = fanout.attach();
+        fanout.push(&chunk(80, false));
+        assert!(
+            drain(&latecomer).await.is_empty(),
+            "with no usable GOP the reader should wait for a keyframe"
+        );
+
+        fanout.push(&chunk(120, true));
+        assert_eq!(drain(&latecomer).await, vec![120]);
+    }
+
+    #[tokio::test]
+    async fn several_readers_joining_at_different_times_all_get_whole_gops() {
+        let fanout = Fanout::new(Some(Duration::from_secs(5)));
+
+        let first = fanout.attach();
+        fanout.push(&chunk(0, true));
+        fanout.push(&chunk(40, false));
+
+        let second = fanout.attach();
+        fanout.push(&chunk(80, false));
+
+        let third = fanout.attach();
+        fanout.push(&chunk(120, false));
+
+        // Everyone starts on the keyframe and nobody misses a frame after
+        // the point they joined.
+        assert_eq!(drain(&first).await, vec![0, 40, 80, 120]);
+        assert_eq!(drain(&second).await, vec![0, 40, 80, 120]);
+        assert_eq!(drain(&third).await, vec![0, 40, 80, 120]);
+        assert_eq!(fanout.consumers(), 3);
     }
 }
