@@ -18,11 +18,20 @@ use tokio::{
         oneshot::{channel as oneshot, Sender as OneshotSender},
         watch::Receiver as WatchReceiver,
     },
-    time::{sleep, Duration},
+    time::{sleep, Duration, Instant},
 };
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Reconnect backoff for the broker connection. A broker that is down or
+/// refusing connections gets retried ever more slowly instead of being hammered
+/// every two seconds for as long as it stays down.
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// A connection that lasted this long counts as healthy: the next failure
+/// starts over from `RECONNECT_BACKOFF_MIN`.
+const RECONNECT_BACKOFF_RESET: Duration = Duration::from_secs(60);
 
 pub(crate) struct Mqtt {
     cancel: CancellationToken,
@@ -43,8 +52,10 @@ impl Mqtt {
         let mut thread_config = config;
         let thread_incoming_tx = incoming_tx;
         let thread_outgoing_tx = outgoing_tx.clone();
+        let retry_cancel = thread_cancel.clone();
         set.spawn(async move {
             let mut mqtt_config = thread_config.borrow().mqtt.clone();
+            let mut backoff = RECONNECT_BACKOFF_MIN;
             let r = loop {
                 break tokio::select! {
                     _ = thread_cancel.cancelled() => AnyResult::Ok(()),
@@ -54,6 +65,7 @@ impl Mqtt {
                         continue;
                     }
                     v = async {
+                        let started = Instant::now();
                         let mut backend = MqttBackend {
                             incomming_tx: thread_incoming_tx.clone(),
                             outgoing_rx: &mut outgoing_rx,
@@ -61,11 +73,19 @@ impl Mqtt {
                             config: mqtt_config.as_ref().unwrap(),
                             cancel: CancellationToken::new(),
                         };
-                        backend.run().await
+                        (backend.run().await, started.elapsed())
                     }, if mqtt_config.is_some() => {
+                        let (v, uptime) = v;
                         if let Err(e) = &v {
-                            log::error!("MQTT Client Connection Failed: {:?}", e);
-                            sleep(Duration::from_secs(2)).await;
+                            if uptime >= RECONNECT_BACKOFF_RESET {
+                                backoff = RECONNECT_BACKOFF_MIN;
+                            }
+                            log::error!("MQTT Client Connection Failed: {:?}; retrying in {:?}", e, backoff);
+                            tokio::select! {
+                                _ = retry_cancel.cancelled() => {},
+                                _ = sleep(backoff) => {},
+                            }
+                            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
                             continue;
                         }
                         v
@@ -195,86 +215,70 @@ impl<'a> MqttBackend<'a> {
                 v = self.outgoing_rx.recv() => {
                     let msg = v.ok_or(anyhow!("All outgoing MQTT channels closed"))?;
 
-                    // Put it on a thread so that we don't block polling
-                    let outgoing_tx = self.outgoing_tx.clone();
-                    let incomming_tx = self.incomming_tx.clone();
-                    let send_client = send_client.clone();
-                    let cancel = self.cancel.clone();
-                    let thread_cancel = loop_cancel.clone();
-                    let server_config = self.config.clone();
-                    tokio::task::spawn(async move {
-                        tokio::select!{
-                            _ = cancel.cancelled() => AnyResult::Ok(()),
-                            _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-                            v = async {
-                                match msg {
-                                    MqttRequest::Send(msg, tx) =>  {
-                                        let v = send_client.publish(
-                                            msg.topic.clone(),
-                                            QoS::AtLeastOnce,
-                                            false,
-                                            (*msg.message).clone(),
-                                        ).await;
-                                        match &v {
-                                            Ok(()) => {
-                                                let _ = tx.send(Ok(()));
-                                            },
-                                            Err(rumqttc::ClientError::Request(_)) | Err(rumqttc::ClientError::TryRequest(_)) => {
-                                                // Requeue it
-                                                outgoing_tx.send(MqttRequest::Send(msg, tx)).await?;
-                                            }
-                                        };
-                                        v?;
-                                    }
-                                    MqttRequest::SendRetained(msg, tx) =>  {
-                                        let v = send_client.publish(
-                                            msg.topic.clone(),
-                                            QoS::AtLeastOnce,
-                                            true,
-                                            (*msg.message).clone(),
-                                        ).await;
-                                        match &v {
-                                            Ok(()) => {
-                                                let _ = tx.send(Ok(()));
-                                            },
-                                            Err(rumqttc::ClientError::Request(_)) | Err(rumqttc::ClientError::TryRequest(_)) => {
-                                                // Requeue it
-                                                outgoing_tx.send(MqttRequest::Send(msg, tx)).await?;
-                                            }
-                                        };
-                                        v?;
-                                    }
-                                    MqttRequest::HangUp(reply) => {
-                                        send_client.publish(
-                                            "neolink/status".to_string(),
-                                            QoS::AtLeastOnce,
-                                            true,
-                                            "disconnected".to_string(),
-                                        ).await?;
-                                        let _ = reply.send(());
-                                        return Err(anyhow!("Disconneting"));
-                                    }
-                                    MqttRequest::Subscribe(name, reply) => {
-                                        let instance = MqttInstance {
-                                            name,
-                                            incomming_rx: BroadcastStream::new(incomming_tx.subscribe()),
-                                            outgoing_tx: outgoing_tx.clone(),
-                                        };
-                                        let _ = reply.send(Ok(instance));
-                                    },
-                                    MqttRequest::LastWill{topic, message, reply} => {
-                                        let last_will = LastWillMqtt::new(
-                                            &server_config,
-                                            topic,
-                                            message,
-                                        ).await;
-                                        let _ = reply.send(last_will);
-                                    }
-                                }
-                                AnyResult::Ok(())
-                            } => v,
+                    match msg {
+                        // Answered from local state, with no broker round trip
+                        // at all, so answer it right here. Handing it to a task
+                        // that races the backend teardown means a broker that
+                        // is refusing connections can drop the reply channel
+                        // instead, which the caller sees as a hard error and
+                        // which used to take the whole daemon down with it.
+                        MqttRequest::Subscribe(name, reply) => {
+                            let instance = MqttInstance {
+                                name,
+                                incomming_rx: BroadcastStream::new(self.incomming_tx.subscribe()),
+                                outgoing_tx: self.outgoing_tx.clone(),
+                            };
+                            let _ = reply.send(Ok(instance));
                         }
-                    });
+                        // `LastWillMqtt::new` registers the will on a connection
+                        // of its own and returns without waiting for the broker,
+                        // so this does not block polling for any meaningful time.
+                        MqttRequest::LastWill{topic, message, reply} => {
+                            let last_will = LastWillMqtt::new(
+                                self.config,
+                                topic,
+                                message,
+                            ).await;
+                            let _ = reply.send(last_will);
+                        }
+                        MqttRequest::HangUp(reply) => {
+                            // Best effort: if the broker is already gone there
+                            // is nothing to say goodbye to, but the caller is
+                            // waiting on this reply before it cancels us.
+                            let _ = send_client.publish(
+                                "neolink/status".to_string(),
+                                QoS::AtLeastOnce,
+                                true,
+                                "disconnected".to_string(),
+                            ).await;
+                            let _ = reply.send(());
+                        }
+                        msg => {
+                            // Publishing can block on the client's request queue,
+                            // so put it on a task and keep polling the connection.
+                            let outgoing_tx = self.outgoing_tx.clone();
+                            let send_client = send_client.clone();
+                            let cancel = self.cancel.clone();
+                            let thread_cancel = loop_cancel.clone();
+                            tokio::task::spawn(async move {
+                                let mut pending = Some(msg);
+                                tokio::select!{
+                                    _ = cancel.cancelled() => {},
+                                    _ = thread_cancel.cancelled() => {},
+                                    _ = publish_request(&send_client, &mut pending) => {},
+                                }
+                                // Whatever the client did not take stays a whole
+                                // request, reply channel included, and goes back
+                                // on the queue for the next connection. Dropping
+                                // it here would fail the sender for no better
+                                // reason than that we happened to be tearing the
+                                // backend down.
+                                if let Some(msg) = pending {
+                                    let _ = outgoing_tx.send(msg).await;
+                                }
+                            });
+                        }
+                    }
 
                     AnyResult::Ok(())
                 },
@@ -336,6 +340,41 @@ impl<'a> MqttBackend<'a> {
             break r;
         }?;
         Ok(())
+    }
+}
+
+/// Hand a `Send`/`SendRetained` request to the MQTT client.
+///
+/// `pending` is only emptied once the client has accepted the message, and the
+/// sender is only acknowledged at that point. If the client refuses it — which
+/// is what happens once the connection behind it has gone away — the request is
+/// left in `pending`, intact and still holding its reply channel, for the
+/// caller to put back on the queue.
+async fn publish_request(client: &AsyncClient, pending: &mut Option<MqttRequest>) {
+    let (msg, retain) = match pending.as_ref() {
+        Some(MqttRequest::Send(msg, _)) => (msg, false),
+        Some(MqttRequest::SendRetained(msg, _)) => (msg, true),
+        _ => return,
+    };
+
+    match client
+        .publish(
+            msg.topic.clone(),
+            QoS::AtLeastOnce,
+            retain,
+            (*msg.message).clone(),
+        )
+        .await
+    {
+        Ok(()) => match pending.take() {
+            Some(MqttRequest::Send(_, tx)) | Some(MqttRequest::SendRetained(_, tx)) => {
+                let _ = tx.send(Ok(()));
+            }
+            _ => unreachable!("publish_request only takes a Send/SendRetained it just published"),
+        },
+        Err(e) => {
+            log::debug!("MQTT publish deferred to the next connection: {e:?}");
+        }
     }
 }
 
@@ -594,5 +633,66 @@ impl LastWillMqtt {
 impl Drop for LastWillMqtt {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(
+        topic: &str,
+    ) -> (
+        MqttReply,
+        tokio::sync::oneshot::Receiver<Result<()>>,
+        OneshotSender<Result<()>>,
+    ) {
+        let (tx, rx) = oneshot();
+        (
+            MqttReply {
+                topic: topic.to_string(),
+                message: Arc::new("payload".to_string()),
+            },
+            rx,
+            tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn publish_request_acknowledges_the_sender() {
+        let (client, _eventloop) =
+            AsyncClient::new(MqttOptions::new("test", "localhost", 1883), 10);
+        let (msg, rx, tx) = request("neolink/status");
+        let mut pending = Some(MqttRequest::Send(msg, tx));
+
+        publish_request(&client, &mut pending).await;
+
+        assert!(pending.is_none(), "an accepted request is not requeued");
+        assert!(rx.await.expect("reply channel kept alive").is_ok());
+    }
+
+    /// The reason the daemon used to die whenever the broker was refusing
+    /// connections: a request in flight when the backend went away took its
+    /// reply channel with it, and the caller read that as a hard failure.
+    #[tokio::test]
+    async fn publish_request_keeps_the_request_when_the_connection_is_gone() {
+        let (client, eventloop) = AsyncClient::new(MqttOptions::new("test", "localhost", 1883), 10);
+        drop(eventloop);
+        let (msg, mut rx, tx) = request("neolink/status");
+        let mut pending = Some(MqttRequest::SendRetained(msg, tx));
+
+        publish_request(&client, &mut pending).await;
+
+        assert!(
+            matches!(pending, Some(MqttRequest::SendRetained(..))),
+            "a refused request stays intact so it can be requeued"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the sender is left waiting rather than failed"
+        );
     }
 }
