@@ -37,14 +37,17 @@ use std::fs;
 use validator::Validate;
 
 mod ai;
+mod audio;
 mod battery;
 mod cmdline;
 mod common;
 mod config;
 #[cfg(feature = "gstreamer")]
 mod image;
+mod mpegts;
 mod mqtt;
 mod onvif;
+mod pipe;
 mod pir;
 mod ptz;
 mod reboot;
@@ -52,6 +55,7 @@ mod reboot;
 mod rtsp;
 mod services;
 mod statusled;
+mod stream;
 #[cfg(feature = "gstreamer")]
 mod talk;
 mod users;
@@ -155,6 +159,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::Ai(opts)) => {
             ai::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Stream(opts)) => {
+            stream::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Pipe(opts)) => {
+            pipe::main(opts, neo_reactor.clone()).await?;
         }
     }
 

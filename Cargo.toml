@@ -41,7 +41,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha1 = "0.11.0"
 socket2 = "0.6.5"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "tracing"] }
 tokio-stream = "0.1.19"
 tokio-util = { version = "0.7.19", features = ["full", "tracing"] }
 toml = "1.1.4"
@@ -52,6 +52,9 @@ validator = {version="0.21.0", features = ["derive"] }
 # `ServiceExt::oneshot`, so the ONVIF router can be exercised without binding a
 # port. Already in the tree as an axum dependency -- this only turns on `util`.
 tower = { version = "0.5.3", features = ["util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.180"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.5.4"

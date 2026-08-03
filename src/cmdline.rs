@@ -35,4 +35,20 @@ pub enum Command {
     Users(super::users::Opt),
     Onvif(super::onvif::Opt),
     Ai(super::ai::Opt),
+    Stream(super::stream::Opt),
+    Pipe(super::pipe::Opt),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        // Clashing short options, duplicate names and the like are only
+        // caught when clap builds the command, which happens at the first
+        // parse — that is, in front of a user rather than in CI.
+        Opt::command().debug_assert();
+    }
 }
