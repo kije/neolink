@@ -48,7 +48,7 @@ const TIE_BREAKER_US: u64 = 1;
 const RESTART_DETECT_COUNT: u32 = 2;
 
 /// Per-stream timestamp state. One tracker per client/stream pipeline.
-pub(super) struct TimestampTracker {
+pub(crate) struct TimestampTracker {
     last_camera_us_32: Option<u32>,
     last_video_us: u64,
     last_audio_us: u64,
@@ -57,7 +57,7 @@ pub(super) struct TimestampTracker {
 }
 
 impl TimestampTracker {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             last_camera_us_32: None,
             last_video_us: 0,
@@ -78,7 +78,7 @@ impl TimestampTracker {
     ///   backward frames, or a single forward jump above
     ///   `MAX_FORWARD_JUMP_US`, accept the new μs as a fresh baseline
     ///   and clamp the PTS advance to `RESTART_ADVANCE_US`.
-    pub(super) fn next_video_us(&mut self, camera_us_32: u32) -> u64 {
+    pub(crate) fn next_video_us(&mut self, camera_us_32: u32) -> u64 {
         let Some(last_32) = self.last_camera_us_32 else {
             self.last_camera_us_32 = Some(camera_us_32);
             return 0;
@@ -146,7 +146,7 @@ impl TimestampTracker {
     /// `duration_us` is clamped to at least 1 μs so a malformed audio
     /// frame reporting zero duration cannot produce equal back-to-back
     /// PTS values.
-    pub(super) fn next_audio_us(&mut self, duration_us: u32) -> u64 {
+    pub(crate) fn next_audio_us(&mut self, duration_us: u32) -> u64 {
         if !self.audio_anchored {
             self.last_audio_us = self.last_video_us;
             self.audio_anchored = true;

@@ -19,8 +19,7 @@ use super::{MdState, NeoCamCommand, NeoCamThreadState, Permit};
 use crate::{config::CameraConfig, AnyResult, Result};
 use neolink_core::bc_protocol::{AiState, BcCamera};
 
-#[cfg(feature = "gstreamer")]
-mod gst;
+mod stream;
 
 #[cfg(feature = "pushnoti")]
 mod pushnoti;
