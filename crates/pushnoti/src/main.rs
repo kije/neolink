@@ -34,25 +34,16 @@ async fn main() -> Result<()> {
 
     let camera = find_and_connect(&config, &opt.camera).await?;
 
-    // 696841269229 is the reo_iphone FCM Sender_ID
-    // let registration = fcm_push_listener::register("696841269229").await?;
-    // 743639030586 is the reo_fcm FCM Sender_ID
-    // 263684512460 is my test Sender_ID
-    // let registration = fcm_push_listener::register("743639030586").await?
-    // I have confirmed that I can recieve test messages with this SenderID
-    // into this program
-    // let registration = fcm_push_listener::register("263684512460").await?;
-
-    // let firebase_app_id = "1:743639030586:android:86f60a4fb7143876";
-    // let firebase_project_id = "reolink-login";
-    // let firebase_api_key = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
-    // let vapid_key = "";
-
-    let sender_id = "743639030586"; // andriod
-
-    // let sender_id = "696841269229"; // ios
-
-    // let sender_id = "263684512460"; // test
+    // Reolink's Firebase project, as used by the Android app. These replace the
+    // bare Sender_ID that fcm-push-listener 2.x took -- Google shut down the
+    // endpoint that version registered against on 2024-06-20.
+    //
+    // The iOS project is `696841269229`, if that is ever needed.
+    let firebase_app_id = "1:743639030586:android:86f60a4fb7143876";
+    let firebase_project_id = "reolink-login";
+    let firebase_api_key = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
+    // Not confirmed -- see the note on `VAPID_KEY` in src/common/pushnoti.rs.
+    let vapid_key = "";
 
     let token_path = PathBuf::from("./token.toml");
     let registration = if let Ok(Ok(registration)) =
@@ -62,14 +53,13 @@ async fn main() -> Result<()> {
         registration
     } else {
         info!("Registering new token");
-        let registration = fcm_push_listener::register(sender_id).await?;
-        // let registration = fcm_push_listener::register(
-        //     firebase_app_id,
-        //     firebase_project_id,
-        //     firebase_api_key,
-        //     vapid_key,
-        // )
-        // .await?;
+        let registration = fcm_push_listener::register(
+            firebase_app_id,
+            firebase_project_id,
+            firebase_api_key,
+            vapid_key,
+        )
+        .await?;
         let new_token = toml::to_string(&registration)?;
         fs::write(token_path, new_token)?;
         registration

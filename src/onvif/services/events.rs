@@ -487,10 +487,12 @@ pub(crate) fn local_action_only(action: &str) -> &str {
 /// header).
 #[allow(dead_code)]
 pub(crate) fn read_wsa_action(envelope: &str) -> Option<String> {
+    // See `soap::push_entity_ref`: the value is accumulated across events
+    // because an entity reference no longer arrives inside `Event::Text`.
     let mut reader = Reader::from_str(envelope);
-    reader.config_mut().trim_text(true);
     let mut in_action = false;
     let mut in_header = false;
+    let mut text = String::new();
     loop {
         match reader.read_event() {
             Err(_) | Ok(Event::Eof) => return None,
@@ -502,20 +504,28 @@ pub(crate) fn read_wsa_action(envelope: &str) -> Option<String> {
                 }
                 if in_header && local == "Action" {
                     in_action = true;
+                    text.clear();
                 }
             }
             Ok(Event::End(e)) => {
                 let name = std::str::from_utf8(e.name().into_inner()).unwrap_or("");
                 let local = name.rsplit(':').next().unwrap_or(name);
                 if local == "Action" {
+                    if in_action {
+                        let found = std::mem::take(&mut text).trim().to_string();
+                        if !found.is_empty() {
+                            return Some(found);
+                        }
+                    }
                     in_action = false;
                 }
                 if local == "Header" {
                     in_header = false;
                 }
             }
-            Ok(Event::Text(t)) if in_action => {
-                return Some(t.unescape().unwrap_or_default().to_string());
+            Ok(Event::Text(t)) if in_action => text.push_str(&t.decode().unwrap_or_default()),
+            Ok(Event::GeneralRef(r)) if in_action => {
+                crate::onvif::soap::push_entity_ref(&mut text, &r)
             }
             _ => {}
         }

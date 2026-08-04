@@ -13,9 +13,8 @@ use futures::{
     sink::SinkExt,
     stream::{FuturesUnordered, Stream, StreamExt},
 };
-use lazy_static::lazy_static;
 use log::*;
-use rand::{seq::SliceRandom, thread_rng, Rng};
+use rand::{seq::SliceRandom, RngExt};
 use std::collections::{btree_map::Entry, BTreeMap, HashSet};
 use std::convert::TryInto;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -59,36 +58,35 @@ struct UidLookupResults {
 }
 
 const MTU: u32 = 1350;
-lazy_static! {
-    static ref P2P_RELAY_HOSTNAMES: [&'static str; 12] = [
-        "p2p.reolink.com",
-        "p2p1.reolink.com",
-        "p2p2.reolink.com",
-        "p2p3.reolink.com",
-        "p2p4.reolink.com",
-        "p2p5.reolink.com",
-        "p2p6.reolink.com",
-        "p2p7.reolink.com",
-        "p2p8.reolink.com",
-        "p2p9.reolink.com",
-        "p2p10.reolink.com",
-        "p2p11.reolink.com",
-        // These following are all currently set to 127.0.0.1
-        // probably reserved for future use
-        // "p2p12.reolink.com",
-        // "p2p13.reolink.com",
-        // "p2p14.reolink.com",
-        // "p2p15.reolink.com",
-        // "p2p16.reolink.com",
-    ];
-    /// Maximum wait for a reply
-    static ref MAXIMUM_WAIT: Duration = Duration::from_secs(15);
-    /// Wait for tcp connections
-    static ref TCP_WAIT: Duration = Duration::from_secs(4);
-    /// How long to wait before resending
-    static ref RESEND_WAIT: Duration = Duration::from_millis(500);
-
-}
+/// The Reolink P2P relay servers, tried in order when a camera is not
+/// reachable on the local network.
+const P2P_RELAY_HOSTNAMES: [&str; 12] = [
+    "p2p.reolink.com",
+    "p2p1.reolink.com",
+    "p2p2.reolink.com",
+    "p2p3.reolink.com",
+    "p2p4.reolink.com",
+    "p2p5.reolink.com",
+    "p2p6.reolink.com",
+    "p2p7.reolink.com",
+    "p2p8.reolink.com",
+    "p2p9.reolink.com",
+    "p2p10.reolink.com",
+    "p2p11.reolink.com",
+    // These following are all currently set to 127.0.0.1
+    // probably reserved for future use
+    // "p2p12.reolink.com",
+    // "p2p13.reolink.com",
+    // "p2p14.reolink.com",
+    // "p2p15.reolink.com",
+    // "p2p16.reolink.com",
+];
+/// Maximum wait for a reply
+const MAXIMUM_WAIT: Duration = Duration::from_secs(15);
+/// Wait for tcp connections
+const TCP_WAIT: Duration = Duration::from_secs(4);
+/// How long to wait before resending
+const RESEND_WAIT: Duration = Duration::from_millis(500);
 
 type Subscriber = Arc<RwLock<BTreeMap<u32, Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
 type Handlers = Arc<RwLock<Vec<Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
@@ -256,7 +254,7 @@ impl Discoverer {
                     }
                 }
             } => v,
-            _ = tokio::time::sleep(*MAXIMUM_WAIT) => Err::<T, Error>(Error::DiscoveryTimeout),
+            _ = tokio::time::sleep(MAXIMUM_WAIT) => Err::<T, Error>(Error::DiscoveryTimeout),
         }
     }
 
@@ -287,7 +285,7 @@ impl Discoverer {
         let mut reply = ReceiverStream::new(self.subscribe(target_tid).await?);
         let msg = BcUdp::Discovery(disc);
 
-        let mut inter = interval(*RESEND_WAIT);
+        let mut inter = interval(RESEND_WAIT);
         inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         let result = tokio::select! {
@@ -313,7 +311,7 @@ impl Discoverer {
             } => {Err::<T, Error>(v)},
             _ = {
                 // Sleep then emit Timeout
-                tokio::time::sleep(*MAXIMUM_WAIT)
+                tokio::time::sleep(MAXIMUM_WAIT)
             } => {
                 Err::<T, Error>(Error::DiscoveryTimeout)
             }
@@ -328,7 +326,7 @@ impl Discoverer {
             let target_tid = generate_tid();
             disc.tid = target_tid;
         }
-        let mut inter = interval(*RESEND_WAIT);
+        let mut inter = interval(RESEND_WAIT);
         inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let msg = BcUdp::Discovery(disc);
 
@@ -419,7 +417,7 @@ impl Discoverer {
             }
             addrs
         });
-        let mut addrs = timeout(*MAXIMUM_WAIT, task).await??;
+        let mut addrs = timeout(MAXIMUM_WAIT, task).await??;
         trace!("Uid lookup to: {:?}", addrs);
 
         Ok(addrs
@@ -1080,7 +1078,7 @@ impl Discovery {
         let username = "admin";
         let password = Some("123456");
         let mut tcp_source =
-            timeout(*TCP_WAIT, TcpSource::new(addr, username, password, false)).await??;
+            timeout(TCP_WAIT, TcpSource::new(addr, username, password, false)).await??;
 
         let md5_username = md5_string(username, Md5Trunc::ZeroLast);
         let md5_password = password
@@ -1104,7 +1102,7 @@ impl Discovery {
             })
             .await?;
 
-        let _bc: Bc = timeout(*TCP_WAIT, tcp_source.next())
+        let _bc: Bc = timeout(TCP_WAIT, tcp_source.next())
             .await?
             .ok_or(Error::CannotInitCamera)??; // Successful recv should mean a Bc packet if not then deser will fail
         Ok(())
@@ -1231,17 +1229,17 @@ impl Discovery {
 }
 
 fn get_local_ip() -> Result<std::net::IpAddr> {
-    get_if_addrs::get_if_addrs()?
+    if_addrs::get_if_addrs()?
         .iter()
-        .find(|i| !i.is_loopback() && matches!(i.addr, get_if_addrs::IfAddr::V4(_)))
+        .find(|i| !i.is_loopback() && matches!(i.addr, if_addrs::IfAddr::V4(_)))
         .map(|iface| Ok(iface.ip()))
         .unwrap_or_else(|| Err(Error::Other("No Local Ip Address Found")))
 }
 
 fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
     let mut broadcasts = vec![Ipv4Addr::BROADCAST];
-    for iface in get_if_addrs::get_if_addrs()?.iter() {
-        if let get_if_addrs::IfAddr::V4(ifacev4) = &iface.addr {
+    for iface in if_addrs::get_if_addrs()?.iter() {
+        if let if_addrs::IfAddr::V4(ifacev4) = &iface.addr {
             if let Some(broadcast) = ifacev4.broadcast.as_ref() {
                 broadcasts.push(*broadcast);
             }
@@ -1264,19 +1262,19 @@ fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
 }
 
 fn generate_tid() -> u32 {
-    let mut rng = thread_rng();
-    (rng.gen::<u8>()) as u32
+    let mut rng = rand::rng();
+    (rng.random::<u8>()) as u32
 }
 
 fn generate_cid() -> i32 {
-    let mut rng = thread_rng();
-    rng.gen()
+    let mut rng = rand::rng();
+    rng.random()
 }
 
 async fn connect() -> Result<UdpSocket> {
     let mut ports: Vec<u16> = (53500..54000).collect();
     {
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         ports.shuffle(&mut rng);
     }
 
@@ -1561,3 +1559,118 @@ async fn connect() -> Result<UdpSocket> {
     ```
 
 */
+
+#[cfg(test)]
+mod rand_tests {
+    use super::*;
+
+    /// `generate_tid` must stay inside `0..=255`.
+    ///
+    /// The value goes on the wire as the UDP discovery transmission id, and
+    /// under rand 0.8 it was `rng.gen::<u8>() as u32`. The rand 0.10 spelling is
+    /// `rng.random::<u8>() as u32`, which resolves to the same
+    /// `next_u32() as u8` -- but nothing about that is enforced by the type
+    /// system once the `as u32` widens it, so pin the range.
+    #[test]
+    fn generate_tid_stays_in_u8_range() {
+        for _ in 0..10_000 {
+            assert!(generate_tid() <= u8::MAX as u32);
+        }
+    }
+
+    /// `generate_cid` is a full-width `i32` and must stay that way -- narrowing
+    /// it would raise the collision rate on the client id.
+    #[test]
+    fn generate_cid_spans_full_i32() {
+        let mut seen_negative = false;
+        let mut seen_large = false;
+        for _ in 0..10_000 {
+            let cid = generate_cid();
+            seen_negative |= cid < 0;
+            seen_large |= cid > u16::MAX as i32;
+        }
+        assert!(
+            seen_negative,
+            "generate_cid never produced a negative value"
+        );
+        assert!(seen_large, "generate_cid looks narrower than an i32");
+    }
+
+    /// `shuffle` must still be a permutation of the port range, not a sample of
+    /// it -- `connect` relies on every candidate port being present.
+    #[test]
+    fn shuffle_is_a_permutation() {
+        let original: Vec<u16> = (53500..54000).collect();
+        let mut ports = original.clone();
+        {
+            let mut rng = rand::rng();
+            ports.shuffle(&mut rng);
+        }
+        assert_eq!(ports.len(), original.len());
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, original, "shuffle lost or duplicated ports");
+        assert_ne!(ports, original, "shuffle did not shuffle");
+    }
+}
+
+/// Interface enumeration.
+///
+/// Neither `get_local_ip` nor `get_broadcasts` had any test, which mattered for
+/// the `get_if_addrs` -> `if-addrs` swap: the two crates do not return identical
+/// interface sets. `if-addrs` skips unicast addresses whose `DadState` is not
+/// `Preferred`, so on a Windows host with a Tentative or Deprecated address the
+/// results differ -- and this feeds camera discovery on the wire.
+///
+/// These assert the invariants the callers actually depend on. They deliberately
+/// tolerate a host with no usable interface, because CI containers are exactly
+/// that.
+#[cfg(test)]
+mod if_addr_tests {
+    use super::*;
+
+    #[test]
+    fn local_ip_is_a_non_loopback_v4() {
+        match get_local_ip() {
+            Ok(ip) => {
+                assert!(!ip.is_loopback(), "returned a loopback address: {}", ip);
+                assert!(ip.is_ipv4(), "returned a non-IPv4 address: {}", ip);
+            }
+            // A container with only `lo` is a legitimate outcome, not a failure.
+            Err(Error::Other(msg)) => assert_eq!(msg, "No Local Ip Address Found"),
+            Err(e) => panic!("unexpected error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn broadcasts_always_include_the_global_address() {
+        let ports = [2015u16, 2018];
+        let got = get_broadcasts(&ports).expect("enumerating interfaces");
+
+        for port in ports {
+            assert!(
+                got.contains(&SocketAddr::new(Ipv4Addr::BROADCAST.into(), port)),
+                "255.255.255.255:{} missing -- discovery would never reach a \
+                 camera on a network with no per-interface broadcast address",
+                port
+            );
+        }
+
+        // Every address is IPv4, and the port set is exactly what was asked for.
+        assert!(got.iter().all(|a| a.is_ipv4()));
+        for addr in &got {
+            assert!(ports.contains(&addr.port()), "unexpected port {}", addr);
+        }
+        // One entry per (address, port) pair, so the count is a multiple of the
+        // number of ports.
+        assert_eq!(got.len() % ports.len(), 0);
+        assert!(got.len() >= ports.len());
+    }
+
+    #[test]
+    fn broadcasts_with_no_ports_is_empty() {
+        assert!(get_broadcasts(&[])
+            .expect("enumerating interfaces")
+            .is_empty());
+    }
+}

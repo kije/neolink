@@ -162,8 +162,22 @@ jobs:
           # `-f` matters: without it curl saves upstream's HTML 404 page as the
           # .pkg and the failure only surfaces later at `installer`, which is
           # how the dead 1.20.4 pin stayed confusing for so long.
+          #
+          # The rest is about surviving a 377 MB transfer. Both macOS runners
+          # died together partway through this download with
+          # `curl: (92) HTTP/2 stream 1 was not closed cleanly: PROTOCOL_ERROR`,
+          # a known curl/nghttp2 symptom on long transfers through some CDNs.
+          # `--http1.1` avoids that failure mode outright; the retries cover
+          # ordinary flakiness. `--retry-all-errors` is not optional here --
+          # without it curl only retries what it deems transient, and exit 92
+          # is not on that list, so the retries would never fire for the very
+          # error that prompted them.
           gst_pkg="gstreamer-1.0-devel-${gstreamer_version}-universal.pkg"
-          curl -fL "https://gstreamer.freedesktop.org/data/pkg/osx/${gstreamer_version}/${gst_pkg}" -o "$(pwd)/gstreamer-devel.pkg"
+          curl -fL --http1.1 \
+            --retry 5 --retry-delay 10 --retry-all-errors \
+            --connect-timeout 30 \
+            "https://gstreamer.freedesktop.org/data/pkg/osx/${gstreamer_version}/${gst_pkg}" \
+            -o "$(pwd)/gstreamer-devel.pkg"
           sudo installer -verbose -pkg "$(pwd)/gstreamer-devel.pkg" -target /
           PKG_CONFIG_PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           PKG_CONFIG_GSTREAMER_1_0_PREFIX="/Library/Frameworks/GStreamer.framework/Versions/1.0"
@@ -239,7 +253,13 @@ jobs:
       - name: Install basic tools
         run: |
           apt-get update
-          apt-get install --assume-yes --no-install-recommends curl ca-certificates protobuf-compiler
+          # cmake is not needed by anything in the tree today. It is here as
+          # insurance for `aws-lc-sys`, which any rustls 0.23 dependency pulls
+          # in: it prefers its cmake-free `CcBuilder` when pre-generated
+          # bindings exist for the target, but falls through to `CmakeBuilder`
+          # otherwise -- and that hard-fails with "Missing dependency: cmake"
+          # in this image, which ships neither.
+          apt-get install --assume-yes --no-install-recommends curl ca-certificates protobuf-compiler cmake
       - name: Install ${{ matrix.arch }} cross compiler and gstreamer
         id: setup
         run: |

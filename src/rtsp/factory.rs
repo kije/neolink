@@ -1178,7 +1178,7 @@ fn make_appsrc(name: &str, buffer_size: u32) -> Result<AppSrc> {
 /// defensively; setting a property an element does not have would panic.
 fn tune_video_payloader(payload: &Element) {
     payload.set_property("config-interval", -1i32);
-    if payload.has_property("aggregate-mode", None) {
+    if payload.has_property("aggregate-mode") {
         payload.set_property_from_str("aggregate-mode", "zero-latency");
     } else {
         log::debug!(

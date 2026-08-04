@@ -9,6 +9,38 @@ to be a poor predictor of effort — several major bumps needed no code at all,
 while one of the cleanest-compiling upgrades in the whole set crashes the
 process at startup.
 
+## Implementation status
+
+Updated 2026-07-30. Everything below has been implemented except where noted.
+
+| Item | Status |
+|---|---|
+| P1–P5 prerequisite tests | **Done** — all five landed before the upgrades they gate |
+| `fcm-push-listener` → 3.0.0 | **Done** — VAPID key still unconfirmed, see below |
+| `gstreamer` → 0.24.5 | **Done** — one call fixed, `kstring` pinned to 2.0.2 |
+| `toml` → 1.1.4, `validator` → 0.21.0 | **Done** |
+| `axum` → 0.8.9 | **Done** — seven route patterns rewritten |
+| `rand` → 0.10.2 | **Done** |
+| `quick-xml` → 0.41.0 | **Done** — four reader loops now reassemble entity refs |
+| `aes` → 0.9.2, `cfb-mode` → 0.9.1 | **Done** — proven byte-identical by P1's known-answer test |
+| Phase 5 hygiene | **Done** — `get_if_addrs`, `lazy_static`, `once_cell`, `hex-string` all gone |
+| Docker jemalloc page-size bug | **Done** |
+| `rumqttc` → 0.25.1 | **Done** — `aws-lc-rs` accepted deliberately over `ring` |
+| Drop `--cfg tokio_unstable` | **Done** |
+| `tikv-jemallocator` → 0.7.0 | **Deferred** — needs a Pi 5 soak test, wants its own PR |
+| `nom` → 8 | **Deferred**, as recommended |
+| `fcm-push-listener` → 4.x | **Deferred** — 3.0.0 fixes the live failure |
+| `gstreamer` → 0.25.x | **Deferred**, as recommended |
+
+Two things still need real hardware to close out:
+
+1. **The VAPID key** in `src/common/pushnoti.rs` is an empty string, which is a
+   valid registration but not a confirmed one. If push notifications still fail
+   to arrive, suspect that constant first.
+2. **The arm64 jemalloc fix** in the Dockerfile is untested on a 16K-page Pi 5.
+   `neolink --version` on that hardware is enough to prove it, since the
+   allocator initialises before `main`.
+
 ## How the claims here were established
 
 Every effort estimate below is measured, not guessed. Two independent methods
