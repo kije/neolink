@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::common::{NeoInstance, NeoReactor};
 use crate::config::{CameraConfig, Config, OnvifGlobalConfig, StreamConfig};
+use crate::onvif::capabilities::CapabilityCache;
 use crate::onvif::events::EventsManager;
 use neolink_core::bc_protocol::BcCamera;
 
@@ -98,7 +99,6 @@ impl CameraEntry {
 /// Camera entry used by every handler. Cheaply cloneable.
 pub(crate) struct CameraEntry {
     pub(crate) name: String,
-    #[allow(dead_code)]
     pub(crate) channel_id: u8,
     pub(crate) uuid: Uuid,
     pub(crate) streams: Vec<OnvifStream>,
@@ -110,6 +110,10 @@ pub(crate) struct CameraEntry {
     /// Per-camera ONVIF events manager. Lazily starts a motion listener on
     /// first subscription.
     pub(crate) events: Arc<EventsManager>,
+    /// What the camera can actually do (pan/tilt, zoom, presets), probed on
+    /// first use and refreshed on a timer. Every capability-describing ONVIF
+    /// response reads from here so they can't disagree with each other.
+    pub(crate) capabilities: Arc<CapabilityCache>,
 }
 
 /// Shared state for every ONVIF handler (axum + WS-Discovery).
@@ -222,8 +226,9 @@ impl OnvifState {
                 let entry = if let Some(prev) = existing.get(&cam_cfg.name) {
                     // Reuse the existing NeoInstance + zoom task handle + the
                     // already-running events manager (so live subscriptions
-                    // survive a config reload). Just refresh the descriptor
-                    // fields that come from config.
+                    // survive a config reload) + the probed capabilities (the
+                    // hardware behind the connection has not changed). Just
+                    // refresh the descriptor fields that come from config.
                     Arc::new(CameraEntry {
                         name: cam_cfg.name.clone(),
                         channel_id: cam_cfg.channel_id,
@@ -233,6 +238,7 @@ impl OnvifState {
                         instance: prev.instance.clone(),
                         zoom_task: prev.zoom_task.clone(),
                         events: prev.events.clone(),
+                        capabilities: prev.capabilities.clone(),
                     })
                 } else {
                     // A single misconfigured camera must not take down ONVIF
@@ -263,6 +269,7 @@ impl OnvifState {
                         instance,
                         zoom_task: Arc::new(Mutex::new(None)),
                         events,
+                        capabilities: Arc::new(CapabilityCache::default()),
                     })
                 };
                 new_set.insert(cam_cfg.name.clone(), entry);

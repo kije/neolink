@@ -11,6 +11,11 @@
 //! The Reolink protocol does not expose absolute pan/tilt coordinates, so
 //! `AbsoluteMove{PanTilt}` returns the proper `NoAbsolutePTZSpace` fault. The
 //! ONVIF spec explicitly permits this on continuous-only devices.
+//!
+//! Everything this service describes — the node's supported spaces, the
+//! preset count, the configuration options — is filtered through the probed
+//! [`CameraCapabilities`], so a fixed-lens camera does not advertise a zoom
+//! space and a mount with no motor does not advertise a pan/tilt one.
 
 use std::sync::Arc;
 
@@ -20,10 +25,20 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use tokio::time::{sleep, Duration};
 
+use crate::onvif::capabilities::{capabilities, CameraCapabilities};
 use crate::onvif::services::device::FaultBody;
 use crate::onvif::services::media::read_first_text_element;
 use crate::onvif::soap::{wrap_envelope, xml_escape, FaultCode, NS_ALL};
 use crate::onvif::state::{CameraEntry, OnvifState};
+
+/// URIs of the PTZ coordinate spaces this bridge can implement.
+const CONTINUOUS_PT_SPACE: &str =
+    "http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace";
+const CONTINUOUS_ZOOM_SPACE: &str =
+    "http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace";
+const ABSOLUTE_ZOOM_SPACE: &str = "http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace";
+const PT_SPEED_SPACE: &str = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/GenericSpeedSpace";
+const ZOOM_SPEED_SPACE: &str = "http://www.onvif.org/ver10/tptz/ZoomSpaces/ZoomGenericSpeedSpace";
 
 /// Map a normalized [-1.0, 1.0] velocity magnitude to the Reolink `speed`
 /// parameter (an f32, conventionally 1..=64; the CLI/MQTT default is 32).
@@ -288,34 +303,64 @@ pub(crate) async fn dispatch(
     action: &str,
     body_xml: &str,
 ) -> Result<String, FaultBody> {
+    let caps = capabilities(cam).await;
+
+    // A camera with no motor at all still gets asked: `GetCapabilities` no
+    // longer lists a PTZ XAddr, but plenty of clients probe the well-known
+    // path anyway. Answer the enumerations with an empty set — that is the
+    // spec's way of saying "nothing here" — and fault the rest.
+    if !caps.ptz() {
+        return match action {
+            "GetNodes" => Ok(wrap_envelope("<tptz:GetNodesResponse/>", NS_ALL)),
+            "GetConfigurations" => Ok(wrap_envelope("<tptz:GetConfigurationsResponse/>", NS_ALL)),
+            "GetServiceCapabilities" => {
+                Ok(wrap_envelope(&render_service_capabilities(&caps), NS_ALL))
+            }
+            _ => Err(FaultBody {
+                code: FaultCode::ActionNotSupported,
+                reason: format!("Camera '{}' has no PTZ support", cam.name),
+            }),
+        };
+    }
+
     let body = match action {
         "GetConfigurations" => format!(
             "<tptz:GetConfigurationsResponse>{cfg}</tptz:GetConfigurationsResponse>",
-            cfg = render_ptz_configuration_xml(cam, "tptz:PTZConfiguration"),
+            cfg = render_ptz_configuration_xml(&cam.name, &caps, "tptz:PTZConfiguration"),
         ),
         "GetConfiguration" => format!(
             "<tptz:GetConfigurationResponse>{cfg}</tptz:GetConfigurationResponse>",
-            cfg = render_ptz_configuration_xml(cam, "tptz:PTZConfiguration"),
+            cfg = render_ptz_configuration_xml(&cam.name, &caps, "tptz:PTZConfiguration"),
         ),
-        "GetConfigurationOptions" => render_configuration_options(),
-        "GetServiceCapabilities" => {
-            "<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities EFlip=\"false\" Reverse=\"false\" GetCompatibleConfigurations=\"true\" MoveStatus=\"false\" StatusPosition=\"true\"/></tptz:GetServiceCapabilitiesResponse>".to_string()
-        }
+        "GetConfigurationOptions" => render_configuration_options(&caps),
+        "GetServiceCapabilities" => render_service_capabilities(&caps),
         "GetNodes" => format!(
             "<tptz:GetNodesResponse>{n}</tptz:GetNodesResponse>",
-            n = render_ptz_node(cam)
+            n = render_ptz_node(&cam.name, &caps)
         ),
         "GetNode" => format!(
             "<tptz:GetNodeResponse>{n}</tptz:GetNodeResponse>",
-            n = render_ptz_node(cam)
+            n = render_ptz_node(&cam.name, &caps)
         ),
         "ContinuousMove" => {
             let v = parse_velocity(body_xml, "Velocity");
+            if !caps.pan_tilt && pick_direction(v.pan, v.tilt).is_some() {
+                return Err(FaultBody {
+                    code: FaultCode::NoContinuousPanTiltSpace,
+                    reason: format!("Camera '{}' has no pan/tilt", cam.name),
+                });
+            }
+            if !caps.zoom && v.zoom.abs() >= 0.05 {
+                return Err(FaultBody {
+                    code: FaultCode::NoContinuousZoomSpace,
+                    reason: format!("Camera '{}' has no optical zoom", cam.name),
+                });
+            }
             abort_zoom_task(cam).await;
             if let Some(dir) = pick_direction(v.pan, v.tilt) {
                 let speed = onvif_to_reolink_speed(v.pan.abs().max(v.tilt.abs()));
                 send_direction(cam, dir, speed).await.map_err(other_fault)?;
-            } else if v.pan == 0.0 && v.tilt == 0.0 {
+            } else if caps.pan_tilt && v.pan == 0.0 && v.tilt == 0.0 {
                 // Pure zoom move — make sure no PT is in progress.
                 let _ = stop_pt(cam).await;
             }
@@ -327,6 +372,18 @@ pub(crate) async fn dispatch(
         "RelativeMove" => {
             let translation = parse_velocity(body_xml, "Translation");
             let speed_v = parse_velocity(body_xml, "Speed");
+            if !caps.pan_tilt && pick_direction(translation.pan, translation.tilt).is_some() {
+                return Err(FaultBody {
+                    code: FaultCode::NoRelativePanTiltSpace,
+                    reason: format!("Camera '{}' has no pan/tilt", cam.name),
+                });
+            }
+            if !caps.zoom && translation.zoom.abs() >= 0.005 {
+                return Err(FaultBody {
+                    code: FaultCode::NoRelativeZoomSpace,
+                    reason: format!("Camera '{}' has no optical zoom", cam.name),
+                });
+            }
             abort_zoom_task(cam).await;
             // PT relative: do a timed continuous move. Magnitude is treated
             // as seconds (clamped to 10s) like the existing CLI does.
@@ -349,7 +406,9 @@ pub(crate) async fn dispatch(
                 let _ = stop_pt(cam).await;
             }
             if translation.zoom.abs() >= 0.005 {
-                relative_zoom(cam, translation.zoom).await.map_err(other_fault)?;
+                relative_zoom(cam, translation.zoom)
+                    .await
+                    .map_err(other_fault)?;
             }
             "<tptz:RelativeMoveResponse/>".to_string()
         }
@@ -366,13 +425,24 @@ pub(crate) async fn dispatch(
             // Scan only for a Zoom element nested in Position so a sibling
             // <Speed><Zoom .../></Speed> doesn't trigger an unintended move.
             if zoom_present_in(body_xml, "Position") {
-                absolute_zoom(cam, position.zoom).await.map_err(other_fault)?;
+                if !caps.zoom {
+                    return Err(FaultBody {
+                        code: FaultCode::NoAbsoluteZoomSpace,
+                        reason: format!("Camera '{}' has no optical zoom", cam.name),
+                    });
+                }
+                absolute_zoom(cam, position.zoom)
+                    .await
+                    .map_err(other_fault)?;
             }
             "<tptz:AbsoluteMoveResponse/>".to_string()
         }
         "Stop" => {
             let (pt, zoom) = parse_stop_flags(body_xml);
-            if pt {
+            // Stop is a no-op for an axis the camera doesn't have; faulting
+            // would break the common client pattern of stopping both axes
+            // after every move.
+            if pt && caps.pan_tilt {
                 stop_pt(cam).await.map_err(other_fault)?;
             }
             if zoom {
@@ -381,33 +451,57 @@ pub(crate) async fn dispatch(
             "<tptz:StopResponse/>".to_string()
         }
         "GetStatus" => {
-            let zf = cam
-                .run(|c| Box::pin(async move { Ok(c.get_zoom().await?) }))
-                .await
-                .ok();
-            let zoom_x = zf
-                .as_ref()
-                .filter(|z| z.zoom.max_pos > z.zoom.min_pos)
-                .map(|z| {
-                    (z.zoom.cur_pos.saturating_sub(z.zoom.min_pos)) as f32
-                        / (z.zoom.max_pos - z.zoom.min_pos) as f32
-                })
-                .unwrap_or(0.0);
+            let zoom_x = if caps.zoom {
+                cam.run(|c| Box::pin(async move { Ok(c.get_zoom().await?) }))
+                    .await
+                    .ok()
+                    .filter(|z| z.zoom.max_pos > z.zoom.min_pos)
+                    .map(|z| {
+                        (z.zoom.cur_pos.saturating_sub(z.zoom.min_pos)) as f32
+                            / (z.zoom.max_pos - z.zoom.min_pos) as f32
+                    })
+            } else {
+                None
+            };
+            // Only report a position for an axis that exists. A fixed mount
+            // reporting `PanTilt x="0" y="0"` reads to a client as "centred",
+            // not as "absent".
+            let mut position = String::new();
+            let mut move_status = String::new();
+            if caps.pan_tilt {
+                position.push_str(
+                    "<tt:PanTilt x=\"0\" y=\"0\" space=\"http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace\"/>",
+                );
+                move_status.push_str("<tt:PanTilt>IDLE</tt:PanTilt>");
+            }
+            if let Some(zx) = zoom_x {
+                position.push_str(&format!(
+                    "<tt:Zoom x=\"{zx:.4}\" space=\"{ABSOLUTE_ZOOM_SPACE}\"/>"
+                ));
+            }
+            if caps.zoom {
+                move_status.push_str("<tt:Zoom>IDLE</tt:Zoom>");
+            }
             format!(
                 "<tptz:GetStatusResponse><tptz:PTZStatus>\
-<tt:Position>\
-<tt:PanTilt x=\"0\" y=\"0\" space=\"http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace\"/>\
-<tt:Zoom x=\"{zx:.4}\" space=\"http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace\"/>\
-</tt:Position>\
-<tt:MoveStatus>\
-<tt:PanTilt>IDLE</tt:PanTilt>\
-<tt:Zoom>IDLE</tt:Zoom>\
-</tt:MoveStatus>\
+{position}\
+<tt:MoveStatus>{move_status}</tt:MoveStatus>\
 <tt:UtcTime>{ts}</tt:UtcTime>\
 </tptz:PTZStatus></tptz:GetStatusResponse>",
-                zx = zoom_x,
+                position = if position.is_empty() {
+                    String::new()
+                } else {
+                    format!("<tt:Position>{position}</tt:Position>")
+                },
                 ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
             )
+        }
+        "GetPresets" if !caps.presets => "<tptz:GetPresetsResponse/>".to_string(),
+        "GotoPreset" | "SetPreset" | "GotoHomePosition" if !caps.presets => {
+            return Err(FaultBody {
+                code: FaultCode::ActionNotSupported,
+                reason: format!("Camera '{}' does not support PTZ presets", cam.name),
+            });
         }
         "GetPresets" => {
             let presets = cam
@@ -429,8 +523,8 @@ pub(crate) async fn dispatch(
             format!("<tptz:GetPresetsResponse>{items}</tptz:GetPresetsResponse>")
         }
         "GotoPreset" => {
-            let token = read_first_text_element(body_xml, "PresetToken")
-                .ok_or_else(|| FaultBody {
+            let token =
+                read_first_text_element(body_xml, "PresetToken").ok_or_else(|| FaultBody {
                     code: FaultCode::InvalidArgs,
                     reason: "Missing PresetToken".to_string(),
                 })?;
@@ -439,13 +533,13 @@ pub(crate) async fn dispatch(
                 reason: format!("Unknown preset token '{token}'"),
             })?;
             cam.run(move |c| {
-                    Box::pin(async move {
-                        c.moveto_ptz_preset(id).await?;
-                        Ok(())
-                    })
+                Box::pin(async move {
+                    c.moveto_ptz_preset(id).await?;
+                    Ok(())
                 })
-                .await
-                .map_err(other_fault)?;
+            })
+            .await
+            .map_err(other_fault)?;
             "<tptz:GotoPresetResponse/>".to_string()
         }
         "SetPreset" => {
@@ -458,14 +552,14 @@ pub(crate) async fn dispatch(
             };
             let name_for_task = name.clone();
             cam.run(move |c| {
-                    let name = name_for_task.clone();
-                    Box::pin(async move {
-                        c.set_ptz_preset(id, name).await?;
-                        Ok(())
-                    })
+                let name = name_for_task.clone();
+                Box::pin(async move {
+                    c.set_ptz_preset(id, name).await?;
+                    Ok(())
                 })
-                .await
-                .map_err(other_fault)?;
+            })
+            .await
+            .map_err(other_fault)?;
             format!(
                 "<tptz:SetPresetResponse><tptz:PresetToken>preset_{id}</tptz:PresetToken></tptz:SetPresetResponse>"
             )
@@ -478,13 +572,13 @@ pub(crate) async fn dispatch(
         }
         "GotoHomePosition" => {
             cam.run(|c| {
-                    Box::pin(async move {
-                        c.moveto_ptz_preset(0).await?;
-                        Ok(())
-                    })
+                Box::pin(async move {
+                    c.moveto_ptz_preset(0).await?;
+                    Ok(())
                 })
-                .await
-                .map_err(other_fault)?;
+            })
+            .await
+            .map_err(other_fault)?;
             "<tptz:GotoHomePositionResponse/>".to_string()
         }
         "SetHomePosition" => {
@@ -503,72 +597,116 @@ pub(crate) async fn dispatch(
     Ok(wrap_envelope(&body, NS_ALL))
 }
 
-fn render_ptz_configuration_xml(cam: &CameraEntry, tag: &str) -> String {
+/// The `tt:Spaces` / `tt:SupportedPTZSpaces` body, holding only the spaces the
+/// camera can actually be driven through. Shared by the PTZ node and the
+/// configuration options so the two can never disagree.
+fn render_supported_spaces(caps: &CameraCapabilities) -> String {
+    let mut out = String::new();
+    if caps.pan_tilt {
+        out.push_str(&format!(
+            "<tt:ContinuousPanTiltVelocitySpace>\
+<tt:URI>{CONTINUOUS_PT_SPACE}</tt:URI>\
+<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
+<tt:YRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:YRange>\
+</tt:ContinuousPanTiltVelocitySpace>"
+        ));
+    }
+    if caps.zoom {
+        out.push_str(&format!(
+            "<tt:ContinuousZoomVelocitySpace>\
+<tt:URI>{CONTINUOUS_ZOOM_SPACE}</tt:URI>\
+<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
+</tt:ContinuousZoomVelocitySpace>\
+<tt:AbsoluteZoomPositionSpace>\
+<tt:URI>{ABSOLUTE_ZOOM_SPACE}</tt:URI>\
+<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
+</tt:AbsoluteZoomPositionSpace>"
+        ));
+    }
+    out
+}
+
+/// The `PTZConfiguration` element. `tag` differs by service: the Media service
+/// nests it in a profile as `tt:PTZConfiguration`, the PTZ service returns it
+/// as `tptz:PTZConfiguration`.
+pub(crate) fn render_ptz_configuration_xml(
+    cam_name: &str,
+    caps: &CameraCapabilities,
+    tag: &str,
+) -> String {
+    let mut default_spaces = String::new();
+    let mut default_speed = String::new();
+    if caps.pan_tilt {
+        default_spaces.push_str(&format!(
+            "<tt:DefaultContinuousPanTiltVelocitySpace>{CONTINUOUS_PT_SPACE}</tt:DefaultContinuousPanTiltVelocitySpace>"
+        ));
+        default_speed.push_str(&format!(
+            "<tt:PanTilt x=\"0.5\" y=\"0.5\" space=\"{PT_SPEED_SPACE}\"/>"
+        ));
+    }
+    if caps.zoom {
+        default_spaces.push_str(&format!(
+            "<tt:DefaultContinuousZoomVelocitySpace>{CONTINUOUS_ZOOM_SPACE}</tt:DefaultContinuousZoomVelocitySpace>"
+        ));
+        default_speed.push_str(&format!(
+            "<tt:Zoom x=\"0.5\" space=\"{ZOOM_SPEED_SPACE}\"/>"
+        ));
+    }
     format!(
         "<{tag} token=\"ptz_{cam_name}\">\
 <tt:Name>{cam_name}_ptz</tt:Name>\
 <tt:UseCount>1</tt:UseCount>\
 <tt:NodeToken>ptz_node_{cam_name}</tt:NodeToken>\
-<tt:DefaultContinuousPanTiltVelocitySpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:DefaultContinuousPanTiltVelocitySpace>\
-<tt:DefaultContinuousZoomVelocitySpace>http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace</tt:DefaultContinuousZoomVelocitySpace>\
-<tt:DefaultPTZSpeed>\
-<tt:PanTilt x=\"0.5\" y=\"0.5\" space=\"http://www.onvif.org/ver10/tptz/PanTiltSpaces/GenericSpeedSpace\"/>\
-<tt:Zoom x=\"0.5\" space=\"http://www.onvif.org/ver10/tptz/ZoomSpaces/ZoomGenericSpeedSpace\"/>\
-</tt:DefaultPTZSpeed>\
+{default_spaces}\
+<tt:DefaultPTZSpeed>{default_speed}</tt:DefaultPTZSpeed>\
 <tt:DefaultPTZTimeout>PT5S</tt:DefaultPTZTimeout>\
 </{tag}>",
         tag = tag,
-        cam_name = xml_escape(&cam.name),
+        cam_name = xml_escape(cam_name),
     )
 }
 
-fn render_configuration_options() -> String {
-    "<tptz:GetConfigurationOptionsResponse><tptz:PTZConfigurationOptions>\
-<tt:Spaces>\
-<tt:ContinuousPanTiltVelocitySpace>\
-<tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:URI>\
-<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
-<tt:YRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:YRange>\
-</tt:ContinuousPanTiltVelocitySpace>\
-<tt:ContinuousZoomVelocitySpace>\
-<tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace</tt:URI>\
-<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
-</tt:ContinuousZoomVelocitySpace>\
-<tt:AbsoluteZoomPositionSpace>\
-<tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace</tt:URI>\
-<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
-</tt:AbsoluteZoomPositionSpace>\
-</tt:Spaces>\
+fn render_configuration_options(caps: &CameraCapabilities) -> String {
+    format!(
+        "<tptz:GetConfigurationOptionsResponse><tptz:PTZConfigurationOptions>\
+<tt:Spaces>{spaces}</tt:Spaces>\
 <tt:PTZTimeout><tt:Min>PT1S</tt:Min><tt:Max>PT60S</tt:Max></tt:PTZTimeout>\
-</tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse>"
-        .to_string()
+</tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse>",
+        spaces = render_supported_spaces(caps),
+    )
 }
 
-fn render_ptz_node(cam: &CameraEntry) -> String {
+fn render_service_capabilities(caps: &CameraCapabilities) -> String {
+    format!(
+        "<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities EFlip=\"false\" \
+Reverse=\"false\" GetCompatibleConfigurations=\"true\" MoveStatus=\"false\" \
+StatusPosition=\"{status_position}\"/></tptz:GetServiceCapabilitiesResponse>",
+        // The only position we can actually read back off a Reolink camera is
+        // the zoom one; without a zoom motor `GetStatus` carries no position
+        // at all, and claiming otherwise makes clients poll it forever.
+        status_position = caps.zoom,
+    )
+}
+
+fn render_ptz_node(cam_name: &str, caps: &CameraCapabilities) -> String {
     format!(
         "<tptz:PTZNode token=\"ptz_node_{cam_name}\" FixedHomePosition=\"true\">\
 <tt:Name>{cam_name}_node</tt:Name>\
-<tt:SupportedPTZSpaces>\
-<tt:ContinuousPanTiltVelocitySpace>\
-<tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:URI>\
-<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
-<tt:YRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:YRange>\
-</tt:ContinuousPanTiltVelocitySpace>\
-<tt:ContinuousZoomVelocitySpace>\
-<tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace</tt:URI>\
-<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
-</tt:ContinuousZoomVelocitySpace>\
-<tt:AbsoluteZoomPositionSpace>\
-<tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace</tt:URI>\
-<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
-</tt:AbsoluteZoomPositionSpace>\
-</tt:SupportedPTZSpaces>\
-<tt:MaximumNumberOfPresets>64</tt:MaximumNumberOfPresets>\
-<tt:HomeSupported>true</tt:HomeSupported>\
+<tt:SupportedPTZSpaces>{spaces}</tt:SupportedPTZSpaces>\
+<tt:MaximumNumberOfPresets>{presets}</tt:MaximumNumberOfPresets>\
+<tt:HomeSupported>{home}</tt:HomeSupported>\
 </tptz:PTZNode>",
-        cam_name = xml_escape(&cam.name)
+        cam_name = xml_escape(cam_name),
+        spaces = render_supported_spaces(caps),
+        // `GotoHomePosition` is implemented as "go to preset 0", so home is
+        // exactly as available as presets are.
+        presets = if caps.presets { MAX_PRESETS } else { 0 },
+        home = caps.presets,
     )
 }
+
+/// Reolink's preset table is 64 slots wide (ids 0..=63).
+const MAX_PRESETS: u8 = 64;
 
 async fn relative_zoom(cam: &Arc<CameraEntry>, delta: f32) -> Result<()> {
     let zf = cam
@@ -614,7 +752,7 @@ async fn allocate_preset_id(cam: &Arc<CameraEntry>) -> Result<u8> {
         .await?;
     let used: std::collections::HashSet<u8> =
         presets.preset_list.preset.iter().map(|p| p.id).collect();
-    for id in 0u8..=63 {
+    for id in 0u8..MAX_PRESETS {
         if !used.contains(&id) {
             return Ok(id);
         }
@@ -632,6 +770,103 @@ fn other_fault(e: anyhow::Error) -> FaultBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FULL: CameraCapabilities = CameraCapabilities {
+        pan_tilt: true,
+        zoom: true,
+        presets: true,
+    };
+    const PT_ONLY: CameraCapabilities = CameraCapabilities {
+        pan_tilt: true,
+        zoom: false,
+        presets: true,
+    };
+    const ZOOM_ONLY: CameraCapabilities = CameraCapabilities {
+        pan_tilt: false,
+        zoom: true,
+        presets: false,
+    };
+
+    /// A fixed-lens pan/tilt camera must not offer a zoom space — clients read
+    /// this list to decide which controls to draw.
+    #[test]
+    fn a_pan_tilt_only_node_advertises_no_zoom_space() {
+        let xml = render_ptz_node("cam", &PT_ONLY);
+        assert!(xml.contains("ContinuousPanTiltVelocitySpace"));
+        assert!(!xml.contains("ZoomVelocitySpace"), "{}", xml);
+        assert!(!xml.contains("AbsoluteZoomPositionSpace"), "{}", xml);
+    }
+
+    #[test]
+    fn a_zoom_only_node_advertises_no_pan_tilt_space() {
+        let xml = render_ptz_node("cam", &ZOOM_ONLY);
+        assert!(!xml.contains("PanTiltVelocitySpace"), "{}", xml);
+        assert!(xml.contains("ContinuousZoomVelocitySpace"));
+        assert!(xml.contains("AbsoluteZoomPositionSpace"));
+    }
+
+    /// `GotoHomePosition` is preset 0, so a camera without presets has no home
+    /// and no preset slots to offer.
+    #[test]
+    fn presets_and_home_track_each_other() {
+        let xml = render_ptz_node("cam", &FULL);
+        assert!(xml.contains("<tt:MaximumNumberOfPresets>64</tt:MaximumNumberOfPresets>"));
+        assert!(xml.contains("<tt:HomeSupported>true</tt:HomeSupported>"));
+
+        let xml = render_ptz_node("cam", &ZOOM_ONLY);
+        assert!(xml.contains("<tt:MaximumNumberOfPresets>0</tt:MaximumNumberOfPresets>"));
+        assert!(xml.contains("<tt:HomeSupported>false</tt:HomeSupported>"));
+    }
+
+    /// The node and the configuration options describe the same hardware, so
+    /// they must list the same spaces.
+    #[test]
+    fn node_and_configuration_options_agree() {
+        for caps in [FULL, PT_ONLY, ZOOM_ONLY] {
+            let spaces = render_supported_spaces(&caps);
+            assert!(render_ptz_node("cam", &caps).contains(&spaces));
+            assert!(render_configuration_options(&caps).contains(&spaces));
+        }
+    }
+
+    #[test]
+    fn a_configuration_only_defaults_the_axes_that_exist() {
+        let xml = render_ptz_configuration_xml("cam", &PT_ONLY, "tt:PTZConfiguration");
+        assert!(xml.contains("DefaultContinuousPanTiltVelocitySpace"));
+        assert!(
+            !xml.contains("DefaultContinuousZoomVelocitySpace"),
+            "{}",
+            xml
+        );
+        assert!(xml.contains("<tt:PanTilt x=\"0.5\""));
+        assert!(!xml.contains("<tt:Zoom x=\"0.5\""), "{}", xml);
+
+        let xml = render_ptz_configuration_xml("cam", &ZOOM_ONLY, "tt:PTZConfiguration");
+        assert!(
+            !xml.contains("DefaultContinuousPanTiltVelocitySpace"),
+            "{}",
+            xml
+        );
+        assert!(xml.contains("DefaultContinuousZoomVelocitySpace"));
+    }
+
+    /// The zoom position is the only one we can read back off a Reolink
+    /// camera, so it is the only thing that can justify `StatusPosition`.
+    #[test]
+    fn status_position_follows_zoom() {
+        assert!(render_service_capabilities(&FULL).contains("StatusPosition=\"true\""));
+        assert!(render_service_capabilities(&PT_ONLY).contains("StatusPosition=\"false\""));
+    }
+
+    #[test]
+    fn a_camera_with_nothing_gets_an_empty_space_list() {
+        let none = CameraCapabilities {
+            pan_tilt: false,
+            zoom: false,
+            presets: false,
+        };
+        assert_eq!(render_supported_spaces(&none), "");
+    }
 
     #[test]
     fn speed_mapping() {

@@ -1046,6 +1046,30 @@ natively, so a VMS sees the bridge as it would see the camera:
 These are the topics Home Assistant's ONVIF integration parses, so AI
 detections show up as binary sensors without any extra configuration.
 
+#### Capabilities match the camera
+
+What the bridge advertises is probed from the camera, not assumed. On first
+use (and every five minutes after) each camera is asked for its `Support`
+table, its ability list and its zoom range, and the answer decides what every
+description-shaped response says:
+
+| If the camera has… | …then |
+|---|---|
+| no PTZ at all (fixed mount, no zoom, or an account without the PTZ `control` permission) | `GetCapabilities`/`GetServices` list no PTZ address, `GetScopes` and WS-Discovery drop `onvif://www.onvif.org/type/ptz`, and media profiles carry no `PTZConfiguration` |
+| pan/tilt but no optical zoom (E1 Pro, most pan/tilt models) | the PTZ node advertises only the continuous pan/tilt space; zoom moves return `ter:NoContinuousZoomSpace` / `ter:NoRelativeZoomSpace` / `ter:NoAbsoluteZoomSpace` |
+| optical zoom but no pan/tilt | the node advertises only the zoom spaces; pan/tilt moves return `ter:NoContinuousPanTiltSpace` / `ter:NoRelativePanTiltSpace` |
+| no preset support | `MaximumNumberOfPresets` is `0`, `HomeSupported` is `false`, and `GotoPreset`/`SetPreset`/`GotoHomePosition` return `ter:ActionNotSupported` |
+
+The point is that a client only offers controls that work: Home Assistant
+draws its PTZ pad from the profile's `PTZConfiguration`, and Frigate decides
+whether to show presets from `MaximumNumberOfPresets`.
+
+Detection errs towards keeping a capability. A camera that is offline, or a
+firmware that omits one of these fields, leaves that signal *unknown*, and
+unknown means "advertise it" — the same behaviour as before this existed. A
+capability is only withdrawn on positive evidence that the camera lacks it.
+Run with `RUST_LOG=neolink::onvif=debug` to see what was probed and decided.
+
 `GetSnapshotUri` returns `http://<host>:<onvif_port>/onvif/<camera>/snapshot/<stream>`;
 that URL serves a JPEG produced by Reolink's `SNAP` command (HTTP Basic auth,
 using the same `[[users]]` table).

@@ -18,6 +18,7 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::onvif::capabilities::{cached, capabilities};
 use crate::onvif::soap::xml_escape;
 use crate::onvif::state::{url_path_segment, OnvifState};
 
@@ -126,7 +127,13 @@ async fn handle_probe(state: &OnvifState, sock: &UdpSocket, src: SocketAddr, rel
         return;
     };
     for cam in state.all_cameras().await {
-        let body = probe_match_envelope(&cam.uuid, &cam.name, &authority, relates_to);
+        // Cached-only: this runs on the receive loop, so one unreachable
+        // camera must not stall the answer for every other one. The startup
+        // Hello warms the cache, and until then we announce the permissive
+        // default — the same thing discovery always announced. The device
+        // service is the authoritative answer either way.
+        let has_ptz = cached(&cam).map(|c| c.ptz()).unwrap_or(true);
+        let body = probe_match_envelope(&cam.uuid, &cam.name, &authority, relates_to, has_ptz);
         let _ = sock.send_to(body.as_bytes(), src).await;
     }
 }
@@ -137,7 +144,11 @@ async fn send_hello_for_all(state: &OnvifState, sock: &UdpSocket) {
     };
     let dst = SocketAddrV4::new(WS_DISCOVERY_ADDR, WS_DISCOVERY_PORT);
     for cam in state.all_cameras().await {
-        let body = hello_envelope(&cam.uuid, &cam.name, &authority);
+        // Startup, once per camera, off the receive loop: worth the probe both
+        // for an accurate Hello and to warm the cache that `handle_probe`
+        // reads.
+        let has_ptz = capabilities(&cam).await.ptz();
+        let body = hello_envelope(&cam.uuid, &cam.name, &authority, has_ptz);
         let _ = sock.send_to(body.as_bytes(), SocketAddr::V4(dst)).await;
     }
 }
@@ -150,14 +161,22 @@ async fn send_bye_for_all(state: &OnvifState, sock: &UdpSocket) {
     }
 }
 
-fn scopes_for(cam: &str) -> String {
+/// The scope list a camera announces. Kept in step with the device service's
+/// `GetScopes`: a client that filters its Probe on `type/ptz` must get the
+/// same answer it would get by asking the device directly.
+fn scopes_for(cam: &str, has_ptz: bool) -> String {
     let cam = xml_escape(cam);
+    let ptz = if has_ptz {
+        " onvif://www.onvif.org/type/ptz"
+    } else {
+        ""
+    };
     format!(
         "onvif://www.onvif.org/type/video_encoder \
 onvif://www.onvif.org/Profile/Streaming \
 onvif://www.onvif.org/name/{cam} \
 onvif://www.onvif.org/hardware/neolink \
-onvif://www.onvif.org/location/neolink"
+onvif://www.onvif.org/location/neolink{ptz}"
     )
 }
 
@@ -169,7 +188,13 @@ fn xaddr(authority: &str, cam: &str) -> String {
     format!("http://{authority}/onvif/{cam}/device_service")
 }
 
-fn probe_match_envelope(uuid: &Uuid, cam: &str, authority: &str, relates_to: &str) -> String {
+fn probe_match_envelope(
+    uuid: &Uuid,
+    cam: &str,
+    authority: &str,
+    relates_to: &str,
+    has_ptz: bool,
+) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" \
@@ -197,12 +222,12 @@ xmlns:dn=\"http://www.onvif.org/ver10/network/wsdl\">\
         msg_id = Uuid::new_v4(),
         relates = xml_escape(relates_to),
         cam_uuid = uuid,
-        scopes = scopes_for(cam),
+        scopes = scopes_for(cam, has_ptz),
         xaddr = xml_escape(&xaddr(authority, cam)),
     )
 }
 
-fn hello_envelope(uuid: &Uuid, cam: &str, authority: &str) -> String {
+fn hello_envelope(uuid: &Uuid, cam: &str, authority: &str, has_ptz: bool) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" \
@@ -226,7 +251,7 @@ xmlns:dn=\"http://www.onvif.org/ver10/network/wsdl\">\
 </s:Envelope>",
         msg_id = Uuid::new_v4(),
         cam_uuid = uuid,
-        scopes = scopes_for(cam),
+        scopes = scopes_for(cam, has_ptz),
         xaddr = xml_escape(&xaddr(authority, cam)),
     )
 }
@@ -262,6 +287,17 @@ mod tests {
         assert!(is_probe("<wsd:Probe xmlns:wsd=\"...\"/>"));
         assert!(!is_probe("<wsd:ProbeMatches xmlns:wsd=\"...\"/>"));
         assert!(!is_probe("<wsd:Hello/>"));
+    }
+
+    /// The `type/ptz` scope is how a VMS filters its Probe for PTZ-capable
+    /// devices; announcing it on a fixed camera puts the camera in a list it
+    /// will then fail every command from.
+    #[test]
+    fn the_ptz_scope_is_only_announced_by_ptz_cameras() {
+        assert!(scopes_for("front", true).contains("onvif://www.onvif.org/type/ptz"));
+        assert!(!scopes_for("front", false).contains("onvif://www.onvif.org/type/ptz"));
+        // The rest of the scope list is unaffected either way.
+        assert!(scopes_for("front", false).contains("onvif://www.onvif.org/name/front"));
     }
 
     #[test]
