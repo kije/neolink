@@ -37,9 +37,11 @@ pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<
     };
     let socket = Arc::new(socket);
 
-    // Hello on startup for each camera.
-    send_hello_for_all(&state, &socket).await;
-
+    // Start answering Probes *before* the startup Hello. The Hello has to probe
+    // each camera to know whether to claim PTZ, and a camera that has gone away
+    // costs a full `CameraEntry::run` timeout per query — so doing it first
+    // would leave the responder deaf for that whole time, on a socket that is
+    // already bound and receiving.
     let inbound_state = state.clone();
     let inbound_sock = socket.clone();
     let inbound_cancel = cancel.clone();
@@ -66,6 +68,9 @@ pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<
             }
         }
     });
+
+    // Hello on startup for each camera.
+    send_hello_for_all(&state, &socket).await;
 
     cancel.cancelled().await;
     inbound.abort();
@@ -143,11 +148,17 @@ async fn send_hello_for_all(state: &OnvifState, sock: &UdpSocket) {
         return;
     };
     let dst = SocketAddrV4::new(WS_DISCOVERY_ADDR, WS_DISCOVERY_PORT);
-    for cam in state.all_cameras().await {
-        // Startup, once per camera, off the receive loop: worth the probe both
-        // for an accurate Hello and to warm the cache that `handle_probe`
-        // reads.
-        let has_ptz = capabilities(&cam).await.ptz();
+    // Probe every camera at once. Each probe costs up to three `CameraEntry::run`
+    // timeouts against a camera that has gone away, so walking the list serially
+    // would make startup cost the sum of every offline camera's timeouts rather
+    // than the slowest single one.
+    let probed =
+        futures::future::join_all(state.all_cameras().await.into_iter().map(|cam| async {
+            let has_ptz = capabilities(&cam).await.ptz();
+            (cam, has_ptz)
+        }))
+        .await;
+    for (cam, has_ptz) in probed {
         let body = hello_envelope(&cam.uuid, &cam.name, &authority, has_ptz);
         let _ = sock.send_to(body.as_bytes(), SocketAddr::V4(dst)).await;
     }

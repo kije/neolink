@@ -497,7 +497,7 @@ pub(crate) async fn dispatch(
             )
         }
         "GetPresets" if !caps.presets => "<tptz:GetPresetsResponse/>".to_string(),
-        "GotoPreset" | "SetPreset" | "GotoHomePosition" if !caps.presets => {
+        "GotoPreset" | "SetPreset" | "GotoHomePosition" | "SetHomePosition" if !caps.presets => {
             return Err(FaultBody {
                 code: FaultCode::ActionNotSupported,
                 reason: format!("Camera '{}' does not support PTZ presets", cam.name),
@@ -573,7 +573,7 @@ pub(crate) async fn dispatch(
         "GotoHomePosition" => {
             cam.run(|c| {
                 Box::pin(async move {
-                    c.moveto_ptz_preset(0).await?;
+                    c.moveto_ptz_preset(HOME_PRESET_ID).await?;
                     Ok(())
                 })
             })
@@ -582,10 +582,18 @@ pub(crate) async fn dispatch(
             "<tptz:GotoHomePositionResponse/>".to_string()
         }
         "SetHomePosition" => {
-            return Err(FaultBody {
-                code: FaultCode::ActionNotSupported,
-                reason: "Home position cannot be reassigned on Reolink".to_string(),
-            });
+            // Home is preset 0 (see HOME_PRESET_ID), which is an ordinary
+            // writable slot, so this is a plain preset write rather than the
+            // fault a truly fixed home would justify.
+            cam.run(|c| {
+                Box::pin(async move {
+                    c.set_ptz_preset(HOME_PRESET_ID, "home".to_string()).await?;
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(other_fault)?;
+            "<tptz:SetHomePositionResponse/>".to_string()
         }
         other => {
             return Err(FaultBody {
@@ -690,7 +698,7 @@ StatusPosition=\"{status_position}\"/></tptz:GetServiceCapabilitiesResponse>",
 
 fn render_ptz_node(cam_name: &str, caps: &CameraCapabilities) -> String {
     format!(
-        "<tptz:PTZNode token=\"ptz_node_{cam_name}\" FixedHomePosition=\"true\">\
+        "<tptz:PTZNode token=\"ptz_node_{cam_name}\" FixedHomePosition=\"false\">\
 <tt:Name>{cam_name}_node</tt:Name>\
 <tt:SupportedPTZSpaces>{spaces}</tt:SupportedPTZSpaces>\
 <tt:MaximumNumberOfPresets>{presets}</tt:MaximumNumberOfPresets>\
@@ -707,6 +715,16 @@ fn render_ptz_node(cam_name: &str, caps: &CameraCapabilities) -> String {
 
 /// Reolink's preset table is 64 slots wide (ids 0..=63).
 const MAX_PRESETS: u8 = 64;
+
+/// The preset slot `GotoHomePosition` / `SetHomePosition` map onto.
+///
+/// The Reolink protocol has no distinct "home" position — it has a flat preset
+/// table — so home is a convention: preset 0. That makes home *writable*, which
+/// is why the node reports `FixedHomePosition="false"` and `SetHomePosition` is
+/// implemented rather than refused: a client can already rewrite this slot with
+/// an ordinary `SetPreset` on token `preset_0`, so claiming the home position
+/// were fixed would be a claim the bridge cannot keep.
+const HOME_PRESET_ID: u8 = 0;
 
 async fn relative_zoom(cam: &Arc<CameraEntry>, delta: f32) -> Result<()> {
     let zf = cam
@@ -746,18 +764,28 @@ fn parse_preset_id(token: &str) -> Option<u8> {
     token.strip_prefix("preset_").and_then(|s| s.parse().ok())
 }
 
+/// Pick a free preset slot for a `SetPreset` that didn't name one.
+///
+/// Skips [`HOME_PRESET_ID`] on the first pass: "save the current view as a new
+/// preset" should not silently redefine where `GotoHomePosition` goes. A client
+/// that actually means to move home can still say so, by passing `preset_0` or
+/// by calling `SetHomePosition`. Slot 0 is only handed out once every other
+/// slot is taken, so no preset capacity is lost.
 async fn allocate_preset_id(cam: &Arc<CameraEntry>) -> Result<u8> {
     let presets = cam
         .run(|c| Box::pin(async move { Ok(c.get_ptz_preset().await?) }))
         .await?;
     let used: std::collections::HashSet<u8> =
         presets.preset_list.preset.iter().map(|p| p.id).collect();
-    for id in 0u8..MAX_PRESETS {
-        if !used.contains(&id) {
-            return Ok(id);
-        }
-    }
-    anyhow::bail!("No free preset slots")
+    pick_free_preset_id(&used).ok_or_else(|| anyhow::anyhow!("No free preset slots"))
+}
+
+fn pick_free_preset_id(used: &std::collections::HashSet<u8>) -> Option<u8> {
+    let free = |id: &u8| !used.contains(id);
+    (0u8..MAX_PRESETS)
+        .filter(|id| *id != HOME_PRESET_ID)
+        .find(free)
+        .or_else(|| free(&HOME_PRESET_ID).then_some(HOME_PRESET_ID))
 }
 
 fn other_fault(e: anyhow::Error) -> FaultBody {
@@ -927,6 +955,39 @@ mod tests {
     fn stop_pan_tilt_only() {
         let xml = r#"<tptz:Stop xmlns:tptz="x"><tptz:ProfileToken>foo</tptz:ProfileToken><tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>false</tptz:Zoom></tptz:Stop>"#;
         assert_eq!(parse_stop_flags(xml), (true, false));
+    }
+
+    /// The Reolink protocol has no fixed home — home is preset 0, an ordinary
+    /// writable slot — so the node must not claim otherwise. Claiming a fixed
+    /// home while `SetPreset` on `preset_0` can rewrite it is exactly the kind
+    /// of untrue advertisement this service is supposed to stop making.
+    #[test]
+    fn home_is_not_advertised_as_fixed() {
+        let xml = render_ptz_node("cam", &FULL);
+        assert!(xml.contains("FixedHomePosition=\"false\""), "{}", xml);
+        assert!(xml.contains("<tt:HomeSupported>true</tt:HomeSupported>"));
+    }
+
+    /// "Save this view as a new preset" must not quietly redefine where the
+    /// home button goes.
+    #[test]
+    fn auto_allocation_leaves_the_home_slot_alone() {
+        let empty = std::collections::HashSet::new();
+        assert_eq!(pick_free_preset_id(&empty), Some(1));
+
+        let used: std::collections::HashSet<u8> = (1u8..5).collect();
+        assert_eq!(pick_free_preset_id(&used), Some(5));
+    }
+
+    /// ...but the slot isn't wasted: it is still handed out once nothing else
+    /// is left, so the camera keeps all 64 usable presets.
+    #[test]
+    fn the_home_slot_is_the_last_resort_not_a_reservation() {
+        let used: std::collections::HashSet<u8> = (1u8..MAX_PRESETS).collect();
+        assert_eq!(pick_free_preset_id(&used), Some(HOME_PRESET_ID));
+
+        let all: std::collections::HashSet<u8> = (0u8..MAX_PRESETS).collect();
+        assert_eq!(pick_free_preset_id(&all), None);
     }
 
     #[test]

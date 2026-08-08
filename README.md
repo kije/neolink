@@ -1025,7 +1025,7 @@ name = "driveway"
 |---|---|
 | Device | `GetDeviceInformation`, `GetSystemDateAndTime`, `GetCapabilities`, `GetServices`, `GetServiceCapabilities`, `GetHostname`, `GetScopes` |
 | Media  | `GetProfiles`, `GetProfile`, `GetStreamUri`, `GetSnapshotUri`, `GetVideoSources`, `GetVideoEncoderConfigurations` |
-| PTZ    | `GetNodes`, `GetConfigurations`, `GetConfigurationOptions`, `ContinuousMove`, `RelativeMove`, `AbsoluteMove` (zoom only), `Stop`, `GetStatus`, `GetPresets`, `GotoPreset`, `SetPreset`, `GotoHomePosition` |
+| PTZ    | `GetNodes`, `GetConfigurations`, `GetConfigurationOptions`, `ContinuousMove`, `RelativeMove`, `AbsoluteMove` (zoom only), `Stop`, `GetStatus`, `GetPresets`, `GotoPreset`, `SetPreset`, `GotoHomePosition`, `SetHomePosition` |
 | Events | `GetEventProperties`, `CreatePullPointSubscription`, `Subscribe`, `PullMessages`, `Renew`, `Unsubscribe` |
 
 The Events service publishes the same topics a Reolink camera publishes
@@ -1058,7 +1058,13 @@ description-shaped response says:
 | no PTZ at all (fixed mount, no zoom, or an account without the PTZ `control` permission) | `GetCapabilities`/`GetServices` list no PTZ address, `GetScopes` and WS-Discovery drop `onvif://www.onvif.org/type/ptz`, and media profiles carry no `PTZConfiguration` |
 | pan/tilt but no optical zoom (E1 Pro, most pan/tilt models) | the PTZ node advertises only the continuous pan/tilt space; zoom moves return `ter:NoContinuousZoomSpace` / `ter:NoRelativeZoomSpace` / `ter:NoAbsoluteZoomSpace` |
 | optical zoom but no pan/tilt | the node advertises only the zoom spaces; pan/tilt moves return `ter:NoContinuousPanTiltSpace` / `ter:NoRelativePanTiltSpace` |
-| no preset support | `MaximumNumberOfPresets` is `0`, `HomeSupported` is `false`, and `GotoPreset`/`SetPreset`/`GotoHomePosition` return `ter:ActionNotSupported` |
+| no preset support | `MaximumNumberOfPresets` is `0`, `HomeSupported` is `false`, and `GotoPreset`/`SetPreset`/`GotoHomePosition`/`SetHomePosition` return `ter:ActionNotSupported` |
+
+The home position is preset 0 — the Reolink protocol has no separate home slot —
+so the node reports `FixedHomePosition="false"` and `SetHomePosition` writes
+that preset. `SetPreset` without a token allocates from preset 1 upwards, so
+saving a new preset never silently moves where the home button goes; slot 0 is
+still handed out once every other slot is full.
 
 The point is that a client only offers controls that work: Home Assistant
 draws its PTZ pad from the profile's `PTZConfiguration`, and Frigate decides
