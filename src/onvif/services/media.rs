@@ -7,7 +7,9 @@ use neolink_core::bc_protocol::BcCamera;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use crate::onvif::capabilities::{capabilities, CameraCapabilities};
 use crate::onvif::services::device::FaultBody;
+use crate::onvif::services::ptz::render_ptz_configuration_xml;
 use crate::onvif::soap::{wrap_envelope, xml_escape, FaultCode, NS_ALL};
 use crate::onvif::state::{url_path_segment, CameraEntry, OnvifState, OnvifStream};
 
@@ -86,9 +88,6 @@ fn video_source_token(cam: &str) -> String {
 fn video_encoder_token(cam: &str, s: OnvifStream) -> String {
     format!("vec_{}_{}", cam, s.token_suffix())
 }
-fn ptz_config_token(cam: &str) -> String {
-    format!("ptz_{cam}")
-}
 
 fn render_video_source_configuration(cam: &CameraEntry, descs: &[StreamDesc]) -> String {
     // Bounds = main stream resolution if available, otherwise the first.
@@ -134,27 +133,12 @@ fn render_video_encoder_configuration(cam_name: &str, d: &StreamDesc) -> String 
     )
 }
 
-fn render_ptz_configuration(cam: &CameraEntry) -> String {
-    format!(
-        "<tt:PTZConfiguration token=\"{tok}\">\
-<tt:Name>{name}</tt:Name>\
-<tt:UseCount>1</tt:UseCount>\
-<tt:NodeToken>ptz_node_{cam_name}</tt:NodeToken>\
-<tt:DefaultContinuousPanTiltVelocitySpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:DefaultContinuousPanTiltVelocitySpace>\
-<tt:DefaultContinuousZoomVelocitySpace>http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace</tt:DefaultContinuousZoomVelocitySpace>\
-<tt:DefaultPTZSpeed>\
-<tt:PanTilt x=\"0.5\" y=\"0.5\" space=\"http://www.onvif.org/ver10/tptz/PanTiltSpaces/GenericSpeedSpace\"/>\
-<tt:Zoom x=\"0.5\" space=\"http://www.onvif.org/ver10/tptz/ZoomSpaces/ZoomGenericSpeedSpace\"/>\
-</tt:DefaultPTZSpeed>\
-<tt:DefaultPTZTimeout>PT5S</tt:DefaultPTZTimeout>\
-</tt:PTZConfiguration>",
-        tok = ptz_config_token(&cam.name),
-        name = xml_escape(&format!("{}_ptz", cam.name)),
-        cam_name = xml_escape(&cam.name),
-    )
-}
-
-async fn render_profile(cam: &CameraEntry, d: &StreamDesc, vs_xml: &str, has_ptz: bool) -> String {
+fn render_profile(
+    cam: &CameraEntry,
+    d: &StreamDesc,
+    vs_xml: &str,
+    caps: &CameraCapabilities,
+) -> String {
     let token = profile_token(&cam.name, d.stream);
     let name = format!("{}_{}", cam.name, d.stream.token_suffix());
     let mut out = format!(
@@ -165,18 +149,17 @@ async fn render_profile(cam: &CameraEntry, d: &StreamDesc, vs_xml: &str, has_ptz
     );
     out.push_str(vs_xml);
     out.push_str(&render_video_encoder_configuration(&cam.name, d));
-    if has_ptz {
-        out.push_str(&render_ptz_configuration(cam));
+    // A profile carries a PTZConfiguration only if the camera has something to
+    // move; clients key their PTZ UI off its presence.
+    if caps.ptz() {
+        out.push_str(&render_ptz_configuration_xml(
+            &cam.name,
+            caps,
+            "tt:PTZConfiguration",
+        ));
     }
     out.push_str("</trt:Profiles>");
     out
-}
-
-async fn has_ptz_capability(cam: &CameraEntry) -> bool {
-    cam.run(|c: &BcCamera| Box::pin(async move { Ok(c.get_abilityinfo().await?) }))
-        .await
-        .map(|info| info.ptz.is_some())
-        .unwrap_or(true) // Default to advertising PTZ — caller can ignore.
 }
 
 pub(crate) async fn dispatch(
@@ -186,15 +169,15 @@ pub(crate) async fn dispatch(
     body_xml: &str,
 ) -> Result<String, FaultBody> {
     let descs = read_stream_descs(cam).await;
-    let has_ptz = has_ptz_capability(cam).await;
+    let caps = capabilities(cam).await;
     let vs_xml = render_video_source_configuration(cam, &descs);
 
     let body = match action {
         "GetProfiles" => {
-            let mut profiles = String::new();
-            for d in &descs {
-                profiles.push_str(&render_profile(cam, d, &vs_xml, has_ptz).await);
-            }
+            let profiles: String = descs
+                .iter()
+                .map(|d| render_profile(cam, d, &vs_xml, &caps))
+                .collect();
             format!("<trt:GetProfilesResponse>{profiles}</trt:GetProfilesResponse>")
         }
         "GetProfile" => {
@@ -210,7 +193,7 @@ pub(crate) async fn dispatch(
                     code: FaultCode::InvalidArgs,
                     reason: format!("Unknown profile token '{token}'"),
                 })?;
-            let p = render_profile(cam, stream, &vs_xml, has_ptz).await;
+            let p = render_profile(cam, stream, &vs_xml, &caps);
             // The single-profile response uses `Profile` not `Profiles`.
             let p = p.replace("<trt:Profiles", "<trt:Profile")
                 .replace("</trt:Profiles>", "</trt:Profile>");
@@ -275,14 +258,23 @@ pub(crate) async fn dispatch(
                 uri = xml_escape(&uri),
             )
         }
-        "GetVideoSources" => format!(
-            "<trt:GetVideoSourcesResponse><tt:VideoSources token=\"vsrc_{cam}\">\
-<tt:Framerate>30</tt:Framerate><tt:Resolution><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:Resolution>\
+        "GetVideoSources" => {
+            // The source is the sensor, so describe it with the highest-fidelity
+            // stream the camera exposes rather than a fixed 1080p30.
+            let best = descs
+                .iter()
+                .find(|d| d.stream == OnvifStream::Main)
+                .or_else(|| descs.first());
+            format!(
+                "<trt:GetVideoSourcesResponse><tt:VideoSources token=\"vsrc_{cam}\">\
+<tt:Framerate>{fps}</tt:Framerate><tt:Resolution><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:Resolution>\
 </tt:VideoSources></trt:GetVideoSourcesResponse>",
-            cam = xml_escape(&cam.name),
-            w = descs.first().map(|d| d.width).unwrap_or(1920),
-            h = descs.first().map(|d| d.height).unwrap_or(1080),
-        ),
+                cam = xml_escape(&cam.name),
+                fps = best.map(|d| d.framerate).unwrap_or(25),
+                w = best.map(|d| d.width).unwrap_or(1920),
+                h = best.map(|d| d.height).unwrap_or(1080),
+            )
+        }
         "GetVideoSourceConfigurations" => format!(
             "<trt:GetVideoSourceConfigurationsResponse>{vs}</trt:GetVideoSourceConfigurationsResponse>",
             vs = vs_xml.replace("<tt:VideoSourceConfiguration", "<trt:Configurations")
@@ -299,9 +291,17 @@ pub(crate) async fn dispatch(
                 .collect();
             format!("<trt:GetVideoEncoderConfigurationsResponse>{configs}</trt:GetVideoEncoderConfigurationsResponse>")
         }
-        "GetServiceCapabilities" => {
-            "<trt:GetServiceCapabilitiesResponse><trt:Capabilities SnapshotUri=\"true\" Rotation=\"false\" VideoSourceMode=\"false\" OSD=\"false\"><trt:ProfileCapabilities MaximumNumberOfProfiles=\"3\"/><trt:StreamingCapabilities RTPMulticast=\"false\" RTP_TCP=\"true\" RTP_RTSP_TCP=\"true\" NonAggregateControl=\"false\" NoRTSPStreaming=\"false\"/></trt:Capabilities></trt:GetServiceCapabilitiesResponse>".to_string()
-        }
+        "GetServiceCapabilities" => format!(
+            "<trt:GetServiceCapabilitiesResponse><trt:Capabilities SnapshotUri=\"true\" \
+Rotation=\"false\" VideoSourceMode=\"false\" OSD=\"false\">\
+<trt:ProfileCapabilities MaximumNumberOfProfiles=\"{n}\"/>\
+<trt:StreamingCapabilities RTPMulticast=\"false\" RTP_TCP=\"true\" RTP_RTSP_TCP=\"true\" \
+NonAggregateControl=\"false\" NoRTSPStreaming=\"false\"/>\
+</trt:Capabilities></trt:GetServiceCapabilitiesResponse>",
+            // The profiles are fixed and derived from the configured streams,
+            // so the maximum is however many we actually hand out.
+            n = descs.len(),
+        ),
         other => {
             return Err(FaultBody {
                 code: FaultCode::ActionNotSupported,

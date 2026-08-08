@@ -315,6 +315,16 @@ pub(crate) enum FaultCode {
     ActionNotSupported,
     InvalidArgs,
     NoAbsolutePtzSpace,
+    /// The per-operation "this camera has no such axis" faults from the PTZ
+    /// service spec. Returned when a client asks to move an axis the hardware
+    /// does not have — which, now that the PTZ node only advertises the spaces
+    /// the camera really supports, should only happen for a client that
+    /// ignored the node.
+    NoContinuousPanTiltSpace,
+    NoContinuousZoomSpace,
+    NoRelativePanTiltSpace,
+    NoRelativeZoomSpace,
+    NoAbsoluteZoomSpace,
     Other,
 }
 
@@ -324,7 +334,12 @@ impl FaultCode {
             FaultCode::NotAuthorized => "Sender",
             FaultCode::ActionNotSupported => "Receiver",
             FaultCode::InvalidArgs => "Sender",
-            FaultCode::NoAbsolutePtzSpace => "Sender",
+            FaultCode::NoAbsolutePtzSpace
+            | FaultCode::NoContinuousPanTiltSpace
+            | FaultCode::NoContinuousZoomSpace
+            | FaultCode::NoRelativePanTiltSpace
+            | FaultCode::NoRelativeZoomSpace
+            | FaultCode::NoAbsoluteZoomSpace => "Sender",
             FaultCode::Other => "Receiver",
         }
     }
@@ -334,6 +349,11 @@ impl FaultCode {
             FaultCode::ActionNotSupported => "ActionNotSupported",
             FaultCode::InvalidArgs => "InvalidArgs",
             FaultCode::NoAbsolutePtzSpace => "NoAbsolutePTZSpace",
+            FaultCode::NoContinuousPanTiltSpace => "NoContinuousPanTiltSpace",
+            FaultCode::NoContinuousZoomSpace => "NoContinuousZoomSpace",
+            FaultCode::NoRelativePanTiltSpace => "NoRelativePanTiltSpace",
+            FaultCode::NoRelativeZoomSpace => "NoRelativeZoomSpace",
+            FaultCode::NoAbsoluteZoomSpace => "NoAbsoluteZoomSpace",
             FaultCode::Other => "Action",
         }
     }

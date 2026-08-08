@@ -21,6 +21,7 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
+mod capabilities;
 mod cmdline;
 mod discovery;
 mod events;

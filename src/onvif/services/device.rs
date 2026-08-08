@@ -3,6 +3,7 @@
 use anyhow::Result;
 use neolink_core::bc_protocol::BcCamera;
 
+use crate::onvif::capabilities::capabilities;
 use crate::onvif::soap::{wrap_envelope, xml_escape, FaultCode, NS_ALL};
 use crate::onvif::state::{url_path_segment, CameraEntry, OnvifState};
 
@@ -102,7 +103,17 @@ pub(crate) async fn dispatch(
             let media = format!("http://{authority}/onvif/{cam_seg}/media_service");
             let ptz = format!("http://{authority}/onvif/{cam_seg}/ptz_service");
             let evt = format!("http://{authority}/onvif/{cam_seg}/events_service");
+            // A camera with no motor gets no PTZ service address at all. This
+            // is the switch most clients actually look at: Home Assistant and
+            // Frigate decide whether to offer PTZ controls from the presence
+            // of this entry, long before they ever call GetNodes.
+            let has_ptz = capabilities(cam).await.ptz();
             if action == "GetCapabilities" {
+                let ptz_xml = if has_ptz {
+                    format!("<tt:PTZ><tt:XAddr>{ptz}</tt:XAddr></tt:PTZ>")
+                } else {
+                    String::new()
+                };
                 format!(
                     "<tds:GetCapabilitiesResponse><tds:Capabilities>\
 <tt:Device><tt:XAddr>{dev}</tt:XAddr>\
@@ -111,16 +122,23 @@ pub(crate) async fn dispatch(
 </tt:Device>\
 <tt:Events><tt:XAddr>{evt}</tt:XAddr><tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport><tt:WSPullPointSupport>true</tt:WSPullPointSupport><tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport></tt:Events>\
 <tt:Media><tt:XAddr>{media}</tt:XAddr><tt:StreamingCapabilities><tt:RTPMulticast>false</tt:RTPMulticast><tt:RTP_TCP>true</tt:RTP_TCP><tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP></tt:StreamingCapabilities></tt:Media>\
-<tt:PTZ><tt:XAddr>{ptz}</tt:XAddr></tt:PTZ>\
+{ptz_xml}\
 </tds:Capabilities></tds:GetCapabilitiesResponse>"
                 )
             } else {
+                let ptz_xml = if has_ptz {
+                    format!(
+                        "<tds:Service><tds:Namespace>http://www.onvif.org/ver20/ptz/wsdl</tds:Namespace><tds:XAddr>{ptz}</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version></tds:Service>"
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
                     "<tds:GetServicesResponse>\
 <tds:Service><tds:Namespace>http://www.onvif.org/ver10/device/wsdl</tds:Namespace><tds:XAddr>{dev}</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version></tds:Service>\
 <tds:Service><tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace><tds:XAddr>{media}</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version></tds:Service>\
 <tds:Service><tds:Namespace>http://www.onvif.org/ver10/events/wsdl</tds:Namespace><tds:XAddr>{evt}</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version></tds:Service>\
-<tds:Service><tds:Namespace>http://www.onvif.org/ver20/ptz/wsdl</tds:Namespace><tds:XAddr>{ptz}</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version></tds:Service>\
+{ptz_xml}\
 </tds:GetServicesResponse>"
                 )
             }
@@ -143,6 +161,13 @@ pub(crate) async fn dispatch(
                 "onvif://www.onvif.org/hardware/neolink".to_string(),
                 format!("onvif://www.onvif.org/name/{}", scope_safe(&cam.name)),
             ];
+            // The PTZ scope has to track the same capability probe the rest of
+            // the device does, or a discovery-driven client and a
+            // GetCapabilities-driven one end up disagreeing about the same
+            // camera.
+            if capabilities(cam).await.ptz() {
+                scopes.push("onvif://www.onvif.org/type/ptz".to_string());
+            }
             // Add the model as a hardware scope if known.
             if let Ok(v) = cam
                 .run(|c| Box::pin(async move { Ok(c.version().await?) }))
