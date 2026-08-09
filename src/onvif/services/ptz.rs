@@ -656,11 +656,43 @@ so the home position cannot be overwritten",
     Ok(wrap_envelope(&body, NS_ALL))
 }
 
+/// The order `tt:PTZSpaces` fixes for its children. It is an `xs:sequence`, so
+/// this is not a style preference: a space emitted out of turn makes the whole
+/// element fail schema validation, and a strict client (anything built on zeep,
+/// which includes Home Assistant's ONVIF integration) then loses the *entire*
+/// node — including the `MaximumNumberOfPresets`, `HomeSupported` and
+/// `FixedHomePosition` that tell it whether to offer presets and home at all.
+///
+/// Kept next to the renderer, and asserted by `spaces_follow_the_schema_order`,
+/// so adding a space later cannot quietly reintroduce the bug.
+#[cfg(test)]
+const PTZ_SPACES_SCHEMA_ORDER: &[&str] = &[
+    "AbsolutePanTiltPositionSpace",
+    "AbsoluteZoomPositionSpace",
+    "RelativePanTiltTranslationSpace",
+    "RelativeZoomTranslationSpace",
+    "ContinuousPanTiltVelocitySpace",
+    "ContinuousZoomVelocitySpace",
+    "PanTiltSpeedSpace",
+    "ZoomSpeedSpace",
+];
+
 /// The `tt:Spaces` / `tt:SupportedPTZSpaces` body, holding only the spaces the
 /// camera can actually be driven through. Shared by the PTZ node and the
 /// configuration options so the two can never disagree.
+///
+/// Emitted in [`PTZ_SPACES_SCHEMA_ORDER`], which is why the zoom spaces are
+/// split either side of the pan/tilt one rather than grouped by axis.
 fn render_supported_spaces(caps: &CameraCapabilities) -> String {
     let mut out = String::new();
+    if caps.zoom {
+        out.push_str(&format!(
+            "<tt:AbsoluteZoomPositionSpace>\
+<tt:URI>{ABSOLUTE_ZOOM_SPACE}</tt:URI>\
+<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
+</tt:AbsoluteZoomPositionSpace>"
+        ));
+    }
     if caps.pan_tilt {
         out.push_str(&format!(
             "<tt:ContinuousPanTiltVelocitySpace>\
@@ -675,11 +707,27 @@ fn render_supported_spaces(caps: &CameraCapabilities) -> String {
             "<tt:ContinuousZoomVelocitySpace>\
 <tt:URI>{CONTINUOUS_ZOOM_SPACE}</tt:URI>\
 <tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
-</tt:ContinuousZoomVelocitySpace>\
-<tt:AbsoluteZoomPositionSpace>\
-<tt:URI>{ABSOLUTE_ZOOM_SPACE}</tt:URI>\
+</tt:ContinuousZoomVelocitySpace>"
+        ));
+    }
+    // The speed spaces the `DefaultPTZSpeed` in every `PTZConfiguration` points
+    // at. Without them that configuration names a space this node never
+    // declared, which is the same kind of unbacked claim the capability probe
+    // exists to remove.
+    if caps.pan_tilt {
+        out.push_str(&format!(
+            "<tt:PanTiltSpeedSpace>\
+<tt:URI>{PT_SPEED_SPACE}</tt:URI>\
 <tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
-</tt:AbsoluteZoomPositionSpace>"
+</tt:PanTiltSpeedSpace>"
+        ));
+    }
+    if caps.zoom {
+        out.push_str(&format!(
+            "<tt:ZoomSpeedSpace>\
+<tt:URI>{ZOOM_SPEED_SPACE}</tt:URI>\
+<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
+</tt:ZoomSpeedSpace>"
         ));
     }
     out
@@ -939,6 +987,65 @@ mod tests {
         let xml = render_ptz_node("cam", &ZOOM_ONLY);
         assert!(xml.contains("<tt:MaximumNumberOfPresets>0</tt:MaximumNumberOfPresets>"));
         assert!(xml.contains("<tt:HomeSupported>false</tt:HomeSupported>"));
+    }
+
+    /// `tt:PTZSpaces` is an `xs:sequence`, so the spaces have to come out in
+    /// the schema's order for the element to validate. Getting this wrong costs
+    /// the whole node on a strict client, which is where a VMS reads whether
+    /// presets and the home position exist — so it is worth a test that does
+    /// not depend on remembering the order by hand.
+    #[test]
+    fn spaces_follow_the_schema_order() {
+        for caps in [FULL, PT_ONLY, ZOOM_ONLY, READ_ONLY_PRESETS] {
+            let xml = render_supported_spaces(&caps);
+            let emitted: Vec<usize> = PTZ_SPACES_SCHEMA_ORDER
+                .iter()
+                .enumerate()
+                .filter(|(_, space)| xml.contains(&format!("<tt:{space}>")))
+                .map(|(i, _)| i)
+                .collect();
+            // Every space the renderer emitted, in the order it emitted them.
+            let mut seen: Vec<usize> = Vec::new();
+            let mut rest = xml.as_str();
+            while let Some(open) = rest.find("<tt:") {
+                rest = &rest[open + 4..];
+                let end = rest.find('>').unwrap_or(rest.len());
+                let name = &rest[..end];
+                if let Some(i) = PTZ_SPACES_SCHEMA_ORDER.iter().position(|s| *s == name) {
+                    seen.push(i);
+                }
+            }
+            assert_eq!(
+                seen, emitted,
+                "spaces are out of schema order for {:?}: {}",
+                caps, xml
+            );
+        }
+    }
+
+    /// Every space URI the configuration nominates as a default has to be one
+    /// the node actually declares, or the configuration points at nothing.
+    #[test]
+    fn default_spaces_are_declared_by_the_node() {
+        for caps in [FULL, PT_ONLY, ZOOM_ONLY] {
+            let spaces = render_supported_spaces(&caps);
+            let cfg = render_ptz_configuration_xml("cam", &caps, "tt:PTZConfiguration");
+            for uri in [
+                CONTINUOUS_PT_SPACE,
+                CONTINUOUS_ZOOM_SPACE,
+                PT_SPEED_SPACE,
+                ZOOM_SPEED_SPACE,
+            ] {
+                if cfg.contains(uri) {
+                    assert!(
+                        spaces.contains(uri),
+                        "configuration defaults to {} but the node never declares it: {}",
+                        uri,
+                        spaces
+                    );
+                }
+            }
+        }
     }
 
     /// The node and the configuration options describe the same hardware, so

@@ -1076,6 +1076,14 @@ The point is that a client only offers controls that work: Home Assistant
 draws its PTZ pad from the profile's `PTZConfiguration`, and Frigate decides
 whether to show presets from `MaximumNumberOfPresets`.
 
+For that to reach the client at all, the descriptions have to parse. `tt:PTZSpaces`
+is an `xs:sequence`, so the supported spaces are emitted in the order the ONVIF
+schema fixes (absolute, then relative, then continuous, then the speed spaces) —
+not grouped by axis. A space out of turn invalidates the whole `PTZNode`, and a
+strict client then loses `MaximumNumberOfPresets`, `HomeSupported` and
+`FixedHomePosition` along with it. The `PTZConfiguration`'s `DefaultPTZSpeed`
+likewise names only speed spaces the node declares.
+
 Detection errs towards keeping a capability. A camera that is offline, or a
 firmware that omits one of these fields, leaves that signal *unknown*, and
 unknown means "advertise it" — the same behaviour as before this existed. A
