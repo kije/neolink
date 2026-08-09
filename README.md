@@ -1055,20 +1055,34 @@ description-shaped response says:
 
 | If the camera has… | …then |
 |---|---|
-| no PTZ at all (fixed mount, no zoom, or an account without the PTZ `control` permission) | `GetCapabilities`/`GetServices` list no PTZ address, `GetScopes` and WS-Discovery drop `onvif://www.onvif.org/type/ptz`, and media profiles carry no `PTZConfiguration` |
+| no PTZ at all (fixed mount, no zoom, or an account whose PTZ `control` permission is missing or read-only) | `GetCapabilities`/`GetServices` list no PTZ address, `GetScopes` and WS-Discovery drop `onvif://www.onvif.org/type/ptz`, and media profiles carry no `PTZConfiguration` |
 | pan/tilt but no optical zoom (E1 Pro, most pan/tilt models) | the PTZ node advertises only the continuous pan/tilt space; zoom moves return `ter:NoContinuousZoomSpace` / `ter:NoRelativeZoomSpace` / `ter:NoAbsoluteZoomSpace` |
 | optical zoom but no pan/tilt | the node advertises only the zoom spaces; pan/tilt moves return `ter:NoContinuousPanTiltSpace` / `ter:NoRelativePanTiltSpace` |
 | no preset support | `MaximumNumberOfPresets` is `0`, `HomeSupported` is `false`, and `GotoPreset`/`SetPreset`/`GotoHomePosition`/`SetHomePosition` return `ter:ActionNotSupported` |
+| presets the logged-in account may recall but not store (a `preset_ro` grant) | presets and home still work for *going to* a position; the node reports `FixedHomePosition="true"`, `SetPreset` returns `ter:ActionNotSupported` and `SetHomePosition` returns `ter:CannotOverwriteHome` |
 
 The home position is preset 0 — the Reolink protocol has no separate home slot —
-so the node reports `FixedHomePosition="false"` and `SetHomePosition` writes
-that preset. `SetPreset` without a token allocates from preset 1 upwards, so
-saving a new preset never silently moves where the home button goes; slot 0 is
-still handed out once every other slot is full.
+so `SetHomePosition` writes that preset, keeping whatever name the slot already
+had. `SetPreset` without a token allocates from preset 1 upwards, so saving a
+new preset never silently moves where the home button goes; slot 0 is still
+handed out once every other slot is full, and `SetPreset` reports
+`ter:TooManyPresets` when the table is genuinely full.
+
+`GotoHomePosition` before anything has been saved to slot 0 returns
+`ter:NoHomePosition` rather than a bare protocol error, so a client can tell
+"no home saved yet" apart from "the camera refused".
 
 The point is that a client only offers controls that work: Home Assistant
 draws its PTZ pad from the profile's `PTZConfiguration`, and Frigate decides
 whether to show presets from `MaximumNumberOfPresets`.
+
+For that to reach the client at all, the descriptions have to parse. `tt:PTZSpaces`
+is an `xs:sequence`, so the supported spaces are emitted in the order the ONVIF
+schema fixes (absolute, then relative, then continuous, then the speed spaces) —
+not grouped by axis. A space out of turn invalidates the whole `PTZNode`, and a
+strict client then loses `MaximumNumberOfPresets`, `HomeSupported` and
+`FixedHomePosition` along with it. The `PTZConfiguration`'s `DefaultPTZSpeed`
+likewise names only speed spaces the node declares.
 
 Detection errs towards keeping a capability. A camera that is offline, or a
 firmware that omits one of these fields, leaves that signal *unknown*, and
