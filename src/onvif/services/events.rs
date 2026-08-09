@@ -181,9 +181,14 @@ pub(crate) async fn dispatch_subscription(
 fn get_event_properties_xml() -> String {
     // The topic set mirrors what a Reolink camera natively advertises: plain
     // motion, the per-AI-type rule detectors, the smart-AI zone detector and
-    // audio (baby cry). The TopicNamespaceLocation is the canonical ONVIF
-    // topic-namespace URL; clients use it for documentation only — they don't
-    // need to fetch it.
+    // audio (baby cry). The one addition is
+    // `RuleEngine/CellMotionDetector/Motion`, the topic ONVIF standardised for
+    // motion: many VMS clients subscribe to nothing else, so a bridge that
+    // published only Reolink's native `VideoSource/MotionAlarm` would look
+    // motionless to them. Both are published together from the same state.
+    //
+    // The TopicNamespaceLocation is the canonical ONVIF topic-namespace URL;
+    // clients use it for documentation only — they don't need to fetch it.
     //
     // Note the client-supplied topic Filter is not applied: like a real
     // camera, every subscription receives every topic, and clients ignore the
@@ -243,6 +248,14 @@ fn get_event_properties_xml() -> String {
 </tt:MessageDescription>\
 </Package>\
 </MyRuleDetector>\
+<CellMotionDetector wstop:topic=\"false\">\
+<Motion wstop:topic=\"true\">\
+<tt:MessageDescription IsProperty=\"true\">\
+<tt:Source><tt:SimpleItemDescription Name=\"Source\" Type=\"tt:ReferenceToken\"/></tt:Source>\
+<tt:Data><tt:SimpleItemDescription Name=\"IsMotion\" Type=\"xsd:boolean\"/></tt:Data>\
+</tt:MessageDescription>\
+</Motion>\
+</CellMotionDetector>\
 <FieldDetector wstop:topic=\"false\">\
 <ObjectsInside wstop:topic=\"true\">\
 <tt:MessageDescription IsProperty=\"true\">\

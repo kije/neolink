@@ -233,8 +233,9 @@ impl EventsManager {
     /// `SetSynchronizationPoint`.
     pub(crate) async fn resync(&self, sub: &Arc<Subscription>) {
         if let Some(state) = *self.last_motion.lock().await {
-            let n = build_motion_notification(&self.cam_name, state, "Initialized");
-            sub.enqueue(n).await;
+            for n in build_motion_notifications(&self.cam_name, state, "Initialized") {
+                sub.enqueue(n).await;
+            }
         }
         for (key, state) in self.last_ai.lock().await.iter() {
             if let Some(n) = self.build_ai_key_notification(key, *state, "Initialized") {
@@ -408,10 +409,11 @@ impl EventsManager {
             }
             *last = Some(state);
         }
-        let n = build_motion_notification(&self.cam_name, state, op);
         let subs = self.subs.read().await.clone();
-        for s in subs.values() {
-            s.enqueue(n.clone()).await;
+        for n in build_motion_notifications(&self.cam_name, state, op) {
+            for s in subs.values() {
+                s.enqueue(n.clone()).await;
+            }
         }
     }
 }
@@ -424,14 +426,48 @@ fn mdstate_to_bool(s: MdState) -> Option<bool> {
     }
 }
 
+/// Motion is published on two topics, not one.
+///
+/// `tns1:VideoSource/MotionAlarm` is what a Reolink camera emits natively and
+/// what `reolink_aio` looks for. But a large part of the VMS world — Frigate's
+/// ONVIF path, Blue Iris, Synology Surveillance Station, Milestone, Agent DVR —
+/// only ever subscribes to `tns1:RuleEngine/CellMotionDetector/Motion`, because
+/// that is the topic ONVIF Profile S standardised for motion and what most
+/// non-Reolink cameras send. A bridge that publishes only the native topic is
+/// invisible to all of them.
+///
+/// Emitting both costs one extra queued message per state change and is what a
+/// camera supporting both profiles does. Clients that understand both see a
+/// consistent pair rather than a contradiction, since they are always published
+/// together from the same state.
+const MOTION_TOPICS: &[(&str, &str)] = &[
+    ("tns1:VideoSource/MotionAlarm", "State"),
+    ("tns1:RuleEngine/CellMotionDetector/Motion", "IsMotion"),
+];
+
+fn build_motion_notifications(cam_name: &str, state: bool, op: &'static str) -> Vec<Notification> {
+    MOTION_TOPICS
+        .iter()
+        .map(|&(topic, data_name)| Notification {
+            utc_time: Utc::now(),
+            topic,
+            source: vec![("Source", format!("vsrc_{cam_name}"))],
+            // The data item name differs between the two: `MotionAlarm`
+            // carries `State`, the cell-motion rule carries `IsMotion`.
+            // Clients look it up by name, so a shared name would make one of
+            // the two silently unreadable.
+            data: vec![(data_name, bool_value(state))],
+            property_op: op,
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn build_motion_notification(cam_name: &str, state: bool, op: &'static str) -> Notification {
-    Notification {
-        utc_time: Utc::now(),
-        topic: "tns1:VideoSource/MotionAlarm",
-        source: vec![("Source", format!("vsrc_{cam_name}"))],
-        data: vec![("State", bool_value(state))],
-        property_op: op,
-    }
+    build_motion_notifications(cam_name, state, op)
+        .into_iter()
+        .next()
+        .expect("there is always at least one motion topic")
 }
 
 fn bool_value(state: bool) -> String {
@@ -557,6 +593,41 @@ mod tests {
             mdstate_to_bool(MdState::Stop(Instant::now())),
             Some(false)
         ));
+    }
+
+    /// Motion has to reach both worlds: Reolink's native topic for
+    /// `reolink_aio`, and the ONVIF-standard cell-motion topic that Frigate,
+    /// Blue Iris, Synology and Milestone subscribe to instead.
+    #[test]
+    fn motion_is_published_on_both_topics() {
+        let ns = build_motion_notifications("cam", true, "Changed");
+        let topics: Vec<_> = ns.iter().map(|n| n.topic).collect();
+        assert_eq!(
+            topics,
+            vec![
+                "tns1:VideoSource/MotionAlarm",
+                "tns1:RuleEngine/CellMotionDetector/Motion"
+            ]
+        );
+        // Both describe the same state, so a client reading both can never see
+        // them disagree.
+        for n in &ns {
+            assert_eq!(n.data[0].1, "true");
+            assert_eq!(n.source[0], ("Source", "vsrc_cam".to_string()));
+            assert_eq!(n.property_op, "Changed");
+        }
+    }
+
+    /// Clients look the data item up by name, and the two topics use different
+    /// ones — sharing a name would make one of them silently unreadable.
+    #[test]
+    fn each_motion_topic_uses_its_own_data_item_name() {
+        let ns = build_motion_notifications("cam", false, "Initialized");
+        assert_eq!(ns[0].data[0].0, "State");
+        assert_eq!(ns[1].data[0].0, "IsMotion");
+        for n in &ns {
+            assert_eq!(n.data[0].1, "false");
+        }
     }
 
     #[test]

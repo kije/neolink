@@ -799,21 +799,24 @@ fn other_fault(e: anyhow::Error) -> FaultBody {
 mod tests {
     use super::*;
 
-    const FULL: CameraCapabilities = CameraCapabilities {
-        pan_tilt: true,
-        zoom: true,
-        presets: true,
-    };
-    const PT_ONLY: CameraCapabilities = CameraCapabilities {
-        pan_tilt: true,
-        zoom: false,
-        presets: true,
-    };
-    const ZOOM_ONLY: CameraCapabilities = CameraCapabilities {
-        pan_tilt: false,
-        zoom: true,
-        presets: false,
-    };
+    /// PTZ rendering only reads the three motor fields. The rest are pinned to
+    /// values that keep the struct well formed and are never consulted here.
+    const fn caps(pan_tilt: bool, zoom: bool, presets: bool) -> CameraCapabilities {
+        CameraCapabilities {
+            pan_tilt,
+            zoom,
+            presets,
+            focus: false,
+            audio: true,
+            led_ctrl: true,
+            floodlight: false,
+            osd: true,
+        }
+    }
+
+    const FULL: CameraCapabilities = caps(true, true, true);
+    const PT_ONLY: CameraCapabilities = caps(true, false, true);
+    const ZOOM_ONLY: CameraCapabilities = caps(false, true, false);
 
     /// A fixed-lens pan/tilt camera must not offer a zoom space — clients read
     /// this list to decide which controls to draw.
@@ -888,11 +891,7 @@ mod tests {
 
     #[test]
     fn a_camera_with_nothing_gets_an_empty_space_list() {
-        let none = CameraCapabilities {
-            pan_tilt: false,
-            zoom: false,
-            presets: false,
-        };
+        let none = caps(false, false, false);
         assert_eq!(render_supported_spaces(&none), "");
     }
 

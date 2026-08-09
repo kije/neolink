@@ -26,7 +26,8 @@ features not yet in upstream master.
 **Major Features**:
 
 - MQTT
-- ONVIF (Profile S — device discovery, RTSP/snapshot URI hand-off, PTZ)
+- ONVIF (Profile S — device discovery, RTSP/snapshot URI hand-off, audio, PTZ,
+  events, imaging, and switches for the floodlight/siren/LEDs)
 - Motion Detection
 - Paused Streams (when no rtsp client or no motion detected)
 - Save a still image to disk
@@ -1023,17 +1024,71 @@ name = "driveway"
 
 | ONVIF service | Operations |
 |---|---|
-| Device | `GetDeviceInformation`, `GetSystemDateAndTime`, `GetCapabilities`, `GetServices`, `GetServiceCapabilities`, `GetHostname`, `GetScopes` |
-| Media  | `GetProfiles`, `GetProfile`, `GetStreamUri`, `GetSnapshotUri`, `GetVideoSources`, `GetVideoEncoderConfigurations` |
+| Device | `GetDeviceInformation`, `GetSystemDateAndTime`, `SetSystemDateAndTime`, `GetCapabilities`, `GetServices`, `GetServiceCapabilities`, `GetHostname`, `GetScopes`, `GetNetworkInterfaces`, `GetUsers`, `GetEndpointReference`, `GetWsdlUrl`, `GetRelayOutputs`, `GetRelayOutputOptions`, `SetRelayOutputState`, `SystemReboot` |
+| Media  | `GetProfiles`, `GetProfile`, `GetStreamUri`, `GetSnapshotUri`, `GetVideoSources`, `GetVideoSourceConfigurations`, `GetVideoEncoderConfigurations`, `GetVideoEncoderConfiguration`, `GetVideoEncoderConfigurationOptions`, `GetAudioSources`, `GetAudioSourceConfigurations`, `GetAudioEncoderConfigurations`, `GetAudioEncoderConfigurationOptions`, `GetOSDs`, `GetOSD`, `GetOSDOptions`, `SetOSD` |
 | PTZ    | `GetNodes`, `GetConfigurations`, `GetConfigurationOptions`, `ContinuousMove`, `RelativeMove`, `AbsoluteMove` (zoom only), `Stop`, `GetStatus`, `GetPresets`, `GotoPreset`, `SetPreset`, `GotoHomePosition`, `SetHomePosition` |
-| Events | `GetEventProperties`, `CreatePullPointSubscription`, `Subscribe`, `PullMessages`, `Renew`, `Unsubscribe` |
+| Imaging | `GetImagingSettings`, `SetImagingSettings` (IR cut filter), `GetOptions`, `GetMoveOptions`, `Move`, `Stop`, `GetStatus` (focus) |
+| Events | `GetEventProperties`, `CreatePullPointSubscription`, `Subscribe`, `PullMessages`, `Renew`, `Unsubscribe`, `SetSynchronizationPoint` |
 
-The Events service publishes the same topics a Reolink camera publishes
-natively, so a VMS sees the bridge as it would see the camera:
+##### Audio
+
+When the camera reports a microphone, each media profile carries an
+`AudioSourceConfiguration` and an `AudioEncoderConfiguration` describing the
+AAC track the RTSP server already serves. This is what a VMS reads to decide
+whether to request audio at all — without it Frigate, Synology and Milestone
+pull video only, even though the RTSP URL carries sound. A camera with no
+microphone reports empty audio lists rather than a fault.
+
+##### Switches (relay outputs)
+
+The floodlight, siren and LEDs are exposed as ONVIF **relay outputs**, which is
+the only device-level actuator ONVIF has and which clients render generically —
+Home Assistant turns each into a switch entity.
+
+| Token | Drives | Mode |
+|---|---|---|
+| `relay_floodlight` | The floodlight / spotlight | Bistable |
+| `relay_siren` | The alarm siren (fires once) | Monostable |
+| `relay_ir_illuminator` | The IR illuminator — **active is `auto`**, inactive is off, matching Home Assistant's Reolink integration | Bistable |
+| `relay_status_led` | The status light on the camera front | Bistable |
+
+Each is gated on the capability probe below, so a camera without a floodlight
+gets no floodlight switch. Only the siren is always offered: the `Support`
+table has no field that rules a speaker out.
+
+##### Imaging
+
+The Baichuan protocol exposes almost nothing of the ISP — there is no
+brightness, contrast or saturation message — so the Imaging service carries
+only the two controls that exist behind it: the **IR cut filter** and the
+**focus motor**. A camera with neither gets no Imaging service address.
+
+Note that `IrCutFilter` is deliberately inverted relative to the camera's own
+field: ONVIF describes the *filter* (`ON` = filter engaged = daylight), Reolink
+describes the *illuminator* (`open` = IR LEDs lit = night). So ONVIF `ON` maps
+to Reolink `close` and ONVIF `OFF` to Reolink `open`.
+
+Continuous focus moves are not offered: the camera has no message to stop the
+lens mid-travel, so only bounded `Absolute` and `Relative` moves are advertised.
+
+##### OSD
+
+`SystemGeneral` carries exactly two things that appear on screen, so exactly two
+OSDs are exposed: a `Text` one holding the camera's display name and a
+`DateAndTime` one holding the date format (`dd/MM/yyyy`, `MM/dd/yyyy` or
+`yyyy/MM/dd`). Both are writable through `SetOSD`. There is no position, colour
+or font control because the protocol has no message for any of it.
+
+##### Events
+
+The Events service publishes the topics a Reolink camera publishes natively —
+so a VMS sees the bridge as it would see the camera — plus the ONVIF-standard
+motion topic, which many clients subscribe to *instead*:
 
 | Topic | Meaning |
 |---|---|
-| `tns1:VideoSource/MotionAlarm` | Motion |
+| `tns1:VideoSource/MotionAlarm` | Motion (Reolink's native topic) |
+| `tns1:RuleEngine/CellMotionDetector/Motion` | The same motion, on the topic ONVIF standardised. Frigate, Blue Iris, Synology, Milestone and Agent DVR subscribe to this one and to nothing else, so both are published together from the same state |
 | `tns1:RuleEngine/MyRuleDetector/PeopleDetect` | Person detected |
 | `tns1:RuleEngine/MyRuleDetector/VehicleDetect` | Vehicle detected |
 | `tns1:RuleEngine/MyRuleDetector/DogCatDetect` | Pet detected |
@@ -1050,12 +1105,16 @@ detections show up as binary sensors without any extra configuration.
 
 What the bridge advertises is probed from the camera, not assumed. On first
 use (and every five minutes after) each camera is asked for its `Support`
-table, its ability list and its zoom range, and the answer decides what every
-description-shaped response says:
+table, its ability list, its zoom/focus range and its floodlight configuration,
+and the answer decides what every description-shaped response says:
 
 | If the camera has… | …then |
 |---|---|
 | no PTZ at all (fixed mount, no zoom, or an account without the PTZ `control` permission) | `GetCapabilities`/`GetServices` list no PTZ address, `GetScopes` and WS-Discovery drop `onvif://www.onvif.org/type/ptz`, and media profiles carry no `PTZConfiguration` |
+| no microphone | media profiles carry no audio configurations, and the audio getters return empty lists |
+| no floodlight | no `relay_floodlight` relay output |
+| no LED control | no IR/status-LED relay outputs, and no `IrCutFilter` in the Imaging service |
+| no focus motor and no LED control | no Imaging service address at all |
 | pan/tilt but no optical zoom (E1 Pro, most pan/tilt models) | the PTZ node advertises only the continuous pan/tilt space; zoom moves return `ter:NoContinuousZoomSpace` / `ter:NoRelativeZoomSpace` / `ter:NoAbsoluteZoomSpace` |
 | optical zoom but no pan/tilt | the node advertises only the zoom spaces; pan/tilt moves return `ter:NoContinuousPanTiltSpace` / `ter:NoRelativePanTiltSpace` |
 | no preset support | `MaximumNumberOfPresets` is `0`, `HomeSupported` is `false`, and `GotoPreset`/`SetPreset`/`GotoHomePosition`/`SetHomePosition` return `ter:ActionNotSupported` |
@@ -1078,7 +1137,14 @@ Run with `RUST_LOG=neolink::onvif=debug` to see what was probed and decided.
 
 `GetSnapshotUri` returns `http://<host>:<onvif_port>/onvif/<camera>/snapshot/<stream>`;
 that URL serves a JPEG produced by Reolink's `SNAP` command (HTTP Basic auth,
-using the same `[[users]]` table).
+using the same `[[users]]` table). The BC snapshot command has no stream
+selector, so every profile's snapshot URI returns the same main-stream image.
+
+`GetSystemDateAndTime` reports the **camera's** clock, not the bridge's, and
+`SetSystemDateAndTime` writes it (preserving the camera's configured time
+zone). Because that operation is on the ONVIF pre-auth whitelist, the reading
+is sampled at most once a minute and advanced from the bridge clock in between,
+so an unauthenticated client cannot turn polling into camera traffic.
 
 `GetStreamUri` returns the existing neolink RTSP URL, so the ONVIF client
 ends up streaming through the regular RTSP server.
@@ -1105,6 +1171,18 @@ ONVIF spec: `GetSystemDateAndTime`, `GetCapabilities`, `GetServices`,
   camera, every subscription receives every topic.
 - **No HTTPS yet** on the ONVIF port. Run behind a TLS-terminating reverse
   proxy if you need it.
+- **No two-way audio over ONVIF.** `neolink talk` works, but the ONVIF
+  backchannel (Profile T) needs an RTSP `Require:
+  www.onvif.org/ver20/backchannel` handshake the RTSP server does not
+  implement yet.
+- **Encoder settings are read-only.** `GetVideoEncoderConfigurationOptions`
+  reports the camera's real resolution, framerate and bitrate tables, but
+  `SetVideoEncoderConfiguration` is not implemented — the Baichuan protocol has
+  no message to write the encode table back.
+- **No recording playback** (Profile G / `Replay`). The protocol's
+  recording-search messages have not been reverse-engineered.
+- **No ISP controls** beyond the IR cut filter: brightness, contrast and
+  saturation have no Baichuan message.
 
 #### Deployment — file descriptor limit
 
