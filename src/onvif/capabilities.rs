@@ -20,9 +20,12 @@
 //!    optical zoom, full stop. This is measured, not declared, so it wins.
 //! 2. `Support` — the camera's own feature table: `ptzMode` (`"pt"`, `"ptz"`,
 //!    ...) plus the per-channel `ptzControl` / `ptzType` / `ptzPreset` flags.
-//! 3. `AbilityInfo` — whether the *logged-in user* holds the PTZ `control`
-//!    ability. Every `BcCamera` PTZ call gates on it, so without it nothing we
-//!    advertise could work regardless of the hardware.
+//! 3. `AbilityInfo` — which PTZ abilities the *logged-in user* holds, and at
+//!    what access level. Every `BcCamera` PTZ call gates on `control` being
+//!    read/write, so without that nothing we advertise could work regardless
+//!    of the hardware. The `preset` ability is granted separately, and an
+//!    account that holds it read-only may recall stored positions but not
+//!    redefine them — including the home position, which is a preset slot.
 //!
 //! # Being wrong in the safe direction
 //!
@@ -59,8 +62,13 @@ pub(crate) struct CameraCapabilities {
     pub(crate) pan_tilt: bool,
     /// The camera has an optical zoom.
     pub(crate) zoom: bool,
-    /// The camera can store and recall PTZ presets.
+    /// The camera can recall stored PTZ presets.
     pub(crate) presets: bool,
+    /// The logged-in user may also *write* the preset table — `SetPreset` and
+    /// `SetHomePosition`. Reolink hands out the preset ability separately from
+    /// the movement one, so an account can be allowed to drive the camera and
+    /// recall stored positions while being unable to redefine them.
+    pub(crate) preset_write: bool,
     /// The camera has a microphone, so the RTSP stream carries audio and the
     /// media profiles should describe an audio source and encoder.
     pub(crate) audio: bool,
@@ -129,6 +137,9 @@ pub(crate) struct Probe {
     pub(crate) support_presets: Option<bool>,
     /// `AbilityInfo`: the logged-in user holds the PTZ `control` ability.
     pub(crate) ability_control: Option<bool>,
+    /// `AbilityInfo`: the user's `preset` ability is read/write rather than
+    /// read-only.
+    pub(crate) ability_preset_write: Option<bool>,
     /// `GetZoomFocus`: the reported `(minPos, maxPos)` zoom range.
     pub(crate) zoom_range: Option<(u32, u32)>,
     /// `GetZoomFocus`: the reported `(minPos, maxPos)` focus range.
@@ -151,6 +162,7 @@ impl Probe {
             || self.support_mode.is_some()
             || self.support_presets.is_some()
             || self.ability_control.is_some()
+            || self.ability_preset_write.is_some()
             || self.zoom_range.is_some()
             || self.focus_range.is_some()
             || self.support_audio.is_some()
@@ -189,6 +201,7 @@ pub(crate) fn resolve(p: &Probe) -> CameraCapabilities {
             pan_tilt: false,
             zoom: false,
             presets: false,
+            preset_write: false,
             // A camera whose user cannot drive the motor cannot drive the
             // focus motor either — it is the same `control` ability.
             focus: false,
@@ -211,11 +224,15 @@ pub(crate) fn resolve(p: &Probe) -> CameraCapabilities {
     // A preset is a stored motor position, so it is only meaningful if some
     // motor exists — a camera that cannot move cannot recall a position.
     let presets = (pan_tilt || zoom) && p.support_presets.unwrap_or(true);
+    // Storing a preset is a separate permission from recalling one, and there
+    // is nothing to store into on a camera with no preset table at all.
+    let preset_write = presets && p.ability_preset_write.unwrap_or(true);
 
     CameraCapabilities {
         pan_tilt,
         zoom,
         presets,
+        preset_write,
         focus,
         audio,
         led_ctrl,
@@ -281,31 +298,67 @@ pub(crate) fn apply_support(p: &mut Probe, support: &Support, channel_id: u8) {
     }
 }
 
-/// Does the logged-in user hold the PTZ `control` ability? This is the same
-/// ability `send_ptz`, `zoom_to` and the preset calls all gate on, so a `false`
-/// here means every PTZ button in the client would return a fault.
-pub(crate) fn ptz_control_ability(info: &AbilityInfo, channel_id: u8) -> Option<bool> {
+/// How much of an ability the logged-in user holds. Reolink writes this as the
+/// suffix on each entry: `control_rw`, `preset_ro`.
+///
+/// Ordered, so two entries naming the same ability resolve to the more
+/// permissive one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Access {
+    /// The ability was not in the list at all.
+    #[default]
+    Absent,
+    /// `_ro`: may be read, may not be changed.
+    ReadOnly,
+    /// `_rw`: full access.
+    ReadWrite,
+}
+
+/// The PTZ abilities the logged-in user holds on one channel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PtzAbilities {
+    /// Driving the motors. `BcCamera`'s PTZ calls all require this read/write.
+    pub(crate) control: Access,
+    /// The preset table. Recalling a preset needs it at all; storing one needs
+    /// it read/write.
+    pub(crate) preset: Access,
+}
+
+/// Read the PTZ ability list for `channel_id` out of the camera's answer.
+///
+/// `None` means the camera told us nothing we could parse — never "the user
+/// holds nothing".
+pub(crate) fn ptz_abilities(info: &AbilityInfo, channel_id: u8) -> Option<PtzAbilities> {
     let Some(token) = info.ptz.as_ref() else {
         // The camera answered and listed no PTZ module at all.
-        return Some(false);
+        return Some(PtzAbilities::default());
     };
     let mut any = false;
-    let mut control = false;
+    let mut out = PtzAbilities::default();
     for sub in token
         .sub_module
         .iter()
         .filter(|s| s.channel_id.map(|c| c == channel_id).unwrap_or(true))
     {
         for entry in sub.ability_value.split(',') {
-            // Entries look like `control_rw` / `preset_ro`; we only care about
-            // the name half.
-            let name = entry.trim().split('_').next().unwrap_or("");
+            // Entries look like `control_rw` / `preset_ro`.
+            let mut parts = entry.trim().split('_');
+            let name = parts.next().unwrap_or("");
             if name.is_empty() {
                 continue;
             }
             any = true;
-            if name == "control" {
-                control = true;
+            let access = match parts.next() {
+                Some("rw") => Access::ReadWrite,
+                // A suffix we don't recognise still proves the ability exists.
+                // Read the weaker of the two out of it rather than inventing a
+                // write permission the camera may reject.
+                _ => Access::ReadOnly,
+            };
+            match name {
+                "control" => out.control = out.control.max(access),
+                "preset" => out.preset = out.preset.max(access),
+                _ => {}
             }
         }
     }
@@ -314,7 +367,27 @@ pub(crate) fn ptz_control_ability(info: &AbilityInfo, channel_id: u8) -> Option<
     if !any {
         return None;
     }
-    Some(control)
+    Some(out)
+}
+
+/// Can the logged-in user drive the motors? Every `BcCamera` PTZ call — moves,
+/// zoom, and both preset calls — goes through `has_ability_rw("control")`, so
+/// anything short of read/write here means every PTZ button in the client would
+/// return a fault.
+pub(crate) fn ptz_control_ability(info: &AbilityInfo, channel_id: u8) -> Option<bool> {
+    Some(ptz_abilities(info, channel_id)?.control == Access::ReadWrite)
+}
+
+/// May the logged-in user *store* presets, as opposed to only recalling them?
+///
+/// A firmware that enumerates PTZ abilities without naming `preset` at all is
+/// not telling us presets are read-only, so that stays unknown.
+pub(crate) fn ptz_preset_write_ability(info: &AbilityInfo, channel_id: u8) -> Option<bool> {
+    match ptz_abilities(info, channel_id)?.preset {
+        Access::Absent => None,
+        Access::ReadOnly => Some(false),
+        Access::ReadWrite => Some(true),
+    }
 }
 
 /// Per-camera cache. Lives on the `CameraEntry` so it survives config reloads
@@ -368,12 +441,13 @@ pub(crate) async fn capabilities(cam: &CameraEntry) -> CameraCapabilities {
     let changed = slot.as_ref().map(|e| e.caps) != Some(caps);
     if changed {
         log::debug!(
-            "ONVIF: camera {} capabilities: pan/tilt={} zoom={} presets={} focus={} \
-             audio={} led={} floodlight={} osd={} (from {probe:?})",
+            "ONVIF: camera {} capabilities: pan/tilt={} zoom={} presets={} \
+             preset_write={} focus={} audio={} led={} floodlight={} osd={} (from {probe:?})",
             cam.name,
             caps.pan_tilt,
             caps.zoom,
             caps.presets,
+            caps.preset_write,
             caps.focus,
             caps.audio,
             caps.led_ctrl,
@@ -405,7 +479,10 @@ async fn run_probe(cam: &CameraEntry) -> Probe {
         .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_abilityinfo().await?) }))
         .await
     {
-        Ok(info) => p.ability_control = ptz_control_ability(&info, channel_id),
+        Ok(info) => {
+            p.ability_control = ptz_control_ability(&info, channel_id);
+            p.ability_preset_write = ptz_preset_write_ability(&info, channel_id);
+        }
         Err(e) => log::debug!("ONVIF: camera {}: no AbilityInfo ({e})", cam.name),
     }
 
@@ -456,6 +533,7 @@ mod tests {
                 pan_tilt: true,
                 zoom: true,
                 presets: true,
+                preset_write: true,
                 audio: true,
                 led_ctrl: true,
                 osd: true,
@@ -689,8 +767,45 @@ mod tests {
             ..probe()
         });
         assert!(!caps.presets);
+        assert!(!caps.preset_write, "nothing to write into");
         assert!(caps.pan_tilt);
         assert!(caps.ptz(), "the PTZ service is still worth having");
+    }
+
+    /// A `preset_ro` account can jump to stored positions but not redefine
+    /// them, and the two must be advertised separately.
+    #[test]
+    fn recalling_and_storing_presets_are_separate_permissions() {
+        let caps = resolve(&Probe {
+            ability_preset_write: Some(false),
+            ..probe()
+        });
+        assert!(caps.presets);
+        assert!(!caps.preset_write);
+    }
+
+    #[test]
+    fn presets_are_writable_when_nothing_says_otherwise() {
+        assert!(resolve(&probe()).preset_write);
+        assert!(
+            resolve(&Probe {
+                ability_preset_write: Some(true),
+                ..probe()
+            })
+            .preset_write
+        );
+    }
+
+    /// A camera that cannot move at all cannot have a writable preset table
+    /// either, whatever the ability list says.
+    #[test]
+    fn preset_writes_need_a_preset_table() {
+        let caps = resolve(&Probe {
+            support_presets: Some(false),
+            ability_preset_write: Some(true),
+            ..probe()
+        });
+        assert!(!caps.preset_write);
     }
 
     #[test]
@@ -834,6 +949,80 @@ mod tests {
         assert_eq!(
             ptz_control_ability(&ability(Some(0), "preset_ro"), 0),
             Some(false)
+        );
+    }
+
+    /// Every `BcCamera` PTZ call demands `control` read/write, so a read-only
+    /// `control` grant moves nothing — advertising PTZ for it would be a lie.
+    #[test]
+    fn read_only_control_is_not_control() {
+        assert_eq!(
+            ptz_control_ability(&ability(Some(0), "control_ro, preset_rw"), 0),
+            Some(false)
+        );
+        assert!(!resolve(&Probe {
+            ability_control: Some(false),
+            ..probe()
+        })
+        .ptz());
+    }
+
+    #[test]
+    fn the_preset_ability_carries_its_own_read_write_kind() {
+        assert_eq!(
+            ptz_preset_write_ability(&ability(Some(0), "control_rw, preset_rw"), 0),
+            Some(true)
+        );
+        assert_eq!(
+            ptz_preset_write_ability(&ability(Some(0), "control_rw, preset_ro"), 0),
+            Some(false)
+        );
+    }
+
+    /// A firmware that enumerates PTZ abilities without naming `preset` is not
+    /// telling us presets are read-only.
+    #[test]
+    fn an_unlisted_preset_ability_is_unknown_not_read_only() {
+        assert_eq!(
+            ptz_preset_write_ability(&ability(Some(0), "control_rw"), 0),
+            None
+        );
+        assert_eq!(ptz_preset_write_ability(&ability(Some(0), ""), 0), None);
+    }
+
+    /// A camera that lists no PTZ module at all holds no preset ability
+    /// either, but that is already covered by losing `control`, so the write
+    /// flag stays unknown rather than pretending to be evidence.
+    #[test]
+    fn a_missing_ptz_token_leaves_the_preset_kind_unknown() {
+        assert_eq!(
+            ptz_preset_write_ability(&AbilityInfo::default(), 0),
+            None,
+            "no PTZ module means no PTZ at all, decided by `control`"
+        );
+    }
+
+    /// An unrecognised suffix proves the ability exists without proving it is
+    /// writable.
+    #[test]
+    fn an_unknown_access_suffix_reads_as_read_only() {
+        assert_eq!(
+            ptz_preset_write_ability(&ability(Some(0), "preset_wtf"), 0),
+            Some(false)
+        );
+    }
+
+    /// Duplicated entries resolve to the most permissive one rather than to
+    /// whichever happened to come last.
+    #[test]
+    fn the_strongest_grant_for_an_ability_wins() {
+        assert_eq!(
+            ptz_preset_write_ability(&ability(Some(0), "preset_ro, preset_rw"), 0),
+            Some(true)
+        );
+        assert_eq!(
+            ptz_preset_write_ability(&ability(Some(0), "preset_rw, preset_ro"), 0),
+            Some(true)
         );
     }
 

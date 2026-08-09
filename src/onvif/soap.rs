@@ -326,6 +326,13 @@ pub(crate) enum FaultCode {
     NoRelativePanTiltSpace,
     NoRelativeZoomSpace,
     NoAbsoluteZoomSpace,
+    /// `GotoHomePosition` on a camera whose home slot has never been written.
+    NoHomePosition,
+    /// `SetHomePosition` when the logged-in user may recall presets but not
+    /// store them.
+    CannotOverwriteHome,
+    /// `SetPreset` with no free slot left in the camera's preset table.
+    TooManyPresets,
     Other,
 }
 
@@ -341,6 +348,9 @@ impl FaultCode {
             | FaultCode::NoRelativePanTiltSpace
             | FaultCode::NoRelativeZoomSpace
             | FaultCode::NoAbsoluteZoomSpace => "Sender",
+            FaultCode::NoHomePosition
+            | FaultCode::CannotOverwriteHome
+            | FaultCode::TooManyPresets => "Receiver",
             FaultCode::Other => "Receiver",
         }
     }
@@ -355,6 +365,9 @@ impl FaultCode {
             FaultCode::NoRelativePanTiltSpace => "NoRelativePanTiltSpace",
             FaultCode::NoRelativeZoomSpace => "NoRelativeZoomSpace",
             FaultCode::NoAbsoluteZoomSpace => "NoAbsoluteZoomSpace",
+            FaultCode::NoHomePosition => "NoHomePosition",
+            FaultCode::CannotOverwriteHome => "CannotOverwriteHome",
+            FaultCode::TooManyPresets => "TooManyPresets",
             FaultCode::Other => "Action",
         }
     }

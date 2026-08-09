@@ -503,6 +503,30 @@ pub(crate) async fn dispatch(
                 reason: format!("Camera '{}' does not support PTZ presets", cam.name),
             });
         }
+        // Recalling a preset and redefining one are separate permissions on a
+        // Reolink camera. An account holding only `preset_ro` can drive the
+        // camera and jump to stored positions, and every attempt to store one
+        // is rejected by the camera — so say so here rather than letting the
+        // client discover it as an opaque protocol error.
+        "SetPreset" if !caps.preset_write => {
+            return Err(FaultBody {
+                code: FaultCode::ActionNotSupported,
+                reason: format!(
+                    "Camera '{}' does not allow this user to store PTZ presets",
+                    cam.name
+                ),
+            });
+        }
+        "SetHomePosition" if !caps.preset_write => {
+            return Err(FaultBody {
+                code: FaultCode::CannotOverwriteHome,
+                reason: format!(
+                    "Camera '{}' does not allow this user to store PTZ presets, \
+so the home position cannot be overwritten",
+                    cam.name
+                ),
+            });
+        }
         "GetPresets" => {
             let presets = cam
                 .run(|c| Box::pin(async move { Ok(c.get_ptz_preset().await?) }))
@@ -516,7 +540,7 @@ pub(crate) async fn dispatch(
                     format!(
                         "<tptz:Preset token=\"preset_{id}\"><tt:Name>{name}</tt:Name></tptz:Preset>",
                         id = p.id,
-                        name = xml_escape(p.name.as_deref().unwrap_or("")),
+                        name = preset_display_name(p.name.as_deref(), p.id),
                     )
                 })
                 .collect();
@@ -548,7 +572,7 @@ pub(crate) async fn dispatch(
             let token_opt = read_first_text_element(body_xml, "PresetToken");
             let id = match token_opt.as_deref().and_then(parse_preset_id) {
                 Some(id) => id,
-                None => allocate_preset_id(cam).await.map_err(other_fault)?,
+                None => allocate_preset_id(cam).await?,
             };
             let name_for_task = name.clone();
             cam.run(move |c| {
@@ -571,6 +595,21 @@ pub(crate) async fn dispatch(
             });
         }
         "GotoHomePosition" => {
+            // Preset 0 is only a home position once something has been stored
+            // in it. Asking the camera to move to an empty slot earns a bare
+            // protocol rejection; the spec has a fault that says exactly what
+            // is wrong, and clients can act on it (Home Assistant hides the
+            // home button, ODM reports it).
+            if home_preset(cam).await.map_err(other_fault)?.is_none() {
+                return Err(FaultBody {
+                    code: FaultCode::NoHomePosition,
+                    reason: format!(
+                        "Camera '{}' has no home position stored — save one first \
+(ONVIF SetHomePosition, or preset {HOME_PRESET_ID} in the Reolink app)",
+                        cam.name
+                    ),
+                });
+            }
             cam.run(|c| {
                 Box::pin(async move {
                     c.moveto_ptz_preset(HOME_PRESET_ID).await?;
@@ -585,9 +624,21 @@ pub(crate) async fn dispatch(
             // Home is preset 0 (see HOME_PRESET_ID), which is an ordinary
             // writable slot, so this is a plain preset write rather than the
             // fault a truly fixed home would justify.
-            cam.run(|c| {
+            //
+            // Writing a preset also writes its name, and slot 0 may already
+            // carry one the user chose in the Reolink app. Keep it: the client
+            // asked to move the home position, not to relabel it.
+            let name = home_preset(cam)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|p| p.name)
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| "home".to_string());
+            cam.run(move |c| {
+                let name = name.clone();
                 Box::pin(async move {
-                    c.set_ptz_preset(HOME_PRESET_ID, "home".to_string()).await?;
+                    c.set_ptz_preset(HOME_PRESET_ID, name).await?;
                     Ok(())
                 })
             })
@@ -605,11 +656,43 @@ pub(crate) async fn dispatch(
     Ok(wrap_envelope(&body, NS_ALL))
 }
 
+/// The order `tt:PTZSpaces` fixes for its children. It is an `xs:sequence`, so
+/// this is not a style preference: a space emitted out of turn makes the whole
+/// element fail schema validation, and a strict client (anything built on zeep,
+/// which includes Home Assistant's ONVIF integration) then loses the *entire*
+/// node — including the `MaximumNumberOfPresets`, `HomeSupported` and
+/// `FixedHomePosition` that tell it whether to offer presets and home at all.
+///
+/// Kept next to the renderer, and asserted by `spaces_follow_the_schema_order`,
+/// so adding a space later cannot quietly reintroduce the bug.
+#[cfg(test)]
+const PTZ_SPACES_SCHEMA_ORDER: &[&str] = &[
+    "AbsolutePanTiltPositionSpace",
+    "AbsoluteZoomPositionSpace",
+    "RelativePanTiltTranslationSpace",
+    "RelativeZoomTranslationSpace",
+    "ContinuousPanTiltVelocitySpace",
+    "ContinuousZoomVelocitySpace",
+    "PanTiltSpeedSpace",
+    "ZoomSpeedSpace",
+];
+
 /// The `tt:Spaces` / `tt:SupportedPTZSpaces` body, holding only the spaces the
 /// camera can actually be driven through. Shared by the PTZ node and the
 /// configuration options so the two can never disagree.
+///
+/// Emitted in [`PTZ_SPACES_SCHEMA_ORDER`], which is why the zoom spaces are
+/// split either side of the pan/tilt one rather than grouped by axis.
 fn render_supported_spaces(caps: &CameraCapabilities) -> String {
     let mut out = String::new();
+    if caps.zoom {
+        out.push_str(&format!(
+            "<tt:AbsoluteZoomPositionSpace>\
+<tt:URI>{ABSOLUTE_ZOOM_SPACE}</tt:URI>\
+<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
+</tt:AbsoluteZoomPositionSpace>"
+        ));
+    }
     if caps.pan_tilt {
         out.push_str(&format!(
             "<tt:ContinuousPanTiltVelocitySpace>\
@@ -624,11 +707,27 @@ fn render_supported_spaces(caps: &CameraCapabilities) -> String {
             "<tt:ContinuousZoomVelocitySpace>\
 <tt:URI>{CONTINUOUS_ZOOM_SPACE}</tt:URI>\
 <tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
-</tt:ContinuousZoomVelocitySpace>\
-<tt:AbsoluteZoomPositionSpace>\
-<tt:URI>{ABSOLUTE_ZOOM_SPACE}</tt:URI>\
+</tt:ContinuousZoomVelocitySpace>"
+        ));
+    }
+    // The speed spaces the `DefaultPTZSpeed` in every `PTZConfiguration` points
+    // at. Without them that configuration names a space this node never
+    // declared, which is the same kind of unbacked claim the capability probe
+    // exists to remove.
+    if caps.pan_tilt {
+        out.push_str(&format!(
+            "<tt:PanTiltSpeedSpace>\
+<tt:URI>{PT_SPEED_SPACE}</tt:URI>\
 <tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
-</tt:AbsoluteZoomPositionSpace>"
+</tt:PanTiltSpeedSpace>"
+        ));
+    }
+    if caps.zoom {
+        out.push_str(&format!(
+            "<tt:ZoomSpeedSpace>\
+<tt:URI>{ZOOM_SPEED_SPACE}</tt:URI>\
+<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>\
+</tt:ZoomSpeedSpace>"
         ));
     }
     out
@@ -698,7 +797,7 @@ StatusPosition=\"{status_position}\"/></tptz:GetServiceCapabilitiesResponse>",
 
 fn render_ptz_node(cam_name: &str, caps: &CameraCapabilities) -> String {
     format!(
-        "<tptz:PTZNode token=\"ptz_node_{cam_name}\" FixedHomePosition=\"false\">\
+        "<tptz:PTZNode token=\"ptz_node_{cam_name}\" FixedHomePosition=\"{fixed_home}\">\
 <tt:Name>{cam_name}_node</tt:Name>\
 <tt:SupportedPTZSpaces>{spaces}</tt:SupportedPTZSpaces>\
 <tt:MaximumNumberOfPresets>{presets}</tt:MaximumNumberOfPresets>\
@@ -710,7 +809,34 @@ fn render_ptz_node(cam_name: &str, caps: &CameraCapabilities) -> String {
         // exactly as available as presets are.
         presets = if caps.presets { MAX_PRESETS } else { 0 },
         home = caps.presets,
+        // Home lives in an ordinary preset slot, so it is fixed exactly when
+        // this user cannot write preset slots. A camera with no presets at all
+        // has no home to fix.
+        fixed_home = caps.presets && !caps.preset_write,
     )
+}
+
+/// The camera's current home preset, or `None` when nothing has ever been
+/// stored in [`HOME_PRESET_ID`].
+async fn home_preset(cam: &Arc<CameraEntry>) -> Result<Option<neolink_core::bc::xml::Preset>> {
+    let presets = cam
+        .run(|c| Box::pin(async move { Ok(c.get_ptz_preset().await?) }))
+        .await?;
+    Ok(presets
+        .preset_list
+        .preset
+        .into_iter()
+        .find(|p| p.id == HOME_PRESET_ID))
+}
+
+/// What to show a client for a preset. The camera can return a slot with an
+/// empty name; an unlabelled row is unusable in a VMS preset list, so fall back
+/// to the slot number rather than handing out a blank.
+fn preset_display_name(name: Option<&str>, id: u8) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => xml_escape(n),
+        None => format!("Preset {id}"),
+    }
 }
 
 /// Reolink's preset table is 64 slots wide (ids 0..=63).
@@ -771,13 +897,20 @@ fn parse_preset_id(token: &str) -> Option<u8> {
 /// that actually means to move home can still say so, by passing `preset_0` or
 /// by calling `SetHomePosition`. Slot 0 is only handed out once every other
 /// slot is taken, so no preset capacity is lost.
-async fn allocate_preset_id(cam: &Arc<CameraEntry>) -> Result<u8> {
+async fn allocate_preset_id(cam: &Arc<CameraEntry>) -> Result<u8, FaultBody> {
     let presets = cam
         .run(|c| Box::pin(async move { Ok(c.get_ptz_preset().await?) }))
-        .await?;
+        .await
+        .map_err(other_fault)?;
     let used: std::collections::HashSet<u8> =
         presets.preset_list.preset.iter().map(|p| p.id).collect();
-    pick_free_preset_id(&used).ok_or_else(|| anyhow::anyhow!("No free preset slots"))
+    pick_free_preset_id(&used).ok_or_else(|| FaultBody {
+        code: FaultCode::TooManyPresets,
+        reason: format!(
+            "Camera '{}' has no free preset slots — all {MAX_PRESETS} are in use",
+            cam.name
+        ),
+    })
 }
 
 fn pick_free_preset_id(used: &std::collections::HashSet<u8>) -> Option<u8> {
@@ -799,13 +932,20 @@ fn other_fault(e: anyhow::Error) -> FaultBody {
 mod tests {
     use super::*;
 
-    /// PTZ rendering only reads the three motor fields. The rest are pinned to
-    /// values that keep the struct well formed and are never consulted here.
-    const fn caps(pan_tilt: bool, zoom: bool, presets: bool) -> CameraCapabilities {
+    /// PTZ rendering reads only the four motor/preset fields. The rest are
+    /// pinned to values that keep the struct well formed and are never
+    /// consulted here.
+    const fn caps(
+        pan_tilt: bool,
+        zoom: bool,
+        presets: bool,
+        preset_write: bool,
+    ) -> CameraCapabilities {
         CameraCapabilities {
             pan_tilt,
             zoom,
             presets,
+            preset_write,
             focus: false,
             audio: true,
             led_ctrl: true,
@@ -814,9 +954,11 @@ mod tests {
         }
     }
 
-    const FULL: CameraCapabilities = caps(true, true, true);
-    const PT_ONLY: CameraCapabilities = caps(true, false, true);
-    const ZOOM_ONLY: CameraCapabilities = caps(false, true, false);
+    const FULL: CameraCapabilities = caps(true, true, true, true);
+    const PT_ONLY: CameraCapabilities = caps(true, false, true, true);
+    const ZOOM_ONLY: CameraCapabilities = caps(false, true, false, false);
+    /// A user who may recall stored positions but not redefine them.
+    const READ_ONLY_PRESETS: CameraCapabilities = caps(true, true, true, false);
 
     /// A fixed-lens pan/tilt camera must not offer a zoom space — clients read
     /// this list to decide which controls to draw.
@@ -847,6 +989,65 @@ mod tests {
         let xml = render_ptz_node("cam", &ZOOM_ONLY);
         assert!(xml.contains("<tt:MaximumNumberOfPresets>0</tt:MaximumNumberOfPresets>"));
         assert!(xml.contains("<tt:HomeSupported>false</tt:HomeSupported>"));
+    }
+
+    /// `tt:PTZSpaces` is an `xs:sequence`, so the spaces have to come out in
+    /// the schema's order for the element to validate. Getting this wrong costs
+    /// the whole node on a strict client, which is where a VMS reads whether
+    /// presets and the home position exist — so it is worth a test that does
+    /// not depend on remembering the order by hand.
+    #[test]
+    fn spaces_follow_the_schema_order() {
+        for caps in [FULL, PT_ONLY, ZOOM_ONLY, READ_ONLY_PRESETS] {
+            let xml = render_supported_spaces(&caps);
+            let emitted: Vec<usize> = PTZ_SPACES_SCHEMA_ORDER
+                .iter()
+                .enumerate()
+                .filter(|(_, space)| xml.contains(&format!("<tt:{space}>")))
+                .map(|(i, _)| i)
+                .collect();
+            // Every space the renderer emitted, in the order it emitted them.
+            let mut seen: Vec<usize> = Vec::new();
+            let mut rest = xml.as_str();
+            while let Some(open) = rest.find("<tt:") {
+                rest = &rest[open + 4..];
+                let end = rest.find('>').unwrap_or(rest.len());
+                let name = &rest[..end];
+                if let Some(i) = PTZ_SPACES_SCHEMA_ORDER.iter().position(|s| *s == name) {
+                    seen.push(i);
+                }
+            }
+            assert_eq!(
+                seen, emitted,
+                "spaces are out of schema order for {:?}: {}",
+                caps, xml
+            );
+        }
+    }
+
+    /// Every space URI the configuration nominates as a default has to be one
+    /// the node actually declares, or the configuration points at nothing.
+    #[test]
+    fn default_spaces_are_declared_by_the_node() {
+        for caps in [FULL, PT_ONLY, ZOOM_ONLY] {
+            let spaces = render_supported_spaces(&caps);
+            let cfg = render_ptz_configuration_xml("cam", &caps, "tt:PTZConfiguration");
+            for uri in [
+                CONTINUOUS_PT_SPACE,
+                CONTINUOUS_ZOOM_SPACE,
+                PT_SPEED_SPACE,
+                ZOOM_SPEED_SPACE,
+            ] {
+                if cfg.contains(uri) {
+                    assert!(
+                        spaces.contains(uri),
+                        "configuration defaults to {} but the node never declares it: {}",
+                        uri,
+                        spaces
+                    );
+                }
+            }
+        }
     }
 
     /// The node and the configuration options describe the same hardware, so
@@ -891,7 +1092,7 @@ mod tests {
 
     #[test]
     fn a_camera_with_nothing_gets_an_empty_space_list() {
-        let none = caps(false, false, false);
+        let none = caps(false, false, false, false);
         assert_eq!(render_supported_spaces(&none), "");
     }
 
@@ -965,6 +1166,45 @@ mod tests {
         let xml = render_ptz_node("cam", &FULL);
         assert!(xml.contains("FixedHomePosition=\"false\""), "{}", xml);
         assert!(xml.contains("<tt:HomeSupported>true</tt:HomeSupported>"));
+    }
+
+    /// ...but for a user who cannot write the preset table, home really is
+    /// fixed: they can go to it and cannot move it.
+    #[test]
+    fn home_is_fixed_when_presets_are_read_only() {
+        let xml = render_ptz_node("cam", &READ_ONLY_PRESETS);
+        assert!(xml.contains("FixedHomePosition=\"true\""), "{}", xml);
+        assert!(
+            xml.contains("<tt:HomeSupported>true</tt:HomeSupported>"),
+            "recall still works, so home is still supported: {}",
+            xml
+        );
+    }
+
+    /// A camera with no preset table has no home at all — there is nothing to
+    /// call fixed.
+    #[test]
+    fn a_camera_without_presets_has_no_fixed_home_to_claim() {
+        let xml = render_ptz_node("cam", &ZOOM_ONLY);
+        assert!(xml.contains("FixedHomePosition=\"false\""), "{}", xml);
+        assert!(xml.contains("<tt:HomeSupported>false</tt:HomeSupported>"));
+    }
+
+    /// A blank slot name renders as a usable label rather than an empty row in
+    /// the client's preset list.
+    #[test]
+    fn presets_always_get_a_label() {
+        assert_eq!(preset_display_name(Some("Driveway"), 3), "Driveway");
+        assert_eq!(preset_display_name(Some("   "), 3), "Preset 3");
+        assert_eq!(preset_display_name(None, 7), "Preset 7");
+    }
+
+    #[test]
+    fn preset_names_are_escaped() {
+        assert_eq!(
+            preset_display_name(Some("Fred & <Ginger>"), 1),
+            "Fred &amp; &lt;Ginger&gt;"
+        );
     }
 
     /// "Save this view as a new preset" must not quietly redefine where the
