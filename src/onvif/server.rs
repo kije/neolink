@@ -11,7 +11,7 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use crate::onvif::services::{device, events, media, ptz};
+use crate::onvif::services::{device, events, imaging, media, ptz};
 use crate::onvif::snapshot;
 use crate::onvif::soap::{
     fault_envelope, is_unauth_allowed, parse_envelope, verify_token, FaultCode,
@@ -38,6 +38,10 @@ pub(crate) async fn run(state: OnvifState, cancel: CancellationToken) -> Result<
         .route("/onvif/:camera/media_service", post(media_service_route))
         .route("/onvif/:camera/ptz_service", post(ptz_service_route))
         .route("/onvif/:camera/events_service", post(events_service_route))
+        .route(
+            "/onvif/:camera/imaging_service",
+            post(imaging_service_route),
+        )
         .route(
             "/onvif/:camera/subscription/:sub_id",
             post(subscription_route),
@@ -98,6 +102,14 @@ async fn events_service_route(
     dispatch_service(state, cam, ServiceKind::Events, body).await
 }
 
+async fn imaging_service_route(
+    State(state): State<OnvifState>,
+    Path(cam): Path<String>,
+    body: String,
+) -> Response {
+    dispatch_service(state, cam, ServiceKind::Imaging, body).await
+}
+
 async fn subscription_route(
     State(state): State<OnvifState>,
     Path((cam_name, sub_id)): Path<(String, String)>,
@@ -125,6 +137,7 @@ enum ServiceKind {
     Media,
     Ptz,
     Events,
+    Imaging,
 }
 
 async fn dispatch_service(
@@ -147,12 +160,15 @@ async fn dispatch_service(
     }
 
     let result = match service {
-        ServiceKind::Device => device::dispatch(&state, &cam, &parsed.action).await,
+        ServiceKind::Device => {
+            device::dispatch(&state, &cam, &parsed.action, parsed.body_xml).await
+        }
         ServiceKind::Media => media::dispatch(&state, &cam, &parsed.action, parsed.body_xml).await,
         ServiceKind::Ptz => ptz::dispatch(&state, &cam, &parsed.action, parsed.body_xml).await,
         ServiceKind::Events => {
             events::dispatch(&state, &cam, &parsed.action, parsed.body_xml).await
         }
+        ServiceKind::Imaging => imaging::dispatch(&cam, &parsed.action, parsed.body_xml).await,
     };
 
     match result {

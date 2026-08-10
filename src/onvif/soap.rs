@@ -276,6 +276,7 @@ pub(crate) const NS_ALL: &str = "xmlns:tt=\"http://www.onvif.org/ver10/schema\" 
 xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" \
 xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\" \
 xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\" \
+xmlns:timg=\"http://www.onvif.org/ver20/imaging/wsdl\" \
 xmlns:wsa=\"http://www.w3.org/2005/08/addressing\" \
 xmlns:tns=\"http://www.onvif.org/ver10/topics\" \
 xmlns:dn=\"http://www.onvif.org/ver10/network/wsdl\" \

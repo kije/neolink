@@ -69,12 +69,51 @@ pub(crate) struct CameraCapabilities {
     /// the movement one, so an account can be allowed to drive the camera and
     /// recall stored positions while being unable to redefine them.
     pub(crate) preset_write: bool,
+    /// The camera has a microphone, so the RTSP stream carries audio and the
+    /// media profiles should describe an audio source and encoder.
+    pub(crate) audio: bool,
+    /// The camera exposes LED control (IR illuminator + status light), so the
+    /// LED relay outputs and the Imaging `IrCutFilter` control are real.
+    pub(crate) led_ctrl: bool,
+    /// The camera has a floodlight / spotlight that can be driven manually.
+    pub(crate) floodlight: bool,
+    /// The lens has a focus motor, so the Imaging service can offer focus.
+    pub(crate) focus: bool,
+    /// The camera exposes the general/OSD settings block.
+    pub(crate) osd: bool,
 }
 
 impl CameraCapabilities {
     /// Should this camera have a PTZ service at all?
     pub(crate) fn ptz(&self) -> bool {
         self.pan_tilt || self.zoom || self.presets
+    }
+
+    /// Should this camera have an Imaging service at all?
+    ///
+    /// Imaging only carries two controls here — the IR cut filter and the focus
+    /// motor — so a camera with neither gets no service address, the same way a
+    /// motorless camera gets no PTZ address.
+    pub(crate) fn imaging(&self) -> bool {
+        self.led_ctrl || self.focus
+    }
+
+    /// Does this camera have any relay output worth advertising?
+    ///
+    /// The siren is always included (see `resolve`), so this is only ever false
+    /// for a camera we have positive evidence has no siren — which today means
+    /// never. Kept as a predicate so the Device service reads the same way the
+    /// others do.
+    pub(crate) fn relays(&self) -> bool {
+        self.siren() || self.floodlight || self.led_ctrl
+    }
+
+    /// The siren is driven by a fire-and-forget `MSG_ID_PLAY_AUDIO` that every
+    /// Reolink camera accepts (silently doing nothing if it has no speaker),
+    /// and the `Support` table has no field we understand well enough to rule
+    /// it out. So it is always offered, matching the MQTT surface.
+    pub(crate) fn siren(&self) -> bool {
+        true
     }
 }
 
@@ -103,6 +142,16 @@ pub(crate) struct Probe {
     pub(crate) ability_preset_write: Option<bool>,
     /// `GetZoomFocus`: the reported `(minPos, maxPos)` zoom range.
     pub(crate) zoom_range: Option<(u32, u32)>,
+    /// `GetZoomFocus`: the reported `(minPos, maxPos)` focus range.
+    pub(crate) focus_range: Option<(u32, u32)>,
+    /// `Support`: this channel has a microphone.
+    pub(crate) support_audio: Option<bool>,
+    /// `Support`: this channel exposes LED control.
+    pub(crate) support_led_ctrl: Option<bool>,
+    /// `Support`: this channel exposes the OSD settings block.
+    pub(crate) support_osd: Option<bool>,
+    /// The camera answered a floodlight-task read, so it has a floodlight.
+    pub(crate) floodlight: Option<bool>,
 }
 
 impl Probe {
@@ -115,12 +164,35 @@ impl Probe {
             || self.ability_control.is_some()
             || self.ability_preset_write.is_some()
             || self.zoom_range.is_some()
+            || self.focus_range.is_some()
+            || self.support_audio.is_some()
+            || self.support_led_ctrl.is_some()
+            || self.support_osd.is_some()
+            || self.floodlight.is_some()
     }
 }
 
 /// Turn raw observations into the capability set. Pure, so the reconciliation
 /// rules can be tested without a camera.
 pub(crate) fn resolve(p: &Probe) -> CameraCapabilities {
+    // The non-PTZ capabilities are independent of the motor, so they are
+    // resolved first and shared by both exits below. Each keeps the same
+    // unknown-means-yes rule as the PTZ set.
+    let audio = p.support_audio.unwrap_or(true);
+    let led_ctrl = p.support_led_ctrl.unwrap_or(true);
+    let osd = p.support_osd.unwrap_or(true);
+    // Unlike the rest, the floodlight defaults to *absent*: this is a probe of
+    // a specific accessory rather than a flag that a firmware might omit, and
+    // advertising a relay for a light that isn't there puts a dead switch in
+    // every client's UI.
+    let floodlight = p.floodlight.unwrap_or(false);
+    // A focus motor needs a real range, and it lives behind the same PTZ
+    // `control` ability as the zoom.
+    let focus = match p.focus_range {
+        Some((min, max)) => max > min,
+        None => false,
+    };
+
     // Both of these default to "yes" when unknown, so a camera that answers
     // nothing keeps the pre-capability-detection behaviour.
     let controllable = p.ability_control.unwrap_or(true) && p.support_ptz_control.unwrap_or(true);
@@ -130,6 +202,13 @@ pub(crate) fn resolve(p: &Probe) -> CameraCapabilities {
             zoom: false,
             presets: false,
             preset_write: false,
+            // A camera whose user cannot drive the motor cannot drive the
+            // focus motor either — it is the same `control` ability.
+            focus: false,
+            audio,
+            led_ctrl,
+            floodlight,
+            osd,
         };
     }
 
@@ -154,6 +233,11 @@ pub(crate) fn resolve(p: &Probe) -> CameraCapabilities {
         zoom,
         presets,
         preset_write,
+        focus,
+        audio,
+        led_ctrl,
+        floodlight,
+        osd,
     }
 }
 
@@ -177,12 +261,35 @@ pub(crate) fn apply_support(p: &mut Probe, support: &Support, channel_id: u8) {
     if let Some(mode) = support.ptz_mode.as_deref().and_then(parse_ptz_mode) {
         p.support_mode = Some(mode);
     }
+    // `audioNum` is device-wide. A device that reports zero audio channels has
+    // no microphone anywhere, which settles the question for this channel too;
+    // a non-zero count only says *some* channel has audio, so it is left to the
+    // per-channel `noAudio` flag below.
+    if support.audio_num == Some(0) {
+        p.support_audio = Some(false);
+    }
     // `Support` is device-wide; on an NVR the per-channel `item` list is what
     // actually describes the camera behind this channel. Match it exactly —
     // borrowing another channel's flags would be worse than having none.
     let Some(item) = support.items.iter().find(|i| i.chn_id == channel_id as u32) else {
         return;
     };
+    // Reolink states this one in the negative: `noAudio == 1` means the channel
+    // has no microphone.
+    //
+    // Combined with, not substituted for, the device-wide `audioNum` above:
+    // either negative is conclusive, and a firmware that reports zero audio
+    // channels *and* `noAudio == 0` on a channel must not be able to talk us
+    // back into advertising a microphone.
+    if let Some(v) = item.no_audio {
+        p.support_audio = Some(p.support_audio.unwrap_or(true) && v == 0);
+    }
+    if let Some(v) = item.led_ctrl {
+        p.support_led_ctrl = Some(v != 0);
+    }
+    if let Some(v) = item.osd_cfg {
+        p.support_osd = Some(v != 0);
+    }
     if let Some(v) = item.ptz_control {
         p.support_ptz_control = Some(v != 0);
     } else if item.ptz_type == Some(0) {
@@ -339,12 +446,18 @@ pub(crate) async fn capabilities(cam: &CameraEntry) -> CameraCapabilities {
     let changed = slot.as_ref().map(|e| e.caps) != Some(caps);
     if changed {
         log::debug!(
-            "ONVIF: camera {} capabilities: pan/tilt={} zoom={} presets={} preset_write={} (from {probe:?})",
+            "ONVIF: camera {} capabilities: pan/tilt={} zoom={} presets={} \
+             preset_write={} focus={} audio={} led={} floodlight={} osd={} (from {probe:?})",
             cam.name,
             caps.pan_tilt,
             caps.zoom,
             caps.presets,
             caps.preset_write,
+            caps.focus,
+            caps.audio,
+            caps.led_ctrl,
+            caps.floodlight,
+            caps.osd,
         );
     }
     *slot = Some(CacheEntry {
@@ -385,10 +498,22 @@ async fn run_probe(cam: &CameraEntry) -> Probe {
             .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_zoom().await?) }))
             .await
         {
-            Ok(zf) => p.zoom_range = Some((zf.zoom.min_pos, zf.zoom.max_pos)),
+            Ok(zf) => {
+                p.zoom_range = Some((zf.zoom.min_pos, zf.zoom.max_pos));
+                p.focus_range = Some((zf.focus.min_pos, zf.focus.max_pos));
+            }
             Err(e) => log::debug!("ONVIF: camera {}: no zoom range ({e})", cam.name),
         }
     }
+
+    // There is no "do you have a floodlight" flag in `Support`, so the read
+    // itself is the test: a camera without one faults on the task read. This
+    // mirrors how the MQTT surface decides whether to publish floodlight state.
+    p.floodlight = Some(
+        cam.run(|c: &BcCamera| Box::pin(async move { Ok(c.get_flightlight_tasks().await?) }))
+            .await
+            .is_ok(),
+    );
 
     p
 }
@@ -414,9 +539,169 @@ mod tests {
                 zoom: true,
                 presets: true,
                 preset_write: true,
+                audio: true,
+                led_ctrl: true,
+                osd: true,
+                // The two exceptions, both deliberate: a floodlight is a
+                // physical accessory we probe for rather than a flag a
+                // firmware might omit, and a focus motor needs a measured
+                // range before we claim it exists.
+                floodlight: false,
+                focus: false,
             }
         );
         assert!(caps.ptz());
+    }
+
+    #[test]
+    fn audio_is_denied_by_either_the_device_count_or_the_channel_flag() {
+        let mut p = probe();
+        apply_support(
+            &mut p,
+            &Support {
+                audio_num: Some(0),
+                ..Default::default()
+            },
+            0,
+        );
+        assert_eq!(p.support_audio, Some(false));
+        assert!(!resolve(&p).audio);
+
+        // A device with audio somewhere still lets the per-channel flag speak
+        // for this channel.
+        let mut p = probe();
+        apply_support(
+            &mut p,
+            &Support {
+                audio_num: Some(4),
+                items: vec![SupportItem {
+                    chn_id: 2,
+                    no_audio: Some(1),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            2,
+        );
+        assert_eq!(
+            p.support_audio,
+            Some(false),
+            "noAudio=1 means no microphone"
+        );
+
+        let mut p = probe();
+        apply_support(
+            &mut p,
+            &support_with(SupportItem {
+                chn_id: 0,
+                no_audio: Some(0),
+                ..Default::default()
+            }),
+            0,
+        );
+        assert_eq!(p.support_audio, Some(true));
+        assert!(resolve(&p).audio);
+    }
+
+    /// The two audio signals are combined, not overwritten. A firmware that
+    /// reports zero audio channels device-wide *and* `noAudio == 0` on the
+    /// channel is contradicting itself, and the negative has to win — the
+    /// channel flag used to replace the device-wide evidence and talk us back
+    /// into advertising a microphone that isn't there.
+    #[test]
+    fn a_contradictory_channel_flag_cannot_restore_audio() {
+        let mut p = probe();
+        apply_support(
+            &mut p,
+            &Support {
+                audio_num: Some(0),
+                items: vec![SupportItem {
+                    chn_id: 0,
+                    no_audio: Some(0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            0,
+        );
+        assert_eq!(p.support_audio, Some(false));
+        assert!(!resolve(&p).audio);
+    }
+
+    #[test]
+    fn led_and_osd_flags_are_read_per_channel() {
+        let mut p = probe();
+        apply_support(
+            &mut p,
+            &support_with(SupportItem {
+                chn_id: 0,
+                led_ctrl: Some(0),
+                osd_cfg: Some(1),
+                ..Default::default()
+            }),
+            0,
+        );
+        let caps = resolve(&p);
+        assert!(!caps.led_ctrl);
+        assert!(caps.osd);
+    }
+
+    /// A floodlight is only advertised once the camera has answered a
+    /// floodlight read: a dead switch in every client's UI is worse than a
+    /// missing one.
+    #[test]
+    fn the_floodlight_relay_needs_positive_evidence() {
+        assert!(!resolve(&probe()).floodlight);
+        assert!(
+            resolve(&Probe {
+                floodlight: Some(true),
+                ..probe()
+            })
+            .floodlight
+        );
+    }
+
+    #[test]
+    fn focus_needs_a_measured_range() {
+        assert!(!resolve(&probe()).focus, "unknown is not a focus motor");
+        assert!(
+            !resolve(&Probe {
+                focus_range: Some((100, 100)),
+                ..probe()
+            })
+            .focus,
+            "a zero-width range is a fixed lens"
+        );
+        let caps = resolve(&Probe {
+            focus_range: Some((0, 4000)),
+            ..probe()
+        });
+        assert!(caps.focus);
+        assert!(caps.imaging());
+    }
+
+    /// Focus rides on the same `control` ability as the motor, so losing that
+    /// ability has to take focus with it.
+    #[test]
+    fn no_control_ability_removes_focus_too() {
+        let caps = resolve(&Probe {
+            ability_control: Some(false),
+            focus_range: Some((0, 4000)),
+            ..probe()
+        });
+        assert!(!caps.focus);
+        assert!(!caps.ptz());
+    }
+
+    /// The Imaging service only exists for the controls it can actually offer.
+    #[test]
+    fn imaging_needs_something_to_control() {
+        let caps = resolve(&Probe {
+            support_led_ctrl: Some(false),
+            ..probe()
+        });
+        assert!(!caps.imaging(), "no IR cut filter and no focus motor");
+        assert!(caps.relays(), "the siren is still there");
     }
 
     #[test]

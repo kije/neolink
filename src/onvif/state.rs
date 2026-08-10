@@ -15,9 +15,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::common::{NeoInstance, NeoReactor};
-use crate::config::{CameraConfig, Config, OnvifGlobalConfig, StreamConfig};
+use crate::config::{AudioFormat, CameraConfig, Config, OnvifGlobalConfig, StreamConfig};
 use crate::onvif::capabilities::CapabilityCache;
 use crate::onvif::events::EventsManager;
+use crate::onvif::services::device::ClockCache;
 use neolink_core::bc_protocol::BcCamera;
 
 /// Hard cap for a single SOAP-time camera read. The shared `NeoInstance`
@@ -114,6 +115,22 @@ pub(crate) struct CameraEntry {
     /// first use and refreshed on a timer. Every capability-describing ONVIF
     /// response reads from here so they can't disagree with each other.
     pub(crate) capabilities: Arc<CapabilityCache>,
+    /// The camera's clock, sampled rarely and extrapolated in between.
+    /// `GetSystemDateAndTime` is answered without authentication, so it must
+    /// not be a lever for turning unauthenticated requests into camera traffic.
+    pub(crate) clock: Arc<ClockCache>,
+    /// Serialises read-modify-write cycles over `SystemGeneral`.
+    ///
+    /// That one message carries the clock, the display name and the OSD date
+    /// format, so `SetSystemDateAndTime` and `SetOSD` both have to read it,
+    /// change one field and write the whole thing back. Without a lock two
+    /// concurrent writers can read the same snapshot and the second write
+    /// silently reverts the first one's unrelated field.
+    pub(crate) general_lock: Arc<Mutex<()>>,
+    /// The audio format this camera's RTSP stream actually carries, resolved
+    /// against the compat profile. The ONVIF media profile has to describe the
+    /// same thing the stream delivers.
+    pub(crate) audio_format: AudioFormat,
 }
 
 /// Shared state for every ONVIF handler (axum + WS-Discovery).
@@ -239,6 +256,9 @@ impl OnvifState {
                         zoom_task: prev.zoom_task.clone(),
                         events: prev.events.clone(),
                         capabilities: prev.capabilities.clone(),
+                        clock: prev.clock.clone(),
+                        general_lock: prev.general_lock.clone(),
+                        audio_format: cam_cfg.audio_format(),
                     })
                 } else {
                     // A single misconfigured camera must not take down ONVIF
@@ -270,6 +290,9 @@ impl OnvifState {
                         zoom_task: Arc::new(Mutex::new(None)),
                         events,
                         capabilities: Arc::new(CapabilityCache::default()),
+                        clock: Arc::new(ClockCache::default()),
+                        general_lock: Arc::new(Mutex::new(())),
+                        audio_format: cam_cfg.audio_format(),
                     })
                 };
                 new_set.insert(cam_cfg.name.clone(), entry);

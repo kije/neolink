@@ -253,7 +253,23 @@ impl BcCamera {
     pub async fn zoom_to(&self, zoom_pos: u32) -> Result<()> {
         let current = self.get_zoom().await?;
         let zoom_pos = zoom_pos.clamp(current.zoom.min_pos, current.zoom.max_pos);
+        self.start_zoom_focus("zoomPos", zoom_pos).await
+    }
 
+    /// The camera will drive its lens to a given focus position.
+    ///
+    /// The usable range is the `focus` half of [`BcCamera::get_zoom`]; the
+    /// requested position is clamped into it, so a caller that only knows it
+    /// wants "as near as possible" can pass 0.
+    pub async fn focus_to(&self, focus_pos: u32) -> Result<()> {
+        let current = self.get_zoom().await?;
+        let focus_pos = focus_pos.clamp(current.focus.min_pos, current.focus.max_pos);
+        self.start_zoom_focus("focusPos", focus_pos).await
+    }
+
+    /// Drive the lens motor. `command` selects the axis (`"zoomPos"` /
+    /// `"focusPos"`); `move_pos` must already be clamped to that axis' range.
+    async fn start_zoom_focus(&self, command: &str, move_pos: u32) -> Result<()> {
         self.has_ability_rw("control").await?;
         let connection = self.get_connection();
         let msg_num = self.new_message_num();
@@ -277,8 +293,8 @@ impl BcCamera {
                     start_zoom_focus: Some(StartZoomFocus {
                         version: xml_ver(),
                         channel_id: self.channel_id,
-                        command: "zoomPos".to_string(),
-                        move_pos: zoom_pos,
+                        command: command.to_string(),
+                        move_pos,
                     }),
                     ..Default::default()
                 })),
