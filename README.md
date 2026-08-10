@@ -1033,11 +1033,19 @@ name = "driveway"
 ##### Audio
 
 When the camera reports a microphone, each media profile carries an
-`AudioSourceConfiguration` and an `AudioEncoderConfiguration` describing the
-AAC track the RTSP server already serves. This is what a VMS reads to decide
-whether to request audio at all — without it Frigate, Synology and Milestone
-pull video only, even though the RTSP URL carries sound. A camera with no
-microphone reports empty audio lists rather than a fault.
+`AudioSourceConfiguration` and an `AudioEncoderConfiguration`. This is what a
+VMS reads to decide whether to request audio at all — without it Frigate,
+Synology and Milestone pull video only, even though the RTSP URL carries sound.
+A camera with no microphone reports empty audio lists rather than a fault.
+
+The configuration describes whatever that camera's `audio_format` resolves to,
+because `GetStreamUri` hands out a URL with no `?audio=` override: passthrough
+formats are reported as `AAC` at ~32 kbps, and the default `pcm` as ~256 kbps.
+Note that ONVIF's `tt:AudioEncoding` enum has only `G711`, `G726` and `AAC` —
+there is no value for L16 — so the `pcm` case is reported as `G711`. That is
+the limit of the vocabulary, not a claim about the payload: clients read the
+real codec from the RTSP SDP and use the profile only to decide whether to ask
+for audio.
 
 ##### Switches (relay outputs)
 

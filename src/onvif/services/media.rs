@@ -7,6 +7,7 @@ use neolink_core::bc_protocol::BcCamera;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use crate::config::AudioFormat;
 use crate::onvif::capabilities::{capabilities, CameraCapabilities};
 use crate::onvif::services::device::FaultBody;
 use crate::onvif::services::osd;
@@ -92,14 +93,8 @@ async fn read_stream_descs(cam: &CameraEntry) -> Vec<StreamDesc> {
             if let Some(t) = tables.iter().find(|t| t.name == s.reolink_name()) {
                 let framerates = csv_u32(&t.framerate_table);
                 let bitrates = csv_u32(&t.bitrate_table);
-                let fps = framerates
-                    .first()
-                    .copied()
-                    .unwrap_or(t.default_framerate.max(1));
-                let br = bitrates
-                    .first()
-                    .copied()
-                    .unwrap_or(t.default_bitrate.max(1));
+                let fps = resolve_default(&framerates, t.default_framerate);
+                let br = resolve_default(&bitrates, t.default_bitrate);
                 StreamDesc {
                     stream: *s,
                     width: t.resolution.width,
@@ -121,6 +116,28 @@ fn csv_u32(s: &str) -> Vec<u32> {
     s.split(',').filter_map(|p| p.trim().parse().ok()).collect()
 }
 
+/// Resolve a `defaultFramerate` / `defaultBitrate` against its table.
+///
+/// Reolink overloads these fields: on most firmwares the number is an *index*
+/// into the matching table, but on some it is the value itself. Taking the
+/// table's first entry — as this used to — reports the camera's current
+/// setting correctly only when the selected index happens to be zero.
+///
+/// The rule here is the one `src/rtsp/factory.rs` already applies when it
+/// builds the RTSP stream config: treat it as an index when it lands inside
+/// the table, and as a literal value when it doesn't. That way the ONVIF
+/// profile and the RTSP stream describe the same encoder settings.
+fn resolve_default(table: &[u32], default: u32) -> u32 {
+    table
+        .get(default as usize)
+        .copied()
+        .unwrap_or(default)
+        // A camera that reports neither a usable table nor a usable default
+        // still needs a positive number here: zero is not a frame rate, and
+        // clients reject a configuration they cannot re-select.
+        .max(1)
+}
+
 fn profile_token(cam: &str, s: OnvifStream) -> String {
     format!("profile_{}_{}", cam, s.token_suffix())
 }
@@ -138,19 +155,51 @@ fn audio_encoder_token(cam: &str) -> String {
     format!("aec_{cam}")
 }
 
-/// What the RTSP server actually puts on the wire for audio.
+/// How the camera's configured RTSP audio format is described in ONVIF terms.
 ///
-/// The camera speaks AAC (and ADPCM on older models); the RTSP pipeline
-/// re-frames that but does not transcode away from AAC unless a client asks for
-/// `?audio=pcm` on the URL. ONVIF has no way to say "whatever the client asked
-/// for", so the profile describes the default — AAC — which is what a client
-/// following `GetStreamUri` receives.
-const AUDIO_ENCODING: &str = "AAC";
-/// Nominal figures for the AAC track. Reolink does not expose an audio encode
-/// table the way it does for video, so these describe the stream rather than
-/// being read back from the camera.
-const AUDIO_BITRATE_KBPS: u32 = 32;
-const AUDIO_SAMPLERATE_KHZ: u32 = 16;
+/// This has to follow the *stream*, not the camera: `GetStreamUri` hands out a
+/// URL with no `?audio=` override, so what a client receives is whatever
+/// `audio_format` resolves to for that camera — and the default profile
+/// resolves to [`AudioFormat::Pcm`], i.e. decoded L16, not passthrough AAC.
+/// Hardcoding AAC therefore misdescribed the stream on every default install.
+///
+/// ONVIF ver10's `tt:AudioEncoding` is a closed enum — `G711`, `G726`, `AAC` —
+/// with no value for L16, so the L16 case is reported as `G711`, the only
+/// uncompressed-audio token available. That is the honest limit of the
+/// vocabulary rather than a claim about the payload: every client reads the
+/// real codec from the RTSP SDP, and uses the profile only to decide whether to
+/// ask for audio at all. The bitrate and sample rate are reported truthfully in
+/// both cases, so a client sizing its buffers gets the right numbers.
+struct AudioDesc {
+    encoding: &'static str,
+    bitrate_kbps: u32,
+    samplerate_khz: u32,
+}
+
+fn audio_desc(format: AudioFormat) -> AudioDesc {
+    match format {
+        // Passthrough: the camera's own AAC, reframed but not re-encoded.
+        AudioFormat::Mpeg4Generic | AudioFormat::Latm => AudioDesc {
+            encoding: "AAC",
+            bitrate_kbps: 32,
+            samplerate_khz: 16,
+        },
+        // Decoded to raw samples. 16 kHz mono L16 is 256 kbps on the wire.
+        AudioFormat::Pcm => AudioDesc {
+            encoding: "G711",
+            bitrate_kbps: 256,
+            samplerate_khz: 16,
+        },
+        // Several tracks in one SDP. A profile describes one encoder, so it
+        // describes the first track offered — the `MPEG4-GENERIC` AAC one —
+        // which is also the track a negotiating client picks when it can.
+        AudioFormat::All => AudioDesc {
+            encoding: "AAC",
+            bitrate_kbps: 32,
+            samplerate_khz: 16,
+        },
+    }
+}
 
 fn render_audio_source_configuration(cam_name: &str, element: &str) -> String {
     format!(
@@ -164,7 +213,12 @@ fn render_audio_source_configuration(cam_name: &str, element: &str) -> String {
     )
 }
 
-fn render_audio_encoder_configuration(cam_name: &str, element: &str) -> String {
+fn render_audio_encoder_configuration(
+    cam_name: &str,
+    format: AudioFormat,
+    element: &str,
+) -> String {
+    let desc = audio_desc(format);
     format!(
         "<{element} token=\"{tok}\">\
 <tt:Name>{name}</tt:Name>\
@@ -177,9 +231,9 @@ fn render_audio_encoder_configuration(cam_name: &str, element: &str) -> String {
 </{element}>",
         tok = audio_encoder_token(cam_name),
         name = xml_escape(&format!("{cam_name}-audio")),
-        enc = AUDIO_ENCODING,
-        br = AUDIO_BITRATE_KBPS,
-        sr = AUDIO_SAMPLERATE_KHZ,
+        enc = desc.encoding,
+        br = desc.bitrate_kbps,
+        sr = desc.samplerate_khz,
     )
 }
 
@@ -290,9 +344,13 @@ fn profile_parts(
             .audio
             .then(|| render_audio_source_configuration(&cam.name, "tt:AudioSourceConfiguration")),
         video_encoder: render_video_encoder_configuration(&cam.name, d),
-        audio_encoder: caps
-            .audio
-            .then(|| render_audio_encoder_configuration(&cam.name, "tt:AudioEncoderConfiguration")),
+        audio_encoder: caps.audio.then(|| {
+            render_audio_encoder_configuration(
+                &cam.name,
+                cam.audio_format,
+                "tt:AudioEncoderConfiguration",
+            )
+        }),
         // A profile carries a PTZConfiguration only if the camera has something
         // to move; clients key their PTZ UI off its presence.
         ptz: caps
@@ -469,18 +527,23 @@ pub(crate) async fn dispatch(
         ),
         "GetAudioEncoderConfigurations" if caps.audio => format!(
             "<trt:GetAudioEncoderConfigurationsResponse>{c}</trt:GetAudioEncoderConfigurationsResponse>",
-            c = render_audio_encoder_configuration(&cam.name, "trt:Configurations"),
+            c = render_audio_encoder_configuration(&cam.name, cam.audio_format, "trt:Configurations"),
         ),
-        "GetAudioEncoderConfigurationOptions" if caps.audio => format!(
-            "<trt:GetAudioEncoderConfigurationOptionsResponse><trt:Options>\
+        "GetAudioEncoderConfigurationOptions" if caps.audio => {
+            // One option, matching the one configuration: the audio format is
+            // a neolink setting, not something an ONVIF client may change.
+            let desc = audio_desc(cam.audio_format);
+            format!(
+                "<trt:GetAudioEncoderConfigurationOptionsResponse><trt:Options>\
 <tt:Options><tt:Encoding>{enc}</tt:Encoding>\
 <tt:BitrateList><tt:Items>{br}</tt:Items></tt:BitrateList>\
 <tt:SampleRateList><tt:Items>{sr}</tt:Items></tt:SampleRateList>\
 </tt:Options></trt:Options></trt:GetAudioEncoderConfigurationOptionsResponse>",
-            enc = AUDIO_ENCODING,
-            br = AUDIO_BITRATE_KBPS,
-            sr = AUDIO_SAMPLERATE_KHZ,
-        ),
+                enc = desc.encoding,
+                br = desc.bitrate_kbps,
+                sr = desc.samplerate_khz,
+            )
+        }
         // A camera with no microphone answers these with an empty list rather
         // than a fault: "this device has no audio" is a valid, useful answer,
         // and a fault makes clients log an error and sometimes abandon the
@@ -682,6 +745,71 @@ mod tests {
         }
     }
 
+    /// Reolink overloads `defaultFramerate`/`defaultBitrate` as an index into
+    /// the matching table. Taking the table's first entry reported the wrong
+    /// current setting for every camera whose selected index was not zero, and
+    /// disagreed with what `src/rtsp/factory.rs` puts in the RTSP stream.
+    #[test]
+    fn the_default_is_resolved_as_an_index_into_its_table() {
+        // Index 2 of [30, 25, 20, 15] is 20fps — not 30.
+        assert_eq!(resolve_default(&[30, 25, 20, 15], 2), 20);
+        assert_eq!(resolve_default(&[30, 25, 20, 15], 0), 30);
+
+        // Out of range means it was the literal value all along, which is the
+        // other shape the field takes.
+        assert_eq!(resolve_default(&[30, 25], 4096), 4096);
+        assert_eq!(resolve_default(&[], 25), 25);
+    }
+
+    /// Zero is never a usable frame rate or bitrate, however it arose.
+    #[test]
+    fn a_resolved_default_is_never_zero() {
+        assert_eq!(resolve_default(&[], 0), 1);
+        assert_eq!(resolve_default(&[0, 30], 0), 1);
+    }
+
+    /// The profile has to describe the stream `GetStreamUri` actually hands
+    /// out. That URL carries no `?audio=` override, so the camera's configured
+    /// format decides — and the default profile is L16, not passthrough AAC.
+    #[test]
+    fn the_audio_description_follows_the_configured_format() {
+        let aac = audio_desc(AudioFormat::Mpeg4Generic);
+        assert_eq!(aac.encoding, "AAC");
+        assert_eq!(aac.bitrate_kbps, 32);
+        assert_eq!(audio_desc(AudioFormat::Latm).encoding, "AAC");
+
+        // The default. ONVIF ver10 has no L16 token, but the bitrate must
+        // still describe the ~256 kbps a client will actually receive.
+        let pcm = audio_desc(AudioFormat::Pcm);
+        assert_eq!(pcm.bitrate_kbps, 256);
+        assert_ne!(
+            pcm.bitrate_kbps, aac.bitrate_kbps,
+            "L16 must not be described with the AAC bitrate"
+        );
+
+        // Multi-track: the profile describes the first track offered.
+        assert_eq!(audio_desc(AudioFormat::All).encoding, "AAC");
+    }
+
+    /// Whatever we report has to be a value from ONVIF ver10's closed
+    /// `tt:AudioEncoding` enum, or a strict client rejects the configuration.
+    #[test]
+    fn every_audio_encoding_is_a_legal_onvif_token() {
+        for format in [
+            AudioFormat::Mpeg4Generic,
+            AudioFormat::Latm,
+            AudioFormat::Pcm,
+            AudioFormat::All,
+        ] {
+            let enc = audio_desc(format).encoding;
+            assert!(
+                matches!(enc, "G711" | "G726" | "AAC"),
+                "{} is not in tt:AudioEncoding",
+                enc
+            );
+        }
+    }
+
     /// A client that cannot re-select the configuration the device just
     /// reported treats it as invalid, so the current value has to appear in
     /// its own option list even when the camera's table left it out.
@@ -764,7 +892,11 @@ mod tests {
             src
         );
 
-        let enc = render_audio_encoder_configuration("cam", "tt:AudioEncoderConfiguration");
+        let enc = render_audio_encoder_configuration(
+            "cam",
+            AudioFormat::Mpeg4Generic,
+            "tt:AudioEncoderConfiguration",
+        );
         assert!(enc.contains("token=\"aec_cam\""), "{}", enc);
         assert!(enc.contains("<tt:Encoding>AAC</tt:Encoding>"), "{}", enc);
     }

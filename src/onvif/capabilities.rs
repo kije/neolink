@@ -276,8 +276,13 @@ pub(crate) fn apply_support(p: &mut Probe, support: &Support, channel_id: u8) {
     };
     // Reolink states this one in the negative: `noAudio == 1` means the channel
     // has no microphone.
+    //
+    // Combined with, not substituted for, the device-wide `audioNum` above:
+    // either negative is conclusive, and a firmware that reports zero audio
+    // channels *and* `noAudio == 0` on a channel must not be able to talk us
+    // back into advertising a microphone.
     if let Some(v) = item.no_audio {
-        p.support_audio = Some(v == 0);
+        p.support_audio = Some(p.support_audio.unwrap_or(true) && v == 0);
     }
     if let Some(v) = item.led_ctrl {
         p.support_led_ctrl = Some(v != 0);
@@ -596,6 +601,31 @@ mod tests {
         );
         assert_eq!(p.support_audio, Some(true));
         assert!(resolve(&p).audio);
+    }
+
+    /// The two audio signals are combined, not overwritten. A firmware that
+    /// reports zero audio channels device-wide *and* `noAudio == 0` on the
+    /// channel is contradicting itself, and the negative has to win — the
+    /// channel flag used to replace the device-wide evidence and talk us back
+    /// into advertising a microphone that isn't there.
+    #[test]
+    fn a_contradictory_channel_flag_cannot_restore_audio() {
+        let mut p = probe();
+        apply_support(
+            &mut p,
+            &Support {
+                audio_num: Some(0),
+                items: vec![SupportItem {
+                    chn_id: 0,
+                    no_audio: Some(0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            0,
+        );
+        assert_eq!(p.support_audio, Some(false));
+        assert!(!resolve(&p).audio);
     }
 
     #[test]

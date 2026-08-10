@@ -13,6 +13,8 @@
 use anyhow::Result;
 use neolink_core::bc::xml::SystemGeneral;
 use neolink_core::bc_protocol::BcCamera;
+use quick_xml::events::Event;
+use quick_xml::Reader;
 
 use crate::onvif::capabilities::CameraCapabilities;
 use crate::onvif::services::device::FaultBody;
@@ -104,9 +106,9 @@ pub(crate) async fn dispatch(
         }
         "GetOSDOptions" => render_osd_options(),
         "SetOSD" => {
-            let token = read_first_text_element(body_xml, "OSDToken").ok_or_else(|| FaultBody {
+            let token = read_osd_token(body_xml).ok_or_else(|| FaultBody {
                 code: FaultCode::InvalidArgs,
-                reason: "Missing OSDToken".to_string(),
+                reason: "SetOSD needs an OSD element carrying a token attribute".to_string(),
             })?;
             apply_set_osd(cam, &token, body_xml).await?;
             "<trt:SetOSDResponse/>".to_string()
@@ -119,6 +121,44 @@ pub(crate) async fn dispatch(
         }
     };
     Ok(wrap_envelope(&body, NS_ALL))
+}
+
+/// Read the OSD token out of a `SetOSD` request.
+///
+/// The two operations spell it differently, and only `GetOSD` uses an element:
+///
+/// ```xml
+/// <trt:GetOSD><trt:OSDToken>osd_name</trt:OSDToken></trt:GetOSD>
+/// <trt:SetOSD><trt:OSD token="osd_name">...</trt:OSD></trt:SetOSD>
+/// ```
+///
+/// `SetOSD` carries a whole `tt:OSDConfiguration`, whose token is the `token`
+/// attribute it inherits from `tt:DeviceEntity` — there is no `OSDToken`
+/// element anywhere in the request. Looking for one rejected every conforming
+/// `SetOSD` as missing its token.
+fn read_osd_token(body_xml: &str) -> Option<String> {
+    let mut reader = Reader::from_str(body_xml);
+    reader.config_mut().trim_text(true);
+    loop {
+        let event = reader.read_event();
+        let e = match event {
+            Err(_) | Ok(Event::Eof) => return None,
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => e,
+            _ => continue,
+        };
+        let name = e.name();
+        let raw = name.into_inner();
+        let s = std::str::from_utf8(raw).unwrap_or("");
+        if s.rsplit(':').next().unwrap_or(s) != "OSD" {
+            continue;
+        }
+        for attr in e.attributes().flatten() {
+            let key = std::str::from_utf8(attr.key.into_inner()).unwrap_or("");
+            if key.rsplit(':').next().unwrap_or(key) == "token" {
+                return Some(attr.unescape_value().ok()?.to_string());
+            }
+        }
+    }
 }
 
 async fn read_general(cam: &CameraEntry) -> Option<SystemGeneral> {
@@ -192,7 +232,11 @@ fn render_osd_options() -> String {
 
 async fn apply_set_osd(cam: &CameraEntry, token: &str, body_xml: &str) -> Result<(), FaultBody> {
     // Read-modify-write, so setting the name cannot clobber the clock and vice
-    // versa: `SystemGeneral` carries both.
+    // versa: `SystemGeneral` carries both. The lock is what actually makes that
+    // true — it is shared with `SetSystemDateAndTime`, and without it two
+    // concurrent writers read the same snapshot and the second write reverts
+    // the first one's field.
+    let _guard = cam.general_lock.lock().await;
     let mut general = cam
         .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_general().await?) }))
         .await
@@ -267,6 +311,46 @@ async fn apply_set_osd(cam: &CameraEntry, token: &str, body_xml: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SetOSD` carries a whole `tt:OSDConfiguration`, whose token is an
+    /// attribute — there is no `OSDToken` element in the request at all.
+    /// Looking for one rejected every conforming `SetOSD` as untokened.
+    #[test]
+    fn the_set_osd_token_is_read_from_the_attribute() {
+        let body = "<trt:SetOSD><trt:OSD token=\"osd_name\">\
+<tt:VideoSourceConfigurationToken>vs_cam</tt:VideoSourceConfigurationToken>\
+<tt:Type>Text</tt:Type>\
+<tt:TextString><tt:Type>Plain</tt:Type><tt:PlainText>Driveway</tt:PlainText></tt:TextString>\
+</trt:OSD></trt:SetOSD>";
+        assert_eq!(read_osd_token(body).as_deref(), Some("osd_name"));
+    }
+
+    /// Namespace prefixes vary between clients; the token does not move.
+    #[test]
+    fn the_set_osd_token_survives_any_prefix() {
+        assert_eq!(
+            read_osd_token("<SetOSD><OSD token=\"osd_datetime\"/></SetOSD>").as_deref(),
+            Some("osd_datetime")
+        );
+        assert_eq!(
+            read_osd_token("<x:SetOSD><x:OSD x:token=\"osd_name\"/></x:SetOSD>").as_deref(),
+            Some("osd_name")
+        );
+    }
+
+    /// A request with no OSD element, or an OSD element with no token, is a
+    /// genuine client error and has to stay one.
+    #[test]
+    fn a_set_osd_without_a_token_is_rejected() {
+        assert!(read_osd_token("<trt:SetOSD></trt:SetOSD>").is_none());
+        assert!(read_osd_token("<trt:SetOSD><trt:OSD/></trt:SetOSD>").is_none());
+        // The `GetOSD` shape is not a valid `SetOSD`, and must not be
+        // mistaken for one.
+        assert!(
+            read_osd_token("<trt:GetOSD><trt:OSDToken>osd_name</trt:OSDToken></trt:GetOSD>")
+                .is_none()
+        );
+    }
 
     #[test]
     fn date_formats_round_trip() {

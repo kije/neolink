@@ -369,10 +369,15 @@ impl RelayOutput {
     }
 
     fn render_options(&self) -> String {
+        // `DelayTimes` is a `tt:DurationRange`, not a duration — it needs
+        // `Min`/`Max` children. Emitting a bare duration here produced XML that
+        // strict (gSOAP-based) clients reject outright, taking the whole
+        // `GetRelayOutputOptions` response with it. Only one delay is
+        // supported, so the bounds are equal.
         format!(
             "<tds:RelayOutputOptions token=\"{tok}\">\
 <tds:Mode>{mode}</tds:Mode>\
-<tds:DelayTimes>{delay}</tds:DelayTimes>\
+<tds:DelayTimes><tt:Min>{delay}</tt:Min><tt:Max>{delay}</tt:Max></tds:DelayTimes>\
 <tds:Discrete>false</tds:Discrete>\
 </tds:RelayOutputOptions>",
             tok = self.token,
@@ -503,11 +508,22 @@ const CLOCK_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 #[derive(Default)]
 pub(crate) struct ClockCache {
     slot: tokio::sync::Mutex<Option<ClockSample>>,
+    /// The most recent sample that actually came from the camera, with the
+    /// instant it was taken. Survives failures so a camera that drops off the
+    /// network keeps reporting a plausible (extrapolated) clock instead of
+    /// snapping back to the bridge's.
+    last_good: tokio::sync::Mutex<Option<ClockSample>>,
 }
 
 struct ClockSample {
     at: std::time::Instant,
-    clock: CameraClock,
+    /// `None` records a *failed* probe. Caching the failure is the whole point
+    /// of the throttle: a camera that is offline or on a firmware without the
+    /// general block is exactly the case where an unauthenticated poller would
+    /// otherwise drive one doomed BC round-trip per request, forever. A
+    /// successful sample that has since gone stale is kept in `last_good` so
+    /// the failure can still be answered with real data.
+    clock: Option<CameraClock>,
 }
 
 /// Read the camera's own clock, reusing a recent sample.
@@ -525,19 +541,48 @@ async fn read_camera_clock(cam: &CameraEntry) -> Option<CameraClock> {
     if let Some(sample) = slot.as_ref() {
         let age = sample.at.elapsed();
         if age < CLOCK_CACHE_TTL {
-            return Some(advance(sample.clock, age));
+            // Inside the TTL, answer from the cache — including when the cached
+            // outcome was a failure, in which case we fall through to the last
+            // good sample rather than asking the camera again.
+            return match sample.clock {
+                Some(clock) => Some(advance(clock, age)),
+                None => stale_clock(cam).await,
+            };
         }
     }
-    let general = cam
+
+    let clock = cam
         .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_general().await?) }))
         .await
-        .ok()?;
-    let clock = clock_from_general(&general)?;
-    *slot = Some(ClockSample {
-        at: std::time::Instant::now(),
-        clock,
-    });
-    Some(clock)
+        .ok()
+        .as_ref()
+        .and_then(clock_from_general);
+
+    // Stamp the attempt either way. An incomplete answer counts as a failure
+    // for throttling purposes for the same reason an unreachable camera does:
+    // asking again immediately cannot produce a different result.
+    let at = std::time::Instant::now();
+    *slot = Some(ClockSample { at, clock });
+    match clock {
+        Some(clock) => {
+            *cam.clock.last_good.lock().await = Some(ClockSample {
+                at,
+                clock: Some(clock),
+            });
+            Some(clock)
+        }
+        None => stale_clock(cam).await,
+    }
+}
+
+/// The last reading that really came from the camera, advanced to now.
+///
+/// `None` when the camera has never answered, which is the only case where
+/// `GetSystemDateAndTime` falls back to the bridge's own clock.
+async fn stale_clock(cam: &CameraEntry) -> Option<CameraClock> {
+    let last = cam.clock.last_good.lock().await;
+    let sample = last.as_ref()?;
+    Some(advance(sample.clock?, sample.at.elapsed()))
 }
 
 /// Move a cached sample forward by how long ago it was taken.
@@ -555,6 +600,7 @@ fn advance(clock: CameraClock, by: std::time::Duration) -> CameraClock {
 /// the old time for up to a minute after a successful `SetSystemDateAndTime`.
 async fn invalidate_clock_cache(cam: &CameraEntry) {
     *cam.clock.slot.lock().await = None;
+    *cam.clock.last_good.lock().await = None;
 }
 
 fn clock_from_general(general: &SystemGeneral) -> Option<CameraClock> {
@@ -583,7 +629,10 @@ async fn write_camera_clock(
 ) -> Result<(), FaultBody> {
     // Read-modify-write: `SystemGeneral` also carries the device name, language
     // and OSD format, and sending a partial structure back would be a silent
-    // way to lose them.
+    // way to lose them. Held across the whole cycle so a concurrent `SetOSD`
+    // cannot read the same snapshot and write back a structure with the old
+    // clock in it.
+    let _guard = cam.general_lock.lock().await;
     let mut general = cam
         .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_general().await?) }))
         .await
@@ -679,11 +728,25 @@ fn posix_tz(seconds_west: i32) -> String {
 
 /// Pull the UTC instant out of a `SetSystemDateAndTime` request.
 ///
-/// `None` when there is no usable `UTCDateTime` — which is what a client asking
-/// for `DateTimeType` `NTP` sends, and the bridge has no way to configure NTP
-/// on the camera.
+/// `None` when the request is not a usable manual clock write — either because
+/// it asks for `DateTimeType` `NTP`, which the bridge cannot configure on the
+/// camera, or because it carries no complete `UTCDateTime`.
+///
+/// The `DateTimeType` check is not redundant with the presence of a timestamp:
+/// clients routinely send an `NTP` request that *also* echoes a `UTCDateTime`,
+/// and applying that as a manual write would silently do the opposite of what
+/// was asked — the camera's clock pinned to a one-off value while the client
+/// believes it is now synchronising itself.
 fn parse_set_system_date_and_time(body_xml: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     use chrono::{NaiveDate, TimeZone, Utc};
+    match read_first_text_element(body_xml, "DateTimeType") {
+        Some(t) if t.trim().eq_ignore_ascii_case("manual") => {}
+        // An absent DateTimeType is tolerated: the field is required by the
+        // schema, but a request that omitted it and supplied a timestamp can
+        // only have meant a manual write.
+        None => {}
+        Some(_) => return None,
+    }
     let num = |name: &str| -> Option<i64> {
         read_first_text_element(body_xml, name)?.trim().parse().ok()
     };
@@ -971,5 +1034,57 @@ mod tests {
         let body = "<tds:SetSystemDateAndTime><tds:DateTimeType>NTP</tds:DateTimeType>\
 </tds:SetSystemDateAndTime>";
         assert!(parse_set_system_date_and_time(body).is_none());
+    }
+
+    /// Clients routinely send an NTP request that *also* echoes a UTCDateTime.
+    /// Applying that as a manual write would pin the clock to a one-off value
+    /// while the client believes it just enabled synchronisation — the exact
+    /// opposite of what was asked.
+    #[test]
+    fn an_ntp_request_carrying_a_timestamp_is_still_refused() {
+        let body = "<tds:SetSystemDateAndTime><tds:DateTimeType>NTP</tds:DateTimeType>\
+<tds:UTCDateTime><tt:Time><tt:Hour>7</tt:Hour><tt:Minute>30</tt:Minute><tt:Second>5</tt:Second></tt:Time>\
+<tt:Date><tt:Year>2026</tt:Year><tt:Month>8</tt:Month><tt:Day>9</tt:Day></tt:Date>\
+</tds:UTCDateTime></tds:SetSystemDateAndTime>";
+        assert!(
+            parse_set_system_date_and_time(body).is_none(),
+            "an NTP request must not be applied as a manual clock write"
+        );
+    }
+
+    /// The schema requires DateTimeType, but a request that omits it and
+    /// supplies a timestamp can only have meant a manual write.
+    #[test]
+    fn a_timestamp_without_a_type_is_taken_as_manual() {
+        let body = "<tds:SetSystemDateAndTime>\
+<tds:UTCDateTime><tt:Time><tt:Hour>7</tt:Hour><tt:Minute>30</tt:Minute><tt:Second>5</tt:Second></tt:Time>\
+<tt:Date><tt:Year>2026</tt:Year><tt:Month>8</tt:Month><tt:Day>9</tt:Day></tt:Date>\
+</tds:UTCDateTime></tds:SetSystemDateAndTime>";
+        assert!(parse_set_system_date_and_time(body).is_some());
+    }
+
+    /// `DelayTimes` is a `tt:DurationRange`, not a duration. A bare duration
+    /// here is schema-invalid and gSOAP-based clients reject the whole
+    /// `GetRelayOutputOptions` response over it.
+    #[test]
+    fn relay_options_report_the_delay_as_a_range() {
+        let all = relay_outputs(&caps_with(true, false));
+        let siren = all
+            .iter()
+            .find(|r| r.token == "relay_siren")
+            .expect("the siren is always offered");
+        let xml = siren.render_options();
+        assert!(
+            xml.contains(
+                "<tds:DelayTimes><tt:Min>PT5S</tt:Min><tt:Max>PT5S</tt:Max></tds:DelayTimes>"
+            ),
+            "{}",
+            xml
+        );
+        assert!(
+            !xml.contains("<tds:DelayTimes>PT5S</tds:DelayTimes>"),
+            "{}",
+            xml
+        );
     }
 }
