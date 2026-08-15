@@ -6,6 +6,8 @@
 //! * `SystemReboot`
 //! * the camera's own clock (`GetSystemDateAndTime` / `SetSystemDateAndTime`)
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use neolink_core::bc::xml::SystemGeneral;
 use neolink_core::bc_protocol::{BcCamera, LightState};
@@ -23,33 +25,46 @@ pub(crate) struct DeviceInfo {
     pub(crate) hardware_id: String,
 }
 
-/// Pull DeviceInformation off the camera. Falls back to neutral strings on any
-/// transient read failure so a quirky camera doesn't bring the bridge down.
-async fn read_device_info(cam: &CameraEntry) -> DeviceInfo {
-    let mut info = DeviceInfo {
-        manufacturer: "Reolink".to_string(),
-        model: "Unknown".to_string(),
-        firmware_version: "Unknown".to_string(),
-        serial_number: "Unknown".to_string(),
-        hardware_id: "Unknown".to_string(),
-    };
-    let r = cam
-        .run(|c: &BcCamera| {
-            Box::pin(async move {
-                let v = c.version().await?;
-                Ok::<_, anyhow::Error>(v)
-            })
+/// Pull DeviceInformation off the camera, reusing the answer for as long as the
+/// connection it was read over lasts.
+///
+/// Model, firmware, serial and hardware ID cannot change under a live
+/// connection — a firmware upgrade reboots the camera, which reconnects and so
+/// invalidates this. `GetDeviceInformation` and `GetScopes` are both polled
+/// routinely by VMS clients and were each paying a camera round-trip every time.
+///
+/// Falls back to neutral strings on any transient read failure so a quirky
+/// camera doesn't bring the bridge down.
+async fn read_device_info(cam: &CameraEntry) -> Arc<DeviceInfo> {
+    let entry = cam.device_info.clone();
+    entry
+        .get_or_init(cam, || async {
+            let mut info = DeviceInfo {
+                manufacturer: "Reolink".to_string(),
+                model: "Unknown".to_string(),
+                firmware_version: "Unknown".to_string(),
+                serial_number: "Unknown".to_string(),
+                hardware_id: "Unknown".to_string(),
+            };
+            let r = cam
+                .run(|c: &BcCamera| {
+                    Box::pin(async move {
+                        let v = c.version().await?;
+                        Ok::<_, anyhow::Error>(v)
+                    })
+                })
+                .await;
+            if let Ok(v) = r {
+                if let Some(m) = v.model {
+                    info.model = m;
+                }
+                info.firmware_version = v.firmwareVersion;
+                info.serial_number = v.serialNumber;
+                info.hardware_id = v.hardwareVersion;
+            }
+            Arc::new(info)
         })
-        .await;
-    if let Ok(v) = r {
-        if let Some(m) = v.model {
-            info.model = m;
-        }
-        info.firmware_version = v.firmwareVersion;
-        info.serial_number = v.serialNumber;
-        info.hardware_id = v.hardwareVersion;
-    }
-    info
+        .await
 }
 
 pub(crate) async fn dispatch(
@@ -208,14 +223,15 @@ pub(crate) async fn dispatch(
             if capabilities(cam).await.ptz() {
                 scopes.push("onvif://www.onvif.org/type/ptz".to_string());
             }
-            // Add the model as a hardware scope if known.
-            if let Ok(v) = cam
-                .run(|c| Box::pin(async move { Ok(c.version().await?) }))
-                .await
-            {
-                if let Some(m) = v.model {
-                    scopes.push(format!("onvif://www.onvif.org/hardware/{}", scope_safe(&m)));
-                }
+            // Add the model as a hardware scope if known. Shares the cached
+            // device info with `GetDeviceInformation` rather than issuing its
+            // own `version()` read.
+            let info = read_device_info(cam).await;
+            if info.model != "Unknown" {
+                scopes.push(format!(
+                    "onvif://www.onvif.org/hardware/{}",
+                    scope_safe(&info.model)
+                ));
             }
             let items: String = scopes
                 .into_iter()
