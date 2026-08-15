@@ -90,6 +90,17 @@ async fn main() -> Result<()> {
         .validate()
         .with_context(|| format!("Failed to validate the {:?} config file", conf_path))?;
 
+    // Applied before the reactor opens any camera socket. `validate()` above has
+    // already rejected an unparseable value, so a `None` here means "not set".
+    if let Some(dscp) = config
+        .dscp
+        .as_deref()
+        .and_then(neolink_core::dscp::parse_dscp)
+    {
+        log::info!("Marking camera traffic with DSCP {dscp}");
+        neolink_core::dscp::set_dscp(Some(dscp));
+    }
+
     let neo_reactor = NeoReactor::new(config.clone()).await;
 
     match opt.cmd {

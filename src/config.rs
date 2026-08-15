@@ -53,6 +53,35 @@ pub(crate) struct Config {
     #[validate(nested)]
     #[serde(default)]
     pub(crate) onvif: OnvifGlobalConfig,
+
+    /// DSCP class applied to every socket that talks to a camera.
+    ///
+    /// Accepts a number (`44`) or a standard class name (`"VOICE-ADMIT"`,
+    /// `"EF"`, `"AF41"`, `"CS5"`, ...). Unset means the traffic is left
+    /// unmarked, which is what neolink has always done.
+    ///
+    /// Note this covers the *whole* camera conversation, not just commands:
+    /// Baichuan carries control messages and the video substream on one
+    /// connection, so there is nothing finer to mark. See `dscp` in the core
+    /// crate.
+    #[validate(custom(function = "validate_dscp"))]
+    #[serde(default)]
+    pub(crate) dscp: Option<String>,
+}
+
+/// The value has to resolve at load time, or a typo like `"VOCIE-ADMIT"` would
+/// silently leave the traffic unmarked and look like the feature is broken.
+fn validate_dscp(v: &str) -> Result<(), ValidationError> {
+    if neolink_core::dscp::parse_dscp(v).is_some() {
+        return Ok(());
+    }
+    let mut err = ValidationError::new("dscp");
+    err.message = Some(
+        "Must be 0-63 or a class name such as VOICE-ADMIT, EF, AF41, CS5"
+            .to_string()
+            .into(),
+    );
+    Err(err)
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]

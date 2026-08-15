@@ -1286,6 +1286,7 @@ async fn connect() -> Result<UdpSocket> {
         .collect();
     let socket = UdpSocket::bind(&addrs[..]).await?;
     socket.set_broadcast(true)?;
+    crate::dscp::mark((&socket).into(), false);
 
     Ok(socket)
 }
