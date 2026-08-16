@@ -15,7 +15,24 @@ use crate::onvif::services::ptz::render_ptz_configuration_xml;
 use crate::onvif::soap::{wrap_envelope, xml_escape, FaultCode, NS_ALL};
 use crate::onvif::state::{url_path_segment, CameraEntry, OnvifState, OnvifStream};
 
+/// How long a read of the camera's encoder tables stays good for.
+///
+/// Unlike the capability probe, these are *not* connection-scoped: resolution,
+/// framerate and bitrate are user-settable at runtime from the Reolink app, so
+/// they can change under a live connection. A short TTL keeps the profiles
+/// honest while collapsing the burst of media calls a VMS makes back-to-back
+/// (`GetProfiles`, `GetStreamUri`, `GetSnapshotUri`, ...) into one camera read
+/// instead of one per request.
+const STREAM_INFO_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Cache for [`read_stream_descs`]. Lives on the `CameraEntry`.
+#[derive(Default)]
+pub(crate) struct StreamInfoCache {
+    slot: tokio::sync::Mutex<Option<(std::time::Instant, Vec<EncodeTable>)>>,
+}
+
 /// Per-stream descriptor used to build profile XML.
+#[derive(Clone)]
 struct StreamDesc {
     stream: OnvifStream,
     width: u32,
@@ -72,7 +89,17 @@ fn options_including(values: &[u32], current: u32) -> Vec<u32> {
     out
 }
 
-async fn read_stream_descs(cam: &CameraEntry) -> Vec<StreamDesc> {
+/// The camera's encoder tables, reusing a recent read.
+///
+/// The lock is held across the read so a burst of media calls costs the camera
+/// one round-trip rather than one each.
+async fn read_encode_tables(cam: &CameraEntry) -> Vec<EncodeTable> {
+    let mut slot = cam.stream_info.slot.lock().await;
+    if let Some((at, tables)) = slot.as_ref() {
+        if at.elapsed() < STREAM_INFO_TTL {
+            return tables.clone();
+        }
+    }
     // Try the camera first. If it errors (or is offline), fall back to
     // plausible defaults so the bridge can still answer profile queries.
     let res = cam
@@ -84,8 +111,20 @@ async fn read_stream_descs(cam: &CameraEntry) -> Vec<StreamDesc> {
             .into_iter()
             .flat_map(|s| s.encode_tables.into_iter())
             .collect(),
-        Err(_) => Vec::new(),
+        Err(e) => {
+            log::debug!("ONVIF: camera {}: no stream info ({e})", cam.name);
+            // A failed read is cached too, deliberately: an offline camera is
+            // exactly the case where one doomed round-trip per request is worst.
+            // The per-stream fallbacks below still produce a usable profile.
+            Vec::new()
+        }
     };
+    *slot = Some((std::time::Instant::now(), tables.clone()));
+    tables
+}
+
+async fn read_stream_descs(cam: &CameraEntry) -> Vec<StreamDesc> {
+    let tables = read_encode_tables(cam).await;
 
     cam.streams
         .iter()
@@ -359,13 +398,41 @@ fn profile_parts(
     }
 }
 
+/// Does this action's response depend on the camera's encoder tables?
+///
+/// Stated as a deny-list so an action nobody thought about still gets the data
+/// it might need: being wrong here costs a redundant (cached) read, whereas an
+/// allow-list that missed an action would silently answer from empty tables.
+fn action_reads_streams(action: &str) -> bool {
+    !matches!(
+        action,
+        "GetServiceCapabilities"
+            | "GetOSDs"
+            | "GetOSD"
+            | "GetOSDOptions"
+            | "SetOSD"
+            | "GetAudioSources"
+            | "GetAudioSourceConfigurations"
+            | "GetAudioEncoderConfigurations"
+            | "GetAudioEncoderConfigurationOptions"
+    )
+}
+
 pub(crate) async fn dispatch(
     state: &OnvifState,
     cam: &CameraEntry,
     action: &str,
     body_xml: &str,
 ) -> Result<String, FaultBody> {
-    let descs = read_stream_descs(cam).await;
+    // Only the arms that describe video need the encoder tables. Audio, OSD and
+    // the service-capabilities answer are independent of them, and making those
+    // wait on a camera read — which is what an unconditional prefetch here did —
+    // bought nothing.
+    let descs = if action_reads_streams(action) {
+        read_stream_descs(cam).await
+    } else {
+        Vec::new()
+    };
     let caps = capabilities(cam).await;
     let vs_xml = render_video_source_configuration(cam, &descs);
 

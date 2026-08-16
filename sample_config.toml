@@ -16,6 +16,21 @@ bind = "0.0.0.0"
 # none|requested|required - default none
 # tls_client_auth = "required"
 
+# QoS marking for the traffic neolink sends to your cameras. Unset by default,
+# which leaves the traffic unmarked (what neolink has always done).
+#
+# Accepts a number 0-63 or a standard class name:
+#     VOICE-ADMIT (44), EF (46), AF41 (34), CS5 (40), ...
+#
+# Worth knowing before you set this: Reolink's protocol carries PTZ commands,
+# config reads AND the video substream over one connection per camera, so there
+# is no separate control channel to mark. Whatever you choose here applies to
+# the video too. If your network polices its voice class by bandwidth, putting a
+# main stream in it will get the stream dropped -- AF41 or CS4 are usually the
+# better fit for camera traffic, and VOICE-ADMIT only makes sense on a network
+# you know is provisioned for it.
+# dscp = "VOICE-ADMIT"
+
 # You can password protect the rtsp server mount points by adding users
 # like the following me and someone. If you do not add [[users]]
 # then anyone can connect without a password or username

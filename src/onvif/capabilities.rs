@@ -34,26 +34,42 @@
 //! back to the previous always-on behaviour. Removing a capability needs
 //! positive evidence that it is absent; that way a flaky camera loses no
 //! function it used to have.
+//!
+//! # When the answer is re-read
+//!
+//! Once per BC connection, not on a timer.
+//!
+//! These are properties of the hardware and of the logged-in session, and both
+//! of those are established at connect+login. A firmware upgrade reboots the
+//! camera, which drops the connection; a permission change only takes effect at
+//! the next login — and the core caches the ability list at login
+//! (`polulate_abilities`) and never refreshes it, so re-reading abilities more
+//! often than that would only let this module disagree with the layer that
+//! actually enforces them. The connection is therefore both the correct
+//! invalidation signal and a strictly earlier one than any TTL.
+//!
+//! This used to be a 300-second TTL, which meant every camera paid a full probe
+//! every five minutes — four sequential round-trips, one of them a deliberate
+//! failure — with the cache mutex held throughout, so every ONVIF request for
+//! every service queued behind it. That is the single biggest source of ONVIF
+//! command latency in the bridge.
 
+use std::sync::Weak;
 use std::time::{Duration, Instant};
 
 use neolink_core::bc::xml::{AbilityInfo, Support};
 use neolink_core::bc_protocol::BcCamera;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
-use crate::onvif::state::CameraEntry;
+use crate::onvif::state::{same_connection, CameraEntry};
 
-/// How long a probe that learned something stays good for. Capabilities are
-/// physical properties of the camera; they change when the hardware is
-/// swapped, not while it is running. Long enough that an ONVIF client polling
-/// `GetProfiles` costs nothing, short enough to pick up a firmware upgrade or
-/// a permission change without a neolink restart.
-const CACHE_TTL_KNOWN: Duration = Duration::from_secs(300);
-
-/// How long a probe that learned *nothing* stays good for. This is the
-/// camera-is-offline case: keep answering (with the permissive defaults)
-/// rather than stalling every SOAP request on a dead socket, but retry soon.
-const CACHE_TTL_UNKNOWN: Duration = Duration::from_secs(30);
+/// How long to wait before re-probing a camera that told us *nothing*.
+///
+/// This is the camera-is-offline case. There is no connection to key the answer
+/// to, so it can't be cached against one; back off instead of hammering a dead
+/// socket on every SOAP request, and keep serving the permissive defaults in
+/// the meantime.
+const RETRY_UNKNOWN: Duration = Duration::from_secs(30);
 
 /// The resolved capability set handed to the ONVIF handlers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,15 +413,39 @@ pub(crate) fn ptz_preset_write_ability(info: &AbilityInfo, channel_id: u8) -> Op
 
 /// Per-camera cache. Lives on the `CameraEntry` so it survives config reloads
 /// along with the connection it describes.
+///
+/// Reads go through `slot` (an `RwLock`) so a cached answer never waits on
+/// anything; `probe_lock` exists only to stop N concurrent clients triggering N
+/// probes of the same camera.
 #[derive(Default)]
 pub(crate) struct CapabilityCache {
-    slot: Mutex<Option<CacheEntry>>,
+    slot: RwLock<Option<CacheEntry>>,
+    probe_lock: Mutex<()>,
 }
 
+#[derive(Clone)]
 struct CacheEntry {
+    /// The connection these capabilities were read over, or a null `Weak` when
+    /// the probe learned nothing (nothing to key it to).
+    conn: Weak<BcCamera>,
+    /// When the probe ran. Only consulted for the learned-nothing case, where
+    /// there is no connection to invalidate against.
     at: Instant,
-    ttl: Duration,
+    informative: bool,
     caps: CameraCapabilities,
+}
+
+impl CacheEntry {
+    /// Is this entry still an answer about the camera as it is *now*?
+    fn is_fresh(&self, conn: &Weak<BcCamera>) -> bool {
+        if self.informative {
+            same_connection(&self.conn, conn)
+        } else {
+            // Nothing was learned, so this is a placeholder rather than an
+            // answer. Hold it briefly to avoid hammering an offline camera.
+            self.at.elapsed() < RETRY_UNKNOWN
+        }
+    }
 }
 
 /// The capabilities of `cam` if they are already cached, without ever touching
@@ -416,33 +456,65 @@ struct CacheEntry {
 /// stall the responder for every other camera. `None` means "no answer yet";
 /// callers decide what to announce in the meantime.
 pub(crate) fn cached(cam: &CameraEntry) -> Option<CameraCapabilities> {
-    let slot = cam.capabilities.slot.try_lock().ok()?;
+    let slot = cam.capabilities.slot.try_read().ok()?;
     let entry = slot.as_ref()?;
-    (entry.at.elapsed() < entry.ttl).then_some(entry.caps)
+    entry
+        .is_fresh(&cam.connection_token())
+        .then_some(entry.caps)
 }
 
-/// The capabilities of `cam`, probing the camera if the cached answer has
-/// expired.
+/// The capabilities of `cam`, probing the camera if what we have no longer
+/// describes the current connection.
 ///
-/// The lock is deliberately held across the probe: several ONVIF clients
-/// polling at once should cost the camera one round of queries, not one per
-/// request. The probe is bounded by `CameraEntry::run`'s hard timeout, so a
-/// dead camera delays callers by that much and no more.
+/// In the steady state this is a single `RwLock` read: the probe runs once per
+/// connection, and [`probe_on_connect`] normally gets there first so no client
+/// request ever pays for it.
 pub(crate) async fn capabilities(cam: &CameraEntry) -> CameraCapabilities {
-    let mut slot = cam.capabilities.slot.lock().await;
-    if let Some(entry) = slot.as_ref() {
-        if entry.at.elapsed() < entry.ttl {
+    let conn = cam.connection_token();
+    if let Some(entry) = cam.capabilities.slot.read().await.as_ref() {
+        if entry.is_fresh(&conn) {
+            return entry.caps;
+        }
+    }
+    refresh(cam).await
+}
+
+/// Probe and store, coalescing concurrent callers onto one probe.
+async fn refresh(cam: &CameraEntry) -> CameraCapabilities {
+    // Someone else is already probing. Rather than queue behind them, serve
+    // whatever we last knew — a slightly stale capability set is a far better
+    // answer to a VMS than a request that blocks for the probe's duration. Only
+    // a camera we have never successfully probed waits.
+    let _guard = match cam.capabilities.probe_lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            if let Some(entry) = cam.capabilities.slot.read().await.as_ref() {
+                return entry.caps;
+            }
+            // Nothing to fall back on: wait for the in-flight probe, then take
+            // its result.
+            let guard = cam.capabilities.probe_lock.lock().await;
+            if let Some(entry) = cam.capabilities.slot.read().await.as_ref() {
+                return entry.caps;
+            }
+            guard
+        }
+    };
+
+    // Re-check under the lock: we may have been the one queued behind a probe
+    // that has just finished.
+    let conn = cam.connection_token();
+    if let Some(entry) = cam.capabilities.slot.read().await.as_ref() {
+        if entry.is_fresh(&conn) {
             return entry.caps;
         }
     }
 
     let probe = run_probe(cam).await;
     let caps = resolve(&probe);
-    let ttl = if probe.is_informative() {
-        CACHE_TTL_KNOWN
-    } else {
-        CACHE_TTL_UNKNOWN
-    };
+    let informative = probe.is_informative();
+
+    let mut slot = cam.capabilities.slot.write().await;
     let changed = slot.as_ref().map(|e| e.caps) != Some(caps);
     if changed {
         log::debug!(
@@ -461,38 +533,112 @@ pub(crate) async fn capabilities(cam: &CameraEntry) -> CameraCapabilities {
         );
     }
     *slot = Some(CacheEntry {
+        // Keyed to the connection as it was *before* the probe: if it was
+        // replaced mid-probe the entry no longer matches and the next caller
+        // re-probes, which is the safe direction.
+        conn: if informative { conn } else { Weak::new() },
         at: Instant::now(),
-        ttl,
+        informative,
         caps,
     });
     caps
 }
 
+/// Keep `cam`'s capabilities probed for as long as it has a connection.
+///
+/// Runs the probe as soon as a connection appears and again after every
+/// reconnect, so the answer is already cached by the time any client asks.
+/// Without this the first SOAP request after each reconnect pays for the probe.
+///
+/// Takes a `Weak` and upgrades it only for the duration of a probe, so a config
+/// reload that drops the camera from the map is free to actually drop it.
+pub(crate) async fn probe_on_connect(cam_weak: std::sync::Weak<CameraEntry>) {
+    // The watch is cloned from the shared camera actor, so it stays usable
+    // without keeping the `CameraEntry` alive.
+    let mut watch = match cam_weak.upgrade() {
+        Some(cam) => cam.instance.camera(),
+        None => return,
+    };
+    loop {
+        if cam_weak.strong_count() == 0 {
+            return;
+        }
+        // Scoped tightly: the watch borrow is a synchronous guard and must not
+        // be alive across the `.await`s below. `borrow_and_update` marks the
+        // current value seen so `changed()` only fires on a real transition.
+        let connected = { watch.borrow_and_update().strong_count() > 0 };
+        if connected {
+            let Some(cam) = cam_weak.upgrade() else {
+                return;
+            };
+            let conn = cam.connection_token();
+            let already_done = cam
+                .capabilities
+                .slot
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|e| e.is_fresh(&conn));
+            if !already_done {
+                log::trace!(
+                    "ONVIF: camera {}: probing capabilities on connect",
+                    cam.name
+                );
+                refresh(&cam).await;
+            }
+            drop(cam);
+        }
+        // Sleep until this connection goes away or is replaced.
+        if watch.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn run_probe(cam: &CameraEntry) -> Probe {
-    let mut p = Probe::default();
     let channel_id = cam.channel_id;
 
-    match cam
-        .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_support().await?) }))
-        .await
-    {
+    // Issued concurrently. They are independent reads over one multiplexed BC
+    // connection, and running them in series made the probe cost the sum of
+    // four timeouts on a camera that answers slowly (or not at all) instead of
+    // the slowest single one.
+    let (support, abilities, floodlight) = futures::join!(
+        cam.run(|c: &BcCamera| Box::pin(async move { Ok(c.get_support().await?) })),
+        cam.run(|c: &BcCamera| Box::pin(async move { Ok(c.get_abilityinfo().await?) })),
+        // There is no "do you have a floodlight" flag in `Support`, so the read
+        // itself is the test. This mirrors how the MQTT surface decides whether
+        // to publish floodlight state.
+        cam.run(|c: &BcCamera| Box::pin(async move { Ok(c.get_flightlight_tasks().await?) })),
+    );
+
+    let mut p = Probe::default();
+    match support {
         Ok(support) => apply_support(&mut p, &support, channel_id),
         Err(e) => log::debug!("ONVIF: camera {}: no Support table ({e})", cam.name),
     }
-
-    match cam
-        .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_abilityinfo().await?) }))
-        .await
-    {
+    match abilities {
         Ok(info) => {
             p.ability_control = ptz_control_ability(&info, channel_id);
             p.ability_preset_write = ptz_preset_write_ability(&info, channel_id);
         }
         Err(e) => log::debug!("ONVIF: camera {}: no AbilityInfo ({e})", cam.name),
     }
+    // A refusal is an answer ("no floodlight here"); a camera that never replied
+    // is not, and must leave this unknown — otherwise `is_informative` below
+    // reads an offline camera as a successfully probed one and pins the
+    // permissive defaults for the whole connection.
+    p.floodlight = match floodlight {
+        Ok(_) => Some(true),
+        Err(e) if is_refusal(&e) => Some(false),
+        Err(e) => {
+            log::debug!("ONVIF: camera {}: floodlight probe failed ({e})", cam.name);
+            None
+        }
+    };
 
     // Only worth asking when something might move; on a camera we already know
-    // has no PTZ control this is a guaranteed fault.
+    // has no PTZ control this is a guaranteed fault. Sequenced after the reads
+    // above precisely so that check can be made.
     if p.ability_control != Some(false) && p.support_ptz_control != Some(false) {
         match cam
             .run(|c: &BcCamera| Box::pin(async move { Ok(c.get_zoom().await?) }))
@@ -506,16 +652,20 @@ async fn run_probe(cam: &CameraEntry) -> Probe {
         }
     }
 
-    // There is no "do you have a floodlight" flag in `Support`, so the read
-    // itself is the test: a camera without one faults on the task read. This
-    // mirrors how the MQTT surface decides whether to publish floodlight state.
-    p.floodlight = Some(
-        cam.run(|c: &BcCamera| Box::pin(async move { Ok(c.get_flightlight_tasks().await?) }))
-            .await
-            .is_ok(),
-    );
-
     p
+}
+
+/// Did the camera answer and decline, as opposed to not answering at all?
+///
+/// `CameraServiceUnavailable` is the camera saying "I got your message and I do
+/// not do that" — which for the floodlight probe is exactly the evidence we
+/// want. A timeout or a dropped connection tells us nothing about the hardware.
+fn is_refusal(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<neolink_core::Error>(),
+        Some(neolink_core::Error::CameraServiceUnavailable { .. })
+            | Some(neolink_core::Error::UnintelligibleReply { .. })
+    )
 }
 
 #[cfg(test)]
@@ -525,6 +675,73 @@ mod tests {
 
     fn probe() -> Probe {
         Probe::default()
+    }
+
+    /// An offline camera must not look like a successfully probed one.
+    ///
+    /// The floodlight probe used to be `Some(read.is_ok())`, which is `Some`
+    /// whatever happens — so `is_informative` was unconditionally true, the
+    /// "learned nothing" branch was unreachable, and a camera that answered
+    /// nothing had the permissive defaults cached against it as though they
+    /// were measured.
+    #[test]
+    fn a_camera_that_answered_nothing_is_not_informative() {
+        let mut p = probe();
+        // What `run_probe` now records when the floodlight read did not get an
+        // answer, as opposed to getting a refusal.
+        p.floodlight = None;
+        assert!(
+            !p.is_informative(),
+            "a probe with no answers must not be treated as an answer"
+        );
+    }
+
+    /// A refusal *is* an answer: the camera replied, and what it said is that
+    /// it has no floodlight. That is exactly the evidence the probe is for.
+    #[test]
+    fn a_refused_floodlight_read_is_informative() {
+        let mut p = probe();
+        p.floodlight = Some(false);
+        assert!(p.is_informative());
+        assert!(!resolve(&p).floodlight);
+
+        let mut p = probe();
+        p.floodlight = Some(true);
+        assert!(p.is_informative());
+        assert!(resolve(&p).floodlight);
+    }
+
+    /// Any single answer is enough to key the result to the connection; the
+    /// floodlight is just the one that is always attempted.
+    #[test]
+    fn one_answered_field_is_enough_to_be_informative() {
+        for p in [
+            Probe {
+                support_ptz_control: Some(true),
+                ..Default::default()
+            },
+            Probe {
+                ability_control: Some(false),
+                ..Default::default()
+            },
+            Probe {
+                zoom_range: Some((0, 100)),
+                ..Default::default()
+            },
+        ] {
+            assert!(p.is_informative(), "{p:?}");
+        }
+        assert!(!Probe::default().is_informative());
+    }
+
+    /// However the floodlight read failed, the *resolved* capability is the
+    /// same conservative "no floodlight" it always was — only the caching
+    /// decision changes.
+    #[test]
+    fn an_unanswered_floodlight_still_resolves_to_absent() {
+        let mut p = probe();
+        p.floodlight = None;
+        assert!(!resolve(&p).floodlight);
     }
 
     /// The whole point of the fallbacks: a camera that says nothing keeps

@@ -68,6 +68,10 @@ async fn connect_to(addr: SocketAddr) -> Result<TcpStream> {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
     };
+    // Marked before connect so the SYN itself carries the class — a switch that
+    // classifies on the first packet of a flow would otherwise pin the whole
+    // connection to the default queue.
+    crate::dscp::mark((&socket).into(), addr.is_ipv6());
 
     Ok(socket.connect(addr).await?)
 }

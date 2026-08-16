@@ -19,6 +19,11 @@ use super::{MdState, NeoCamCommand, NeoCamThreadState, Permit};
 use crate::{config::CameraConfig, AnyResult, Result};
 use neolink_core::bc_protocol::{AiState, BcCamera};
 
+/// How many times a background task re-runs after the camera answers `400`
+/// ("service unavailable", which it also uses for "still booting"). One second
+/// apart, so this is also the delay budget.
+const RETRY_400_DEFAULT: usize = 4;
+
 mod stream;
 
 #[cfg(feature = "pushnoti")]
@@ -79,6 +84,27 @@ impl NeoInstance {
         self.run_passive_task(task).await
     }
 
+    /// Like [`NeoInstance::run_task`] but without the "camera is still waking
+    /// up" retry ladder.
+    ///
+    /// A response code of 400 normally earns five retries a second apart, which
+    /// is right for a background loop that only cares about eventually getting
+    /// an answer. It is wrong for a request a client is synchronously blocked
+    /// on: ONVIF callers sit behind a hard timeout, so those five seconds turn
+    /// what the camera actually said ("I don't support that") into a timeout
+    /// that says nothing. Reconnect retries still apply — only the 400 ladder
+    /// is skipped.
+    pub(crate) async fn run_task_now<F, T>(&self, task: F) -> AnyResult<T>
+    where
+        F: for<'a> Fn(
+            &'a BcCamera,
+        )
+            -> std::pin::Pin<Box<dyn futures::Future<Output = AnyResult<T>> + Send + 'a>>,
+    {
+        let _permit = self.permit().await?;
+        self.run_passive_task_with(task, 0).await
+    }
+
     /// This is a helpful convience function
     ///
     /// Given an async task it will:
@@ -93,6 +119,22 @@ impl NeoInstance {
     ///
     /// The streams and MD use this
     pub(crate) async fn run_passive_task<F, T>(&self, task: F) -> AnyResult<T>
+    where
+        F: for<'a> Fn(
+            &'a BcCamera,
+        )
+            -> std::pin::Pin<Box<dyn futures::Future<Output = AnyResult<T>> + Send + 'a>>,
+    {
+        self.run_passive_task_with(task, RETRY_400_DEFAULT).await
+    }
+
+    /// [`NeoInstance::run_passive_task`] with an explicit budget for the
+    /// "camera is booting" 400 retries. See [`NeoInstance::run_task_now`].
+    pub(crate) async fn run_passive_task_with<F, T>(
+        &self,
+        task: F,
+        retries_400: usize,
+    ) -> AnyResult<T>
     where
         F: for<'a> Fn(
             &'a BcCamera,
@@ -124,16 +166,21 @@ impl NeoInstance {
                     if let Some(cam) = camera.clone() {
                         let cam_ref = cam.as_ref();
                         let mut r = Err(anyhow!("No run"));
-                        for i in 0..5 {
+                        for i in 0..=retries_400 {
                             r = task(cam_ref).await;
                             if let Err(e) = &r {
                                 log::debug!("- Task Error: {e:?}");
+                            }
+                            if i == retries_400 {
+                                // Budget spent (or never had one): hand back
+                                // what the camera actually said.
+                                break;
                             }
                             if let Err(Some(e @ neolink_core::Error::CameraServiceUnavailable{code: 400, ..})) = r.as_ref().map_err(|e| e.downcast_ref::<neolink_core::Error>()) {
                                 // Retryable without a reconnect
                                 // Usually occurs when camera is starting up
                                 // or the connection is initialising
-                                log::debug!("Got a 400 code for {e:?} retry {i}/5, ");
+                                log::debug!("Got a 400 code for {e:?} retry {i}/{retries_400}, ");
 
                                 sleep(Duration::from_secs(1)).await;
                                 continue;

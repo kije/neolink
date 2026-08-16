@@ -65,6 +65,8 @@ pub mod bc_protocol;
 pub mod bcmedia;
 ///  Contains low level structures and formats for the udpstream
 pub mod bcudp;
+/// DSCP/QoS marking for the sockets that talk to cameras
+pub mod dscp;
 
 /// This is the top level error structure of the library
 ///

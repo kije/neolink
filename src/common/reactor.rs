@@ -97,6 +97,13 @@ impl NeoReactor {
                                 let _ = sender.send(new);
                             },
                             NeoReactorCommand::UpdateConfig(new_conf, reply) => {
+                                // Pick up a changed DSCP before anything reconnects.
+                                // Sockets already open keep the marking they were
+                                // created with; the new value lands as connections
+                                // are re-established.
+                                neolink_core::dscp::set_dscp(
+                                    new_conf.dscp.as_deref().and_then(neolink_core::dscp::parse_dscp)
+                                );
                                 // Shutdown or Notify instances of a change
                                 let mut names = new_conf.cameras.iter().filter(|cam_conf| cam_conf.enabled).map(|cam_conf| (cam_conf.name.clone(), cam_conf.clone())).collect::<HashMap<_,_>>();
                                 // Remove those no longer in the config

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{anyhow, Result};
 use tokio::sync::{Mutex, RwLock};
@@ -81,6 +81,12 @@ impl CameraEntry {
     /// long-lived MQTT/RTSP loops but it would make ONVIF clients hang while
     /// a camera is offline. ONVIF clients expect quick failure so they can
     /// reconnect.
+    ///
+    /// The 400 retry ladder is skipped too (`run_task_now`). A camera answering
+    /// 400 means "I don't do that" as often as it means "still booting", and
+    /// five one-second retries inside a five-second timeout turns the former
+    /// into a bare "camera read timed out" — losing the reason the request
+    /// failed, which is the only thing the SOAP fault could usefully carry.
     pub(crate) async fn run<F, T>(&self, task: F) -> anyhow::Result<T>
     where
         F: for<'a> Fn(
@@ -91,9 +97,75 @@ impl CameraEntry {
             + Sync,
         T: Send,
     {
-        tokio::time::timeout(CAMERA_READ_TIMEOUT, self.instance.run_task(task))
+        tokio::time::timeout(CAMERA_READ_TIMEOUT, self.instance.run_task_now(task))
             .await
             .map_err(|_| anyhow::anyhow!("camera read timed out"))?
+    }
+
+    /// Identity of the BC connection currently backing this camera.
+    ///
+    /// `NeoCamThread` publishes a fresh `Arc<BcCamera>` for every successful
+    /// connect+login and a null `Weak` while disconnected, so pointer identity
+    /// is an exact "is this still the same login?" test. Anything read from the
+    /// camera that describes the *hardware or the session* — capabilities,
+    /// model, firmware — stays valid exactly as long as this token does.
+    ///
+    /// A reconnect is also the only way the answers can change in practice: a
+    /// firmware upgrade reboots the camera, and a permissions change only takes
+    /// effect on the next login (the core caches the ability list at login and
+    /// never refreshes it, so re-reading it more often than this would just
+    /// disagree with the layer that enforces it).
+    pub(crate) fn connection_token(&self) -> Weak<BcCamera> {
+        self.instance.camera().borrow().clone()
+    }
+}
+
+/// Has the connection changed since `token` was taken?
+///
+/// A null `Weak` (camera currently disconnected) never matches a live one, so a
+/// cache filled while connected is correctly invalidated by a drop+reconnect.
+pub(crate) fn same_connection(token: &Weak<BcCamera>, now: &Weak<BcCamera>) -> bool {
+    Weak::ptr_eq(token, now) && token.strong_count() > 0
+}
+
+/// A value read from the camera that is only valid for the connection it was
+/// read over. See [`CameraEntry::connection_token`].
+///
+/// The lock is deliberately held across the read so that N concurrent ONVIF
+/// requests cost the camera one round-trip rather than N.
+pub(crate) struct ConnScopedCache<T> {
+    slot: Mutex<Option<(Weak<BcCamera>, T)>>,
+}
+
+impl<T> Default for ConnScopedCache<T> {
+    fn default() -> Self {
+        Self {
+            slot: Mutex::new(None),
+        }
+    }
+}
+
+impl<T: Clone> ConnScopedCache<T> {
+    pub(crate) async fn get_or_init<F, Fut>(&self, cam: &CameraEntry, init: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let now = cam.connection_token();
+        let mut slot = self.slot.lock().await;
+        if let Some((token, value)) = slot.as_ref() {
+            if same_connection(token, &now) {
+                return value.clone();
+            }
+        }
+        let value = init().await;
+        // Stored under the token taken *before* the read, not after. If the
+        // connection was replaced while we were reading, this entry no longer
+        // matches and the next caller re-reads — which is the safe direction to
+        // be wrong in. Keying it to the new connection would pin a value that
+        // may have come from the old one.
+        *slot = Some((now, value.clone()));
+        value
     }
 }
 
@@ -108,6 +180,10 @@ pub(crate) struct CameraEntry {
     /// Tracks an in-flight continuous-PTZ background task so the next
     /// `Stop` / replacement can abort it cleanly.
     pub(crate) zoom_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Tracks the timed pan/tilt move a `RelativeMove` starts, for the same
+    /// reason as `zoom_task`: the move outlives the request that asked for it,
+    /// so `Stop` and any replacement move need a handle to cancel.
+    pub(crate) pt_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Per-camera ONVIF events manager. Lazily starts a motion listener on
     /// first subscription.
     pub(crate) events: Arc<EventsManager>,
@@ -115,6 +191,13 @@ pub(crate) struct CameraEntry {
     /// first use and refreshed on a timer. Every capability-describing ONVIF
     /// response reads from here so they can't disagree with each other.
     pub(crate) capabilities: Arc<CapabilityCache>,
+    /// Model / firmware / serial. Fixed for the life of a connection, so it is
+    /// read once per connect rather than once per `GetDeviceInformation`.
+    pub(crate) device_info: Arc<ConnScopedCache<Arc<crate::onvif::services::device::DeviceInfo>>>,
+    /// The encoder tables behind the media profiles. Unlike the rest, these are
+    /// user-settable at runtime from the Reolink app, so this one is a TTL
+    /// cache rather than a connection-scoped one.
+    pub(crate) stream_info: Arc<crate::onvif::services::media::StreamInfoCache>,
     /// The camera's clock, sampled rarely and extrapolated in between.
     /// `GetSystemDateAndTime` is answered without authentication, so it must
     /// not be a lever for turning unauthenticated requests into camera traffic.
@@ -254,8 +337,11 @@ impl OnvifState {
                         permitted_users,
                         instance: prev.instance.clone(),
                         zoom_task: prev.zoom_task.clone(),
+                        pt_task: prev.pt_task.clone(),
                         events: prev.events.clone(),
                         capabilities: prev.capabilities.clone(),
+                        device_info: prev.device_info.clone(),
+                        stream_info: prev.stream_info.clone(),
                         clock: prev.clock.clone(),
                         general_lock: prev.general_lock.clone(),
                         audio_format: cam_cfg.audio_format(),
@@ -278,9 +364,9 @@ impl OnvifState {
                     let events = Arc::new(EventsManager::new(
                         cam_cfg.name.clone(),
                         instance.clone(),
-                        cancel,
+                        cancel.clone(),
                     ));
-                    Arc::new(CameraEntry {
+                    let entry = Arc::new(CameraEntry {
                         name: cam_cfg.name.clone(),
                         channel_id: cam_cfg.channel_id,
                         uuid,
@@ -288,12 +374,28 @@ impl OnvifState {
                         permitted_users,
                         instance,
                         zoom_task: Arc::new(Mutex::new(None)),
+                        pt_task: Arc::new(Mutex::new(None)),
                         events,
                         capabilities: Arc::new(CapabilityCache::default()),
+                        device_info: Arc::new(ConnScopedCache::default()),
+                        stream_info: Arc::new(Default::default()),
                         clock: Arc::new(ClockCache::default()),
                         general_lock: Arc::new(Mutex::new(())),
                         audio_format: cam_cfg.audio_format(),
-                    })
+                    });
+
+                    // Probe capabilities as the connection comes up, so no
+                    // client request ever pays for the probe. `probe_on_connect`
+                    // holds only a Weak, so a config reload that drops this
+                    // camera from the map really drops it.
+                    let weak = Arc::downgrade(&entry);
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {}
+                            _ = crate::onvif::capabilities::probe_on_connect(weak) => {}
+                        }
+                    });
+                    entry
                 };
                 new_set.insert(cam_cfg.name.clone(), entry);
             }

@@ -225,6 +225,60 @@ async fn abort_zoom_task(cam: &CameraEntry) {
     }
 }
 
+/// Cancel an in-flight timed pan/tilt move without stopping the motor. Callers
+/// that want the motor stopped issue `stop_pt` themselves — `ContinuousMove`
+/// replaces the move rather than halting it, and halting first would put a
+/// visible stutter in the middle of a drag.
+async fn abort_pt_task(cam: &CameraEntry) {
+    let mut g = cam.pt_task.lock().await;
+    if let Some(h) = g.take() {
+        h.abort();
+    }
+}
+
+/// Run a timed pan/tilt move in the background: start the motor, wait, stop.
+///
+/// This used to happen inline, which held the SOAP response open for the whole
+/// move — up to ten seconds. ONVIF has no expectation that `RelativeMove`
+/// blocks until the motion completes (that is what `GetStatus`'s `MoveStatus`
+/// is for), and clients read the delay as bridge latency or time the request
+/// out entirely.
+///
+/// Weak, for the same reason `spawn_zoom_task` is: storing a handle to a task
+/// that owns the entry would be a reference cycle that outlives the bridge's
+/// own map.
+async fn spawn_pt_task(cam: &Arc<CameraEntry>, dir: Direction, speed: f32, dur: Duration) {
+    let mut g = cam.pt_task.lock().await;
+    if let Some(h) = g.take() {
+        h.abort();
+    }
+    let cam_weak = Arc::downgrade(cam);
+    let h = tokio::spawn(async move {
+        {
+            let Some(cam) = cam_weak.upgrade() else {
+                return;
+            };
+            if let Err(e) = send_direction(&cam, dir, speed).await {
+                log::warn!("ONVIF: camera {}: relative move failed: {e}", cam.name);
+                return;
+            }
+        }
+        sleep(dur).await;
+        // Upgraded again rather than held: the entry may have been dropped
+        // while the camera was moving.
+        let Some(cam) = cam_weak.upgrade() else {
+            return;
+        };
+        if let Err(e) = stop_pt(&cam).await {
+            log::warn!(
+                "ONVIF: camera {}: could not stop after relative move: {e}",
+                cam.name
+            );
+        }
+    });
+    *g = Some(h);
+}
+
 /// Spawn a background task that approximates a continuous-zoom move. Reolink
 /// has no native "zoom velocity" so we simulate it by stepping `zoom_to`.
 ///
@@ -357,6 +411,10 @@ pub(crate) async fn dispatch(
                 });
             }
             abort_zoom_task(cam).await;
+            // A timed move still running would issue its own `stop` partway
+            // through this one. Cancelled without stopping the motor, so a
+            // client dragging the PTZ pad doesn't see a stutter.
+            abort_pt_task(cam).await;
             if let Some(dir) = pick_direction(v.pan, v.tilt) {
                 let speed = onvif_to_reolink_speed(v.pan.abs().max(v.tilt.abs()));
                 send_direction(cam, dir, speed).await.map_err(other_fault)?;
@@ -386,7 +444,9 @@ pub(crate) async fn dispatch(
             }
             abort_zoom_task(cam).await;
             // PT relative: do a timed continuous move. Magnitude is treated
-            // as seconds (clamped to 10s) like the existing CLI does.
+            // as seconds (clamped to 10s) like the existing CLI does. The move
+            // runs in the background so the response goes out now — see
+            // `spawn_pt_task`.
             if let Some(dir) = pick_direction(translation.pan, translation.tilt) {
                 let speed_mag = if speed_v.pan != 0.0 || speed_v.tilt != 0.0 {
                     speed_v.pan.abs().max(speed_v.tilt.abs())
@@ -399,11 +459,7 @@ pub(crate) async fn dispatch(
                     .abs()
                     .max(translation.tilt.abs())
                     .clamp(0.05, 10.0);
-                send_direction(cam, dir, reolink_speed)
-                    .await
-                    .map_err(other_fault)?;
-                sleep(Duration::from_secs_f32(dur)).await;
-                let _ = stop_pt(cam).await;
+                spawn_pt_task(cam, dir, reolink_speed, Duration::from_secs_f32(dur)).await;
             }
             if translation.zoom.abs() >= 0.005 {
                 relative_zoom(cam, translation.zoom)
@@ -443,6 +499,10 @@ pub(crate) async fn dispatch(
             // would break the common client pattern of stopping both axes
             // after every move.
             if pt && caps.pan_tilt {
+                // Cancel first: otherwise the timed move keeps driving the
+                // motor and re-stops it later, so the explicit Stop appears to
+                // have been ignored.
+                abort_pt_task(cam).await;
                 stop_pt(cam).await.map_err(other_fault)?;
             }
             if zoom {
@@ -556,6 +616,10 @@ so the home position cannot be overwritten",
                 code: FaultCode::InvalidArgs,
                 reason: format!("Unknown preset token '{token}'"),
             })?;
+            // A manual move still in flight would fight the preset recall, and
+            // its trailing `stop` would halt the camera partway there.
+            abort_zoom_task(cam).await;
+            abort_pt_task(cam).await;
             cam.run(move |c| {
                 Box::pin(async move {
                     c.moveto_ptz_preset(id).await?;
@@ -610,6 +674,8 @@ so the home position cannot be overwritten",
                     ),
                 });
             }
+            abort_zoom_task(cam).await;
+            abort_pt_task(cam).await;
             cam.run(|c| {
                 Box::pin(async move {
                     c.moveto_ptz_preset(HOME_PRESET_ID).await?;
