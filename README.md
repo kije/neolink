@@ -77,6 +77,52 @@ sudo apt install \
 
 Make a config file see below.
 
+### Nix
+
+The repository is a Nix flake. It packages `neolink` with the GStreamer
+plugins it needs already wired in, so nothing has to be installed on the host.
+
+```bash
+nix run github:kije/neolink -- rtsp --config neolink.toml
+```
+
+To use it from another flake:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    neolink.url = "github:kije/neolink";
+    neolink.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { nixpkgs, neolink, ... }: {
+    # Either use the packages as built against this flake's own nixpkgs ...
+    #   neolink.packages.${system}.neolink        (also `.default`)
+    #   neolink.packages.${system}.neolink-tools  (neolink_decoder, mailnoti, pushnoti)
+    # ... or add the overlay, which builds both against your own nixpkgs:
+    nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+      modules = [
+        {
+          nixpkgs.hostPlatform = "x86_64-linux";
+          nixpkgs.overlays = [ neolink.overlays.default ];
+        }
+        ({ pkgs, ... }: { environment.systemPackages = [ pkgs.neolink ]; })
+      ];
+    };
+  };
+}
+```
+
+Cargo features are exposed as override arguments, e.g.
+`pkgs.neolink.override { withPushNotifications = true; }` (also
+`withGstreamer`).
+
+For development, `nix develop` (or `direnv allow`, via the bundled `.envrc`)
+gives a shell with the Rust toolchain, rust-analyzer, clippy, rustfmt,
+cargo-deny, pre-commit and all native dependencies, with
+`GST_PLUGIN_SYSTEM_PATH_1_0` set so `cargo run` works as-is.
+
 ## Config/Usage
 
 ### RTSP
